@@ -1,8 +1,10 @@
 import { Button } from "@/components/ui/button";
+import { SearchField } from "@/components/ui/search-field";
+import { Switch } from "@/components/ui/switch";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { TFunction } from "i18next";
-import { SquarePen } from "lucide-react-native";
+import { ChevronDown, ChevronUp, SquarePen } from "lucide-react-native";
 import React, {
   memo,
   useCallback,
@@ -13,7 +15,7 @@ import React, {
   useSyncExternalStore,
 } from "react";
 import { useTranslation } from "react-i18next";
-import { StyleSheet as RNStyleSheet, Text, View } from "react-native";
+import { Pressable, StyleSheet as RNStyleSheet, Text, View } from "react-native";
 import ReanimatedAnimated from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
@@ -106,6 +108,11 @@ import { applyLegacyDaemonWorkspaceOwnership } from "@/workspace/legacy-daemon-w
 import type { WorkspaceFileOpenRequest } from "@/workspace/file-open";
 import { deriveSidebarStateBucket } from "@/utils/sidebar-agent-state";
 import { buildDraftAgentSetup, type ClientSlashCommand } from "@/client-slash-commands";
+import { parseConversationFamilyLabels, searchConversationFamily } from "@/conversation-family";
+import {
+  useConversationFamily,
+  type ConversationFamilyView,
+} from "@/hooks/use-conversation-family";
 
 interface ChatAgentStateShape {
   serverId: string | null;
@@ -120,6 +127,7 @@ interface ChatAgentStateShape {
   thinkingOptionId?: Agent["thinkingOptionId"];
   runtimeInfo?: Agent["runtimeInfo"];
   features?: Agent["features"];
+  labels?: Agent["labels"];
   lastError?: Agent["lastError"] | null;
 }
 
@@ -183,6 +191,7 @@ function selectChatAgentState(
     thinkingOptionId: agent.thinkingOptionId,
     runtimeInfo: agent.runtimeInfo,
     features: agent.features,
+    labels: agent.labels,
     lastError: agent.lastError ?? null,
     archivedAt: agent.archivedAt ?? null,
     requiresAttention: agent.requiresAttention ?? false,
@@ -210,6 +219,7 @@ function buildChatAgentFromState(
     thinkingOptionId: state.thinkingOptionId,
     runtimeInfo: state.runtimeInfo,
     features: state.features,
+    labels: state.labels,
     lastError: state.lastError ?? null,
     projectPlacement,
   };
@@ -1288,7 +1298,13 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
     parentAgentId: agentId,
     rows: subagentRows,
   });
-  const hasActiveComposer = !agentState.archivedAt && !isArchivingCurrentAgent;
+  const familyMetadata = useMemo(
+    () => parseConversationFamilyLabels(effectiveAgent.labels),
+    [effectiveAgent.labels],
+  );
+  const isReadOnlyHistory = Boolean(familyMetadata && familyMetadata.currentAgentId !== agentId);
+  const hasActiveComposer =
+    !agentState.archivedAt && !isArchivingCurrentAgent && !isReadOnlyHistory;
   const hasVisibleAgentTracks = hasAgentTracks({
     subagentRows,
     tasks,
@@ -1355,6 +1371,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
         onAttentionPromptSend={onAttentionPromptSend}
         onComposerHeightChange={handleComposerHeightChange}
         onMessageSent={handleMessageSent}
+        isReadOnlyHistory={isReadOnlyHistory}
       />
     </RenderProfile>
   );
@@ -1373,6 +1390,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
           hasVisibleAgentTracks={hasVisibleAgentTracks}
           toast={toastApi}
           onOpenWorkspaceFile={onOpenWorkspaceFile}
+          readOnly={isReadOnlyHistory}
         />
       </RenderProfile>
       {hasActiveComposer ? (
@@ -1397,7 +1415,10 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
       onRewindComplete={handleRewindComplete}
     >
       <View style={styles.root}>
-        <FileDropZone style={styles.container} disabled={isArchivingCurrentAgent}>
+        <FileDropZone
+          style={styles.container}
+          disabled={isArchivingCurrentAgent || isReadOnlyHistory}
+        >
           {contentContainer}
 
           {showHistorySyncError ? (
@@ -1446,6 +1467,139 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   );
 });
 
+function ConversationFamilyToolbar({
+  family,
+  onJumpToMatch,
+}: {
+  family: ConversationFamilyView;
+  onJumpToMatch: (itemId: string) => void;
+}) {
+  const { t } = useTranslation();
+  const isCompactFormFactor = useIsCompactFormFactor();
+  const [query, setQuery] = useState("");
+  const [includeToolActivity, setIncludeToolActivity] = useState(false);
+  const [activeMatchIndex, setActiveMatchIndex] = useState(0);
+  const matches = useMemo(
+    () => searchConversationFamily(family.streamItems, query, { includeToolActivity }),
+    [family.streamItems, includeToolActivity, query],
+  );
+
+  useEffect(() => setActiveMatchIndex(0), [includeToolActivity, matches.length, query]);
+
+  const jumpToMatch = useCallback(
+    (index: number) => {
+      if (matches.length === 0) return;
+      const normalized = (index + matches.length) % matches.length;
+      setActiveMatchIndex(normalized);
+      onJumpToMatch(matches[normalized].itemId);
+    },
+    [matches, onJumpToMatch],
+  );
+  const hasMatches = matches.length > 0;
+  const matchNavigationAccessibilityState = useMemo(
+    () => ({ disabled: !hasMatches }),
+    [hasMatches],
+  );
+  const matchCountLabel = useMemo(() => {
+    if (query.trim().length === 0) return "";
+    if (!hasMatches) return t("agentStream.family.noMatches");
+    return t("agentStream.family.matchCount", {
+      current: Math.min(activeMatchIndex + 1, matches.length),
+      total: matches.length,
+    });
+  }, [activeMatchIndex, hasMatches, matches.length, query, t]);
+  const jumpToPreviousMatch = useCallback(
+    () => jumpToMatch(activeMatchIndex - 1),
+    [activeMatchIndex, jumpToMatch],
+  );
+  const jumpToNextMatch = useCallback(
+    () => jumpToMatch(activeMatchIndex + 1),
+    [activeMatchIndex, jumpToMatch],
+  );
+
+  return (
+    <View style={styles.familyToolbarRail} testID="conversation-family-toolbar">
+      <View style={styles.familyToolbar}>
+        <View style={styles.familySummary}>
+          {family.isLoading ? (
+            <ThemedLoadingSpinner size="small" uniProps={foregroundMutedColorMapping} />
+          ) : null}
+          <Text style={styles.familySummaryText} numberOfLines={1}>
+            {t("agentStream.family.fullHistory", { count: family.memberCount })}
+          </Text>
+          {family.error ? (
+            <Text style={styles.familyErrorText} numberOfLines={1}>
+              {t("agentStream.family.loadFailed")}
+            </Text>
+          ) : null}
+        </View>
+        <View
+          style={[styles.familySearchRow, isCompactFormFactor && styles.familySearchRowCompact]}
+        >
+          <View
+            style={[
+              styles.familySearchField,
+              isCompactFormFactor && styles.familySearchFieldCompact,
+            ]}
+          >
+            <SearchField
+              value={query}
+              onChangeText={setQuery}
+              placeholder={t("agentStream.family.searchPlaceholder")}
+              clearAccessibilityLabel={t("agentStream.family.clearSearch")}
+              testID="conversation-family-search"
+              clearTestID="conversation-family-search-clear"
+            />
+          </View>
+          <View
+            style={[
+              styles.familySearchControls,
+              isCompactFormFactor && styles.familySearchControlsCompact,
+            ]}
+          >
+            <Text style={styles.familyMatchCount} testID="conversation-family-match-count">
+              {matchCountLabel}
+            </Text>
+            <Pressable
+              style={styles.familyNavButton}
+              disabled={!hasMatches}
+              onPress={jumpToPreviousMatch}
+              accessibilityRole="button"
+              accessibilityLabel={t("agentStream.family.previousMatch")}
+              accessibilityState={matchNavigationAccessibilityState}
+              testID="conversation-family-previous"
+            >
+              <ThemedChevronUp size={16} uniProps={foregroundMutedColorMapping} />
+            </Pressable>
+            <Pressable
+              style={styles.familyNavButton}
+              disabled={!hasMatches}
+              onPress={jumpToNextMatch}
+              accessibilityRole="button"
+              accessibilityLabel={t("agentStream.family.nextMatch")}
+              accessibilityState={matchNavigationAccessibilityState}
+              testID="conversation-family-next"
+            >
+              <ThemedChevronDown size={16} uniProps={foregroundMutedColorMapping} />
+            </Pressable>
+            <View style={styles.familyToolToggle}>
+              <Text style={styles.familyToolToggleText}>
+                {t("agentStream.family.includeTools")}
+              </Text>
+              <Switch
+                value={includeToolActivity}
+                onValueChange={setIncludeToolActivity}
+                accessibilityLabel={t("agentStream.family.includeTools")}
+                testID="conversation-family-include-tools"
+              />
+            </View>
+          </View>
+        </View>
+      </View>
+    </View>
+  );
+}
+
 const AgentStreamSection = memo(function AgentStreamSection({
   streamViewRef,
   serverId,
@@ -1458,6 +1612,7 @@ const AgentStreamSection = memo(function AgentStreamSection({
   hasVisibleAgentTracks,
   toast,
   onOpenWorkspaceFile,
+  readOnly,
 }: {
   streamViewRef: React.RefObject<AgentStreamViewHandle | null>;
   serverId: string;
@@ -1470,6 +1625,7 @@ const AgentStreamSection = memo(function AgentStreamSection({
   hasVisibleAgentTracks: boolean;
   toast: ReturnType<typeof useToastHost>["api"];
   onOpenWorkspaceFile?: (request: WorkspaceFileOpenRequest) => void;
+  readOnly: boolean;
 }) {
   const isCompactFormFactor = useIsCompactFormFactor();
   const hasWorkspaceDiffStat = useWorkspaceHasDiffStat(serverId, workspaceId);
@@ -1499,6 +1655,29 @@ const AgentStreamSection = memo(function AgentStreamSection({
     ),
   );
   const streamItems = streamItemsRaw ?? EMPTY_STREAM_ITEMS;
+  const family = useConversationFamily({
+    serverId,
+    agentId: agent.id,
+    labels: agent.labels,
+  });
+  const displayedStreamItems =
+    family && family.streamItems.length > 0 ? family.streamItems : streamItems;
+  const familyHistoryPagination = useMemo(
+    () =>
+      family
+        ? {
+            hasOlder: false,
+            isLoadingOlder: family.isLoading,
+            progressKey: family.familyId,
+            onLoadOlder: () => false,
+          }
+        : undefined,
+    [family],
+  );
+  const handleJumpToFamilyMatch = useCallback(
+    (itemId: string) => streamViewRef.current?.scrollToMessage(itemId),
+    [streamViewRef],
+  );
   const pendingPermissionList = useStoreWithEqualityFn(
     useSessionStore,
     (state) => {
@@ -1527,22 +1706,30 @@ const AgentStreamSection = memo(function AgentStreamSection({
   }, [pendingPermissionList]);
 
   return (
-    <AgentStreamView
-      ref={streamViewRef}
-      agentId={agent.id}
-      serverId={serverId}
-      context={agent}
-      streamItems={streamItems}
-      pendingPermissions={pendingPermissions}
-      routeBottomAnchorRequest={routeBottomAnchorRequest}
-      isAuthoritativeHistoryReady={hasAppliedAuthoritativeHistory}
-      bottomOverlayTailClearance={bottomOverlayTailClearance}
-      bottomOverlayControlClearance={bottomOverlayControlClearance}
-      toast={toast}
-      pendingMessageSubmissions={pendingMessageSubmissions}
-      turnPresentation={turnPresentation}
-      onOpenWorkspaceFile={onOpenWorkspaceFile}
-    />
+    <View style={styles.familyStreamContainer}>
+      {family ? (
+        <ConversationFamilyToolbar family={family} onJumpToMatch={handleJumpToFamilyMatch} />
+      ) : null}
+      <AgentStreamView
+        ref={streamViewRef}
+        agentId={agent.id}
+        serverId={serverId}
+        context={agent}
+        streamItems={displayedStreamItems}
+        pendingPermissions={readOnly ? EMPTY_PENDING_PERMISSIONS : pendingPermissions}
+        routeBottomAnchorRequest={routeBottomAnchorRequest}
+        isAuthoritativeHistoryReady={hasAppliedAuthoritativeHistory}
+        bottomOverlayTailClearance={bottomOverlayTailClearance}
+        bottomOverlayControlClearance={bottomOverlayControlClearance}
+        toast={toast}
+        pendingMessageSubmissions={pendingMessageSubmissions}
+        turnPresentation={turnPresentation}
+        onOpenWorkspaceFile={onOpenWorkspaceFile}
+        readOnly={readOnly}
+        readOnlyItemIds={family?.readOnlyItemIds}
+        historyPagination={familyHistoryPagination}
+      />
+    </View>
   );
 });
 
@@ -1559,6 +1746,7 @@ const AgentComposerSection = memo(function AgentComposerSection({
   onAttentionPromptSend,
   onComposerHeightChange,
   onMessageSent,
+  isReadOnlyHistory,
 }: {
   agentId?: string;
   serverId: string;
@@ -1572,9 +1760,20 @@ const AgentComposerSection = memo(function AgentComposerSection({
   onAttentionPromptSend: () => void;
   onComposerHeightChange: (height: number) => void;
   onMessageSent: () => void;
+  isReadOnlyHistory: boolean;
 }) {
+  const { t } = useTranslation();
   if (!agentId) {
     return null;
+  }
+  if (isReadOnlyHistory) {
+    return (
+      <View style={styles.familyReadOnlyCalloutRail} testID="conversation-family-read-only">
+        <Text style={styles.familyReadOnlyCalloutText}>
+          {t("agentStream.family.readOnlySegment")}
+        </Text>
+      </View>
+    );
   }
   if (archivedAt) {
     return <ArchivedAgentCallout serverId={serverId} agentId={agentId} />;
@@ -1804,6 +2003,8 @@ function AgentSessionUnavailableState({
 }
 
 const ThemedLoadingSpinner = withUnistyles(LoadingSpinner);
+const ThemedChevronUp = withUnistyles(ChevronUp);
+const ThemedChevronDown = withUnistyles(ChevronDown);
 
 const foregroundMutedColorMapping = (theme: Theme) => ({
   color: theme.colors.foregroundMuted,
@@ -1834,6 +2035,116 @@ const styles = StyleSheet.create((theme) => ({
     flex: 1,
     overflow: "hidden",
     ...(isWeb ? { userSelect: "none" as const } : {}),
+  },
+  familyStreamContainer: {
+    flex: 1,
+    minHeight: 0,
+  },
+  familyToolbarRail: {
+    width: "100%",
+    alignItems: "center",
+    borderBottomWidth: theme.borderWidth[1],
+    borderBottomColor: theme.colors.border,
+    backgroundColor: theme.colors.surface0,
+    paddingHorizontal: {
+      xs: theme.spacing[3],
+      md: theme.spacing[6],
+    },
+    paddingVertical: theme.spacing[2],
+  },
+  familyToolbar: {
+    width: "100%",
+    maxWidth: MAX_CONTENT_WIDTH,
+    gap: theme.spacing[2],
+  },
+  familySummary: {
+    minHeight: 18,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[2],
+  },
+  familySummaryText: {
+    color: theme.colors.foregroundMuted,
+    fontSize: theme.fontSize.sm,
+    fontWeight: theme.fontWeight.medium,
+  },
+  familyErrorText: {
+    color: theme.colors.statusDanger,
+    fontSize: theme.fontSize.sm,
+  },
+  familySearchRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[2],
+  },
+  familySearchRowCompact: {
+    flexDirection: "column",
+    alignItems: "stretch",
+  },
+  familySearchField: {
+    flex: 1,
+    minWidth: 0,
+    maxWidth: 420,
+  },
+  familySearchFieldCompact: {
+    width: "100%",
+    maxWidth: "100%",
+  },
+  familySearchControls: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[2],
+  },
+  familySearchControlsCompact: {
+    width: "100%",
+    justifyContent: "flex-end",
+  },
+  familyMatchCount: {
+    minWidth: 54,
+    color: theme.colors.foregroundMuted,
+    fontSize: theme.fontSize.sm,
+    textAlign: "center",
+  },
+  familyNavButton: {
+    width: {
+      xs: 48,
+      md: 32,
+    },
+    height: {
+      xs: 48,
+      md: 32,
+    },
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: theme.borderRadius.md,
+    backgroundColor: theme.colors.surface1,
+    borderWidth: theme.borderWidth[1],
+    borderColor: theme.colors.border,
+  },
+  familyToolToggle: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[2],
+  },
+  familyToolToggleText: {
+    color: theme.colors.foregroundMuted,
+    fontSize: theme.fontSize.sm,
+  },
+  familyReadOnlyCalloutRail: {
+    width: "100%",
+    alignItems: "center",
+    borderTopWidth: theme.borderWidth[1],
+    borderTopColor: theme.colors.border,
+    backgroundColor: theme.colors.surface0,
+    paddingHorizontal: theme.spacing[4],
+    paddingVertical: theme.spacing[3],
+  },
+  familyReadOnlyCalloutText: {
+    width: "100%",
+    maxWidth: MAX_CONTENT_WIDTH,
+    color: theme.colors.foregroundMuted,
+    fontSize: theme.fontSize.sm,
+    textAlign: "center",
   },
   timelineSyncCalloutRail: {
     width: "100%",

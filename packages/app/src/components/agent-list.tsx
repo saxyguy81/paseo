@@ -42,6 +42,8 @@ interface AgentListProps {
    * typo tiers match characters the eye would not find on its own.
    */
   searchMatchesByAgentKey?: Record<string, AgentSearchMatch[]>;
+  /** Related immutable sessions folded into each canonical conversation row. */
+  familyMemberCountByAgentKey?: Record<string, number>;
   /**
    * Renders one flat list in the given order instead of grouping by day. Day
    * headings claim the list is chronological, which is a lie once the caller
@@ -160,11 +162,13 @@ function SessionRowBadges({
   archivedIcon,
   pendingPermissionCount,
   showDesktopAttention,
+  familyMemberCount,
 }: {
   agent: AggregatedAgent;
   archivedIcon: ReactElement;
   pendingPermissionCount: number;
   showDesktopAttention: boolean;
+  familyMemberCount?: number;
 }) {
   const { t } = useTranslation();
   return (
@@ -180,6 +184,9 @@ function SessionRowBadges({
       ) : null}
       {showDesktopAttention ? (
         <SessionBadge label={t("agentList.badges.attention")} tone="danger" />
+      ) : null}
+      {familyMemberCount && familyMemberCount > 1 ? (
+        <SessionBadge label={t("agentList.badges.sessionCount", { count: familyMemberCount })} />
       ) : null}
     </>
   );
@@ -212,6 +219,7 @@ function SessionRow({
   selectedAgentId,
   showAttentionIndicator,
   showHostColumn,
+  familyMemberCount,
   onPress,
   onLongPress,
 }: {
@@ -221,6 +229,7 @@ function SessionRow({
   selectedAgentId?: string;
   showAttentionIndicator: boolean;
   showHostColumn: boolean;
+  familyMemberCount?: number;
   onPress: (agent: AggregatedAgent) => void;
   onLongPress: (agent: AggregatedAgent) => void;
 }) {
@@ -296,6 +305,7 @@ function SessionRow({
             archivedIcon={archivedIcon}
             pendingPermissionCount={pendingPermissionCount}
             showDesktopAttention={showDesktopAttention}
+            familyMemberCount={familyMemberCount}
           />
         </View>
         {isMobile ? (
@@ -381,6 +391,7 @@ export function AgentList({
   showAttentionIndicator = true,
   showHostColumn = false,
   searchMatchesByAgentKey,
+  familyMemberCountByAgentKey,
   flat = false,
 }: AgentListProps) {
   const { theme } = useUnistyles();
@@ -492,6 +503,7 @@ export function AgentList({
         <SessionRow
           agent={item.agent}
           searchMatches={searchMatchesByAgentKey?.[item.key]}
+          familyMemberCount={familyMemberCountByAgentKey?.[item.key]}
           isMobile={isMobile}
           selectedAgentId={selectedAgentId}
           showAttentionIndicator={showAttentionIndicator}
@@ -505,6 +517,7 @@ export function AgentList({
       handleAgentLongPress,
       handleAgentPress,
       isMobile,
+      familyMemberCountByAgentKey,
       searchMatchesByAgentKey,
       selectedAgentId,
       showAttentionIndicator,

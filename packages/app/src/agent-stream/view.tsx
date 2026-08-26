@@ -245,6 +245,7 @@ function renderLiveHeadStreamItem(input: {
 
 export interface AgentStreamViewHandle {
   scrollToBottom(reason?: BottomAnchorLocalRequest["reason"]): void;
+  scrollToMessage(itemId: string): void;
   prepareForViewportChange(): void;
 }
 
@@ -266,6 +267,8 @@ export interface AgentStreamViewProps {
   toast?: ToastApi | null;
   onOpenWorkspaceFile?: (request: WorkspaceFileOpenRequest) => void;
   readOnly?: boolean;
+  /** Items inherited from predecessor sessions cannot be rewound or forked. */
+  readOnlyItemIds?: ReadonlySet<string>;
   historyPagination?: {
     hasOlder: boolean;
     isLoadingOlder: boolean;
@@ -320,6 +323,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
       toast,
       onOpenWorkspaceFile,
       readOnly = false,
+      readOnlyItemIds,
       historyPagination,
     },
     ref,
@@ -349,6 +353,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
     const [expandedToolCallGroupIds, setExpandedToolCallGroupIds] = useState<Set<string>>(
       new Set(),
     );
+    const [pendingExternalJumpItemId, setPendingExternalJumpItemId] = useState<string | null>(null);
 
     // Get serverId (fallback to agent's serverId if not provided)
     const resolvedServerId = serverId ?? context.serverId ?? "";
@@ -612,12 +617,27 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
         scrollToBottom(reason = "jump-to-bottom") {
           viewportRef.current?.scrollToBottom(reason);
         },
+        scrollToMessage(itemId) {
+          if (revealLoadedHistory(itemId)) {
+            setPendingExternalJumpItemId(itemId);
+            return;
+          }
+          viewportRef.current?.scrollToMessage?.(itemId);
+        },
         prepareForViewportChange() {
           viewportRef.current?.prepareForViewportChange();
         },
       }),
-      [],
+      [revealLoadedHistory],
     );
+
+    useEffect(() => {
+      if (!pendingExternalJumpItemId || !visibleHistoryItemIds.has(pendingExternalJumpItemId)) {
+        return;
+      }
+      viewportRef.current?.scrollToMessage?.(pendingExternalJumpItemId);
+      setPendingExternalJumpItemId(null);
+    }, [pendingExternalJumpItemId, visibleHistoryItemIds]);
 
     const scrollToBottom = useCallback(() => {
       if (!isTimelineDetached) {
@@ -841,6 +861,9 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
             return renderToolCallItem(layoutItem, item);
 
           case "activity_log":
+            if (item.id.startsWith("family-boundary:")) {
+              return <ConversationFamilyBoundary message={item.message} />;
+            }
             return (
               <ActivityLog
                 type={item.activityType}
@@ -879,12 +902,16 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
           layoutItem,
           strategy: streamRenderStrategy,
           supportsTimelineCursor: supportsAgentForkContextCursor,
-          onForkAssistantTurn: readOnly ? undefined : handleForkAssistantTurn,
+          onForkAssistantTurn:
+            readOnly || readOnlyItemIds?.has(layoutItem.item.id)
+              ? undefined
+              : handleForkAssistantTurn,
         });
       },
       [
         handleForkAssistantTurn,
         readOnly,
+        readOnlyItemIds,
         renderStreamItemContent,
         streamRenderStrategy,
         supportsAgentForkContextCursor,
@@ -1157,6 +1184,7 @@ function collectAgentScreenAgentDiffs(left: AgentScreenAgent, right: AgentScreen
     reasons.push("agent.capabilities");
   }
   if (left.lastError !== right.lastError) reasons.push("agent.lastError");
+  if (left.labels !== right.labels) reasons.push("agent.labels");
   reasons.push(...collectAgentSetupDiffs(left, right));
   reasons.push(...collectAgentProjectPlacementDiffs(left.projectPlacement, right.projectPlacement));
   return reasons;
@@ -1211,6 +1239,7 @@ function agentStreamViewPropsEqual(
   if (left.toast !== right.toast) reasons.push("toast");
   if (left.onOpenWorkspaceFile !== right.onOpenWorkspaceFile) reasons.push("onOpenWorkspaceFile");
   if (left.readOnly !== right.readOnly) reasons.push("readOnly");
+  if (left.readOnlyItemIds !== right.readOnlyItemIds) reasons.push("readOnlyItemIds");
   if (!historyPaginationPropsEqual(left.historyPagination, right.historyPagination)) {
     reasons.push("historyPagination");
   }
@@ -1586,6 +1615,24 @@ const stylesheet = StyleSheet.create((theme) => ({
     alignSelf: "center",
     paddingHorizontal: theme.spacing[2],
   },
+  familyBoundary: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[3],
+    paddingVertical: theme.spacing[3],
+  },
+  familyBoundaryLine: {
+    flex: 1,
+    height: theme.borderWidth[1],
+    backgroundColor: theme.colors.border,
+  },
+  familyBoundaryText: {
+    flexShrink: 1,
+    color: theme.colors.foregroundMuted,
+    fontSize: theme.fontSize.sm,
+    fontWeight: theme.fontWeight.medium,
+    textAlign: "center",
+  },
   emptyState: {
     flex: 1,
     alignItems: "center",
@@ -1722,4 +1769,16 @@ function StreamItemWrapper({ gapBelow, children }: StreamItemWrapperProps) {
     [gapBelow],
   );
   return <View style={wrapperStyle}>{children}</View>;
+}
+
+function ConversationFamilyBoundary({ message }: { message: string }) {
+  return (
+    <View style={stylesheet.familyBoundary} testID="conversation-family-boundary">
+      <View style={stylesheet.familyBoundaryLine} />
+      <Text style={stylesheet.familyBoundaryText} selectable>
+        {message}
+      </Text>
+      <View style={stylesheet.familyBoundaryLine} />
+    </View>
+  );
 }

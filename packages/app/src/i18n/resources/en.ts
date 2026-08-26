@@ -200,6 +200,21 @@ export const en = {
     empty: "Start chatting with this agent...",
     scrollToBottom: "Scroll to bottom",
     historyLoadFailed: "Couldn't load agent history",
+    family: {
+      fullHistory: "Full history · {{count}} sessions",
+      loadFailed: "Some history could not be loaded",
+      searchPlaceholder: "Search this conversation",
+      clearSearch: "Clear conversation search",
+      matchCount: "{{current}} of {{total}}",
+      noMatches: "No matches",
+      previousMatch: "Previous match",
+      nextMatch: "Next match",
+      includeTools: "Include tools",
+      conversationStarted: "Conversation started in “{{title}}”",
+      continuedInNewSession: "Continued in a new session: “{{title}}”",
+      readOnlySegment:
+        "This is an earlier read-only segment. Continue from the latest session in History.",
+    },
     permission: {
       plan: "Plan",
       required: "Permission Required",
@@ -270,6 +285,7 @@ export const en = {
       archived: "Archived",
       pending: "{{count}} pending",
       attention: "Attention",
+      sessionCount: "{{count}} sessions",
     },
     archiveSheet: {
       hostOffline: "Host offline",

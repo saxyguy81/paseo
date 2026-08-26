@@ -200,6 +200,20 @@ export const ko: TranslationResources = {
     },
   },
   agentStream: {
+    family: {
+      fullHistory: "전체 기록 · 세션 {{count}}개",
+      loadFailed: "일부 기록을 불러오지 못했습니다",
+      searchPlaceholder: "이 대화 검색",
+      clearSearch: "대화 검색 지우기",
+      matchCount: "{{total}}개 중 {{current}}개",
+      noMatches: "일치 항목 없음",
+      previousMatch: "이전 일치 항목",
+      nextMatch: "다음 일치 항목",
+      includeTools: "도구 포함",
+      conversationStarted: "‘{{title}}’에서 대화 시작",
+      continuedInNewSession: "새 세션 ‘{{title}}’에서 계속",
+      readOnlySegment: "읽기 전용인 이전 세그먼트입니다. 기록의 최신 세션에서 계속하세요.",
+    },
     empty: "이 에이전트와 대화를 시작하세요...",
     scrollToBottom: "맨 아래로 스크롤",
     historyLoadFailed: "에이전트 기록을 로드할 수 없습니다.",
@@ -273,6 +287,7 @@ export const ko: TranslationResources = {
       archived: "보관됨",
       pending: "대기 {{count}}개",
       attention: "주의",
+      sessionCount: "세션 {{count}}개",
     },
     archiveSheet: {
       hostOffline: "호스트 오프라인",

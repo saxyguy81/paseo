@@ -200,6 +200,21 @@ export const ru: TranslationResources = {
     },
   },
   agentStream: {
+    family: {
+      fullHistory: "Полная история · сеансов: {{count}}",
+      loadFailed: "Не удалось загрузить часть истории",
+      searchPlaceholder: "Поиск в этой беседе",
+      clearSearch: "Очистить поиск по беседе",
+      matchCount: "{{current}} из {{total}}",
+      noMatches: "Совпадений нет",
+      previousMatch: "Предыдущее совпадение",
+      nextMatch: "Следующее совпадение",
+      includeTools: "Включить инструменты",
+      conversationStarted: "Беседа начата в «{{title}}»",
+      continuedInNewSession: "Продолжение в новом сеансе: «{{title}}»",
+      readOnlySegment:
+        "Это предыдущий сегмент только для чтения. Продолжайте в последнем сеансе в истории.",
+    },
     empty: "Начните общаться с этим агентом...",
     scrollToBottom: "Прокрутить вниз",
     historyLoadFailed: "Не удалось загрузить историю агента",
@@ -274,6 +289,7 @@ export const ru: TranslationResources = {
       archived: "В архиве",
       pending: "На рассмотрении: {{count}}",
       attention: "Внимание",
+      sessionCount: "Сессий: {{count}}",
     },
     archiveSheet: {
       hostOffline: "Хост не в сети",

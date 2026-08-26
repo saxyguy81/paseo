@@ -200,6 +200,20 @@ export const ar: TranslationResources = {
     },
   },
   agentStream: {
+    family: {
+      fullHistory: "السجل الكامل · {{count}} جلسات",
+      loadFailed: "تعذّر تحميل جزء من السجل",
+      searchPlaceholder: "البحث في هذه المحادثة",
+      clearSearch: "مسح البحث في المحادثة",
+      matchCount: "{{current}} من {{total}}",
+      noMatches: "لا توجد نتائج",
+      previousMatch: "النتيجة السابقة",
+      nextMatch: "النتيجة التالية",
+      includeTools: "تضمين الأدوات",
+      conversationStarted: "بدأت المحادثة في «{{title}}»",
+      continuedInNewSession: "المتابعة في جلسة جديدة: «{{title}}»",
+      readOnlySegment: "هذا مقطع سابق للقراءة فقط. تابع من أحدث جلسة في السجل.",
+    },
     empty: "ابدأ الدردشة مع هذا الوكيل...",
     scrollToBottom: "قم بالتمرير إلى الأسفل",
     historyLoadFailed: "تعذر تحميل سجل الوكيل",
@@ -272,6 +286,7 @@ export const ar: TranslationResources = {
       archived: "مؤرشف",
       pending: "{{count}}معلق",
       attention: "انتباه",
+      sessionCount: "{{count}} جلسات",
     },
     archiveSheet: {
       hostOffline: "Host غير متصل",

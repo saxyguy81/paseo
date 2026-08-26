@@ -17,6 +17,7 @@ import { type AgentHistoryHostError, useAgentHistory } from "@/hooks/use-agent-h
 import { useDebouncedValue } from "@/hooks/use-debounced-value";
 import { useHosts } from "@/runtime/host-runtime";
 import { buildOpenProjectRoute } from "@/utils/host-routes";
+import { collapseConversationFamilies } from "@/conversation-family";
 
 /** Long enough that a typed word is one request, short enough to feel live. */
 const SEARCH_DEBOUNCE_MS = 200;
@@ -94,6 +95,11 @@ function SessionsScreenContent() {
     search,
   });
   const isSearching = isSearchSupported && search.length > 0;
+  const collapsedHistory = useMemo(
+    () => collapseConversationFamilies({ agents, searchMatchesByAgentKey }),
+    [agents, searchMatchesByAgentKey],
+  );
+  const visibleAgents = collapsedHistory.agents;
 
   useEffect(() => {
     if (
@@ -119,7 +125,7 @@ function SessionsScreenContent() {
   });
   const showHostFilter = hosts.length > 1;
   const showFilterRow = showHostFilter || isSearchSupported;
-  const showLoadError = isError && agents.length === 0;
+  const showLoadError = isError && visibleAgents.length === 0;
 
   const handleBack = useCallback(() => {
     router.navigate(buildOpenProjectRoute());
@@ -189,7 +195,7 @@ function SessionsScreenContent() {
           </Button>
         </View>
       ) : null}
-      {!isInitialLoad && !showLoadError && agents.length === 0 ? (
+      {!isInitialLoad && !showLoadError && visibleAgents.length === 0 ? (
         <View style={styles.emptyContainer} testID="sessions-empty">
           <Text style={styles.emptyText}>{emptyText}</Text>
           {isSearching ? (
@@ -203,16 +209,19 @@ function SessionsScreenContent() {
           )}
         </View>
       ) : null}
-      {!isInitialLoad && !showLoadError && agents.length > 0 ? (
+      {!isInitialLoad && !showLoadError && visibleAgents.length > 0 ? (
         <AgentList
-          agents={agents}
+          agents={visibleAgents}
           showCheckoutInfo={false}
           isRefreshing={isManualRefresh}
           onRefresh={handleRefresh}
           listFooterComponent={listFooterComponent}
           showAttentionIndicator={false}
           showHostColumn
-          searchMatchesByAgentKey={isSearching ? searchMatchesByAgentKey : undefined}
+          searchMatchesByAgentKey={
+            isSearching ? collapsedHistory.searchMatchesByAgentKey : undefined
+          }
+          familyMemberCountByAgentKey={collapsedHistory.memberCountByAgentKey}
           flat={isSearching}
         />
       ) : null}

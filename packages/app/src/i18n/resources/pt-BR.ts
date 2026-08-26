@@ -200,6 +200,21 @@ export const ptBR: TranslationResources = {
     },
   },
   agentStream: {
+    family: {
+      fullHistory: "Histórico completo · {{count}} sessões",
+      loadFailed: "Não foi possível carregar parte do histórico",
+      searchPlaceholder: "Pesquisar nesta conversa",
+      clearSearch: "Limpar pesquisa da conversa",
+      matchCount: "{{current}} de {{total}}",
+      noMatches: "Nenhum resultado",
+      previousMatch: "Resultado anterior",
+      nextMatch: "Próximo resultado",
+      includeTools: "Incluir ferramentas",
+      conversationStarted: "Conversa iniciada em “{{title}}”",
+      continuedInNewSession: "Continuação em uma nova sessão: “{{title}}”",
+      readOnlySegment:
+        "Este é um segmento anterior somente para leitura. Continue pela sessão mais recente no Histórico.",
+    },
     empty: "Comece a conversar com este agente...",
     scrollToBottom: "Rolar para o fim",
     historyLoadFailed: "Não foi possível carregar o histórico do agente",
@@ -275,6 +290,7 @@ export const ptBR: TranslationResources = {
       archived: "Arquivado",
       pending: "{{count}} pendente(s)",
       attention: "Atenção",
+      sessionCount: "{{count}} sessões",
     },
     archiveSheet: {
       hostOffline: "Host offline",
