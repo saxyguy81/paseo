@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { buildAgentForkContextAttachment, curateAgentActivity } from "./activity-curator.js";
+import {
+  buildAgentContextOverflowContinuationPrompt,
+  buildAgentForkContextAttachment,
+  curateAgentActivity,
+} from "./activity-curator.js";
 import type { AgentTimelineItem } from "./agent-sdk-types.js";
 import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
 
@@ -265,6 +269,76 @@ second line'`,
 
   it("returns a default message when timeline is empty", () => {
     expect(curateAgentActivity([])).toBe("No activity to display.");
+  });
+
+  it("builds a bounded continuation from current state instead of copying the transcript", () => {
+    const oldRows = Array.from({ length: 100 }, (_, index) =>
+      row(index + 1, {
+        type: "user_message",
+        text: `old-transcript-marker-${index}-${"x".repeat(500)}`,
+      }),
+    );
+    const result = buildAgentContextOverflowContinuationPrompt({
+      maxChars: 1_500,
+      rows: [
+        ...oldRows,
+        row(101, { type: "user_message", text: "Finish the MR review and report blockers." }),
+        row(102, { type: "assistant_message", text: "I finished the diff and started tests." }),
+        row(
+          103,
+          toolCallItem({
+            callId: "test-1",
+            name: "Bash",
+            detail: { type: "shell", command: "npm test", output: "one failure", exitCode: 1 },
+          }),
+        ),
+      ],
+    });
+
+    expect(result).not.toBeNull();
+    expect(result?.length).toBeLessThanOrEqual(1_500);
+    expect(result).toContain("Finish the MR review and report blockers.");
+    expect(result).toContain("I finished the diff and started tests.");
+    expect(result).toContain("npm test");
+    expect(result).not.toContain("old-transcript-marker");
+    expect(result).not.toContain("<chat-history-summary>");
+  });
+
+  it("preserves a recent AskUserQuestion answer in the bounded continuation", () => {
+    const result = buildAgentContextOverflowContinuationPrompt({
+      maxChars: 2_000,
+      rows: [
+        row(1, { type: "user_message", text: "Choose the implementation and continue." }),
+        row(
+          2,
+          toolCallItem({
+            callId: "question-1",
+            name: "AskUserQuestion",
+            detail: {
+              type: "unknown",
+              input: {
+                questions: [{ question: "Which implementation?", header: "Choice" }],
+              },
+              output: { answers: { "Which implementation?": "Bounded rollover" } },
+            },
+          }),
+        ),
+        row(3, { type: "assistant_message", text: "[System Error] Prompt is too long" }),
+      ],
+    });
+
+    expect(result).toContain("Which implementation?");
+    expect(result).toContain("Bounded rollover");
+    expect(result).not.toContain("Prompt is too long");
+  });
+
+  it("refuses automatic continuation when the outstanding request cannot fit", () => {
+    expect(
+      buildAgentContextOverflowContinuationPrompt({
+        maxChars: 500,
+        rows: [row(1, { type: "user_message", text: "x".repeat(1_000) })],
+      }),
+    ).toBeNull();
   });
 
   it("builds fork context from user messages, assistant messages, and tool summaries", () => {

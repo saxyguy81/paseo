@@ -6,6 +6,12 @@ import {
   type AgentLifecycleStatus,
 } from "@getpaseo/protocol/agent-lifecycle";
 import {
+  CONVERSATION_FAMILY_CURRENT_LABEL,
+  CONVERSATION_FAMILY_HIDDEN_LABEL,
+  CONVERSATION_FAMILY_ID_LABEL,
+  CONVERSATION_FAMILY_NAME_LABEL,
+  CONVERSATION_FAMILY_POSITION_LABEL,
+  CONVERSATION_FAMILY_PREDECESSOR_LABEL,
   getParentAgentIdFromLabels,
   hasOpenAgentTab,
   isDelegatedAgent,
@@ -81,6 +87,7 @@ import {
   type ProviderSubagentDescriptor,
   type ProviderSubagentStoreEvent,
 } from "./provider-subagents/store.js";
+import { buildAgentContextOverflowContinuationPrompt } from "./activity-curator.js";
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
@@ -106,6 +113,24 @@ function submittedPromptText(prompt: AgentPromptInput): string {
     .flatMap((block) => (block.type === "text" && !("mimeType" in block) ? [block.text] : []))
     .join("\n")
     .trim();
+}
+
+function isContextOverflowFailureText(value: unknown): boolean {
+  if (typeof value !== "string") {
+    return false;
+  }
+  const normalized = value.toLowerCase();
+  return (
+    normalized.includes("prompt is too long") ||
+    normalized.includes("prompt too long") ||
+    /context (?:window|length).*(?:exceed|overflow|too (?:large|long))/.test(normalized) ||
+    /maximum context (?:window|length)/.test(normalized)
+  );
+}
+
+function parseFamilyPosition(value: string | null | undefined): number {
+  const position = Number(value);
+  return Number.isInteger(position) && position >= 0 ? position : 0;
 }
 
 export class AgentManagerShuttingDownError extends Error {
@@ -689,6 +714,7 @@ export class AgentManager {
   private readonly agentRegistrationTasks = new Set<Promise<void>>();
   private readonly inFlightAgentCloses = new Map<string, Promise<void>>();
   private readonly lifecycleMutationTails = new Map<string, Promise<void>>();
+  private readonly contextOverflowRollovers = new Map<string, Promise<string | null>>();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private readonly mcpAuthToken: string | null;
@@ -1090,6 +1116,170 @@ export class AgentManager {
       return await this.durableTimelineStore.getCommittedRows(id);
     }
     return this.timelineStore.getRows(id);
+  }
+
+  /**
+   * Ensure a context-exhausted agent has one fresh writable continuation.
+   * The durable predecessor marker is the idempotency key across daemon restarts.
+   */
+  async ensureAgentContextOverflowContinuation(agentId: string): Promise<string | null> {
+    const existing = this.contextOverflowRollovers.get(agentId);
+    if (existing) {
+      return existing;
+    }
+    const rollover = this.ensureAgentContextOverflowContinuationInternal(agentId);
+    this.contextOverflowRollovers.set(agentId, rollover);
+    try {
+      return await rollover;
+    } finally {
+      if (this.contextOverflowRollovers.get(agentId) === rollover) {
+        this.contextOverflowRollovers.delete(agentId);
+      }
+    }
+  }
+
+  private async ensureAgentContextOverflowContinuationInternal(
+    agentId: string,
+  ): Promise<string | null> {
+    const registry = this.requireRegistry();
+    const records = await registry.list();
+    const priorSuccessor = records.find(
+      (record) => record.labels?.[CONVERSATION_FAMILY_PREDECESSOR_LABEL] === agentId,
+    );
+    if (priorSuccessor) {
+      await this.repairContextOverflowFamily(agentId, priorSuccessor.id);
+      return priorSuccessor.id;
+    }
+
+    const predecessor = records.find((record) => record.id === agentId);
+    const latestError = this.agents.get(agentId)?.lastError ?? predecessor?.lastError;
+    if (!predecessor || !isContextOverflowFailureText(latestError)) {
+      return null;
+    }
+    let rows: readonly AgentTimelineRow[] = [];
+    if (this.agents.has(agentId)) {
+      rows = this.timelineStore.getRows(agentId);
+    } else if (this.durableTimelineStore) {
+      rows = await this.durableTimelineStore.getCommittedRows(agentId);
+    }
+    const prompt = buildAgentContextOverflowContinuationPrompt({ rows });
+    if (!prompt) {
+      this.logger.warn(
+        { agentId },
+        "Context overflow continuation was not created because no bounded handoff was safe",
+      );
+      return null;
+    }
+
+    const existingFamilyId = predecessor.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim();
+    const familyId = existingFamilyId || randomUUID();
+    const familyMembers = records.filter(
+      (record) =>
+        record.id === agentId || record.labels?.[CONVERSATION_FAMILY_ID_LABEL] === familyId,
+    );
+    const predecessorPosition = parseFamilyPosition(
+      predecessor.labels?.[CONVERSATION_FAMILY_POSITION_LABEL],
+    );
+    const highestPosition = Math.max(
+      predecessorPosition,
+      ...familyMembers.map((record) =>
+        parseFamilyPosition(record.labels?.[CONVERSATION_FAMILY_POSITION_LABEL]),
+      ),
+    );
+    const successorId = this.idFactory();
+    const familyName =
+      predecessor.labels?.[CONVERSATION_FAMILY_NAME_LABEL]?.trim() ||
+      predecessor.title?.trim() ||
+      "Conversation";
+    const successorLabels = Object.fromEntries(
+      Object.entries(predecessor.labels ?? {}).filter(
+        ([label]) => label !== CONVERSATION_FAMILY_HIDDEN_LABEL && !isOpenAgentTabLabel(label),
+      ),
+    );
+    Object.assign(successorLabels, {
+      [CONVERSATION_FAMILY_ID_LABEL]: familyId,
+      [CONVERSATION_FAMILY_CURRENT_LABEL]: successorId,
+      [CONVERSATION_FAMILY_NAME_LABEL]: familyName,
+      [CONVERSATION_FAMILY_POSITION_LABEL]: String(highestPosition + 1),
+      [CONVERSATION_FAMILY_PREDECESSOR_LABEL]: agentId,
+    });
+
+    const successor = await this.createAgent(buildStoredAgentConfig(predecessor), successorId, {
+      labels: successorLabels,
+      initialTitle: familyName,
+      workspaceId: predecessor.workspaceId,
+      owner: predecessor.owner,
+    });
+
+    await this.repairContextOverflowFamily(agentId, successor.id);
+
+    const continuation = this.consumeContextOverflowContinuation(successor.id, prompt);
+    this.trackBackgroundTask(continuation);
+    return successor.id;
+  }
+
+  private async repairContextOverflowFamily(
+    predecessorId: string,
+    successorId: string,
+  ): Promise<void> {
+    const records = await this.requireRegistry().list();
+    const predecessor = records.find((record) => record.id === predecessorId);
+    const successor = records.find((record) => record.id === successorId);
+    if (!predecessor || !successor) {
+      throw new Error("Context overflow family members are missing from storage");
+    }
+    const familyId =
+      successor.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim() ||
+      predecessor.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim();
+    if (!familyId) {
+      throw new Error("Context overflow successor has no conversation family id");
+    }
+    const familyName =
+      successor.labels?.[CONVERSATION_FAMILY_NAME_LABEL]?.trim() ||
+      predecessor.labels?.[CONVERSATION_FAMILY_NAME_LABEL]?.trim() ||
+      predecessor.title?.trim() ||
+      "Conversation";
+    const familyMembers = records.filter(
+      (record) =>
+        record.id === predecessorId ||
+        record.id === successorId ||
+        record.labels?.[CONVERSATION_FAMILY_ID_LABEL] === familyId,
+    );
+    for (const member of familyMembers) {
+      await this.writeLabels(member.id, {
+        [CONVERSATION_FAMILY_ID_LABEL]: familyId,
+        [CONVERSATION_FAMILY_CURRENT_LABEL]: successorId,
+        [CONVERSATION_FAMILY_NAME_LABEL]: familyName,
+        [CONVERSATION_FAMILY_POSITION_LABEL]: String(
+          parseFamilyPosition(member.labels?.[CONVERSATION_FAMILY_POSITION_LABEL]),
+        ),
+      });
+    }
+    await this.archiveContextOverflowPredecessor(predecessorId);
+  }
+
+  private async archiveContextOverflowPredecessor(agentId: string): Promise<void> {
+    await this.runLifecycleMutation(agentId, async () => {
+      if (this.agents.has(agentId)) {
+        await this.closeAgent(agentId);
+      }
+      const record = await this.requireRegistry().get(agentId);
+      if (!record || record.archivedAt) {
+        return;
+      }
+      await this.markRecordArchived(record);
+      this.discardRetainedAgentState(agentId);
+    });
+  }
+
+  private async consumeContextOverflowContinuation(agentId: string, prompt: string): Promise<void> {
+    try {
+      for await (const _event of this.streamAgent(agentId, prompt)) {
+        // Consuming the stream owns the foreground run; events are persisted by AgentManager.
+      }
+    } catch (error) {
+      this.logger.error({ err: error, agentId }, "Fresh context overflow continuation failed");
+    }
   }
 
   fetchTimeline(id: string, options?: AgentTimelineFetchOptions): AgentTimelineFetchResult {
@@ -3868,7 +4058,38 @@ export class AgentManager {
 
     this.traceHandleStreamEventEnd(agent, event, eventTurnId, flags);
 
+    this.scheduleContextOverflowContinuation(
+      agent,
+      event,
+      options?.fromHistory === true,
+      terminalDisposition,
+    );
+
     return flags.shouldNotifyWaiters;
+  }
+
+  private scheduleContextOverflowContinuation(
+    agent: ActiveManagedAgent,
+    event: AgentStreamEvent,
+    fromHistory: boolean,
+    terminalDisposition: ActiveTurnTerminalDisposition,
+  ): void {
+    if (
+      !fromHistory &&
+      event.type === "turn_failed" &&
+      event.failureKind === "context_overflow" &&
+      terminalDisposition !== "stale"
+    ) {
+      const rollover = this.ensureAgentContextOverflowContinuation(agent.id)
+        .then(() => undefined)
+        .catch((error) => {
+          this.logger.error(
+            { err: error, agentId: agent.id },
+            "Failed to create context overflow continuation",
+          );
+        });
+      this.trackBackgroundTask(rollover);
+    }
   }
 
   private traceHandleStreamEventStart(

@@ -743,6 +743,7 @@ export const AgentStreamEventPayloadSchema = z.discriminatedUnion("type", [
     provider: AgentProviderSchema,
     turnId: z.string().optional(),
     error: z.string(),
+    failureKind: z.literal("context_overflow").optional(),
     code: z.string().optional(),
     diagnostic: z.string().optional(),
   }),

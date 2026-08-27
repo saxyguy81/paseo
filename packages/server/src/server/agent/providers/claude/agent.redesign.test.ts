@@ -6,7 +6,12 @@ import { join } from "node:path";
 
 import { createTestLogger } from "../../../../test-utils/test-logger.js";
 import { asInternals } from "../../../test-utils/class-mocks.js";
-import { ClaudeAgentClient, readEventIdentifiers, readRetryableClaudeApiError } from "./agent.js";
+import {
+  ClaudeAgentClient,
+  readClaudeContextOverflowError,
+  readEventIdentifiers,
+  readRetryableClaudeApiError,
+} from "./agent.js";
 import { streamSession } from "../test-utils/session-stream-adapter.js";
 import type { AgentStreamEvent, AgentTimelineItem } from "../../agent-sdk-types.js";
 
@@ -222,6 +227,146 @@ test("recognizes only retryable synthetic Claude API failures", () => {
       message: { role: "assistant", content: "API Error: 502 Bad Gateway" },
     }),
   ).toBeNull();
+});
+
+test("classifies Claude context overflow without treating it as a same-session retry", () => {
+  const apiError = (text: string) => ({
+    type: "assistant",
+    isApiErrorMessage: true,
+    message: { role: "assistant", content: [{ type: "text", text }] },
+  });
+
+  expect(readClaudeContextOverflowError(apiError("API Error: prompt too long"))).toBe(
+    "API Error: prompt too long",
+  );
+  expect(readClaudeContextOverflowError(apiError("Prompt is too long"))).toBe("Prompt is too long");
+  expect(
+    readClaudeContextOverflowError({
+      type: "result",
+      subtype: "error_during_execution",
+      errors: ["maximum context length exceeded"],
+    }),
+  ).toBe("maximum context length exceeded");
+  expect(readClaudeContextOverflowError(apiError("API Error: 502 Bad Gateway"))).toBeNull();
+  expect(readRetryableClaudeApiError(apiError("API Error: prompt too long"))).toBeNull();
+});
+
+test("keeps context overflow classified after an AskUserQuestion response", async () => {
+  let canUseTool:
+    | ((
+        name: string,
+        input: Record<string, unknown>,
+        options: { toolUseID: string },
+      ) => Promise<unknown>)
+    | undefined;
+  let step = 0;
+  sdkQueryFactory.mockImplementation(
+    ({ options }: { options: { canUseTool?: typeof canUseTool } }) => {
+      canUseTool = options.canUseTool;
+      return createBaseQueryMock(
+        vi.fn(async () => {
+          if (step === 0) {
+            step += 1;
+            return {
+              done: false,
+              value: {
+                type: "system",
+                subtype: "init",
+                session_id: "question-overflow-session",
+                permissionMode: "default",
+                model: "opus",
+              },
+            };
+          }
+          if (step === 1) {
+            step += 1;
+            await canUseTool?.(
+              "AskUserQuestion",
+              {
+                questions: [
+                  {
+                    question: "Which implementation should I use?",
+                    header: "Choice",
+                    options: [{ label: "Bounded rollover", description: "Use a new session" }],
+                    multiSelect: false,
+                  },
+                ],
+              },
+              { toolUseID: "question-1" },
+            );
+            return {
+              done: false,
+              value: {
+                type: "assistant",
+                uuid: "prompt-too-long-assistant-uuid",
+                session_id: "question-overflow-session",
+                isApiErrorMessage: true,
+                message: {
+                  role: "assistant",
+                  content: [{ type: "text", text: "Prompt is too long" }],
+                },
+              },
+            };
+          }
+          if (step === 2) {
+            step += 1;
+            return {
+              done: false,
+              value: {
+                type: "result",
+                subtype: "error_during_execution",
+                uuid: "prompt-too-long-result-uuid",
+                session_id: "question-overflow-session",
+                usage: buildUsage(),
+                errors: ["Prompt is too long"],
+                total_cost_usd: 0,
+              },
+            };
+          }
+          return { done: true, value: undefined };
+        }),
+      );
+    },
+  );
+
+  const session = await createSession();
+  const observed: AgentStreamEvent[] = [];
+  const unsubscribe = session.subscribe((event) => observed.push(event));
+  try {
+    const eventsPromise = collectUntilTerminal(streamSession(session, "continue the review"));
+    await vi.waitFor(() => {
+      expect(observed.some((event) => event.type === "permission_requested")).toBe(true);
+    });
+    const request = observed.find(
+      (event): event is Extract<AgentStreamEvent, { type: "permission_requested" }> =>
+        event.type === "permission_requested",
+    );
+    if (!request) throw new Error("Expected AskUserQuestion permission request");
+    await session.respondToPermission(request.request.id, {
+      behavior: "allow",
+      updatedInput: { answers: { Choice: "Bounded rollover" } },
+    });
+
+    const events = await eventsPromise;
+    expect(events.find((event) => event.type === "turn_failed")).toMatchObject({
+      type: "turn_failed",
+      error: "Prompt is too long",
+      failureKind: "context_overflow",
+    });
+    const answeredQuestion = events.find(
+      (event): event is Extract<AgentStreamEvent, { type: "timeline" }> =>
+        event.type === "timeline" &&
+        event.item.type === "tool_call" &&
+        event.item.name === "AskUserQuestion" &&
+        event.item.status === "completed",
+    );
+    expect(answeredQuestion).toBeDefined();
+    expect(JSON.stringify(answeredQuestion?.item)).toContain("Bounded rollover");
+    expect(sdkQueryFactory).toHaveBeenCalledTimes(1);
+  } finally {
+    unsubscribe();
+    await session.close();
+  }
 });
 
 test("recycles Claude once and continues a foreground turn after a pre-work API failure", async () => {

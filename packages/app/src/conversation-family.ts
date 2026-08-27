@@ -1,13 +1,22 @@
 import type { AgentSearchMatch } from "@getpaseo/protocol/messages";
+import {
+  CONVERSATION_FAMILY_CURRENT_LABEL,
+  CONVERSATION_FAMILY_HIDDEN_LABEL,
+  CONVERSATION_FAMILY_ID_LABEL,
+  CONVERSATION_FAMILY_NAME_LABEL,
+  CONVERSATION_FAMILY_POSITION_LABEL,
+} from "@getpaseo/protocol/agent-labels";
 import type { AggregatedAgent } from "@/hooks/use-aggregated-agents";
 import type { StreamItem } from "@/types/stream";
 import { isGroupableToolCall } from "@/tool-calls/detail-level/grouping";
 
-export const CONVERSATION_FAMILY_ID_LABEL = "paseo.family.id";
-export const CONVERSATION_FAMILY_CURRENT_LABEL = "paseo.family.current";
-export const CONVERSATION_FAMILY_NAME_LABEL = "paseo.family.name";
-export const CONVERSATION_FAMILY_POSITION_LABEL = "paseo.family.position";
-export const CONVERSATION_FAMILY_HIDDEN_LABEL = "paseo.family.hidden";
+export {
+  CONVERSATION_FAMILY_CURRENT_LABEL,
+  CONVERSATION_FAMILY_HIDDEN_LABEL,
+  CONVERSATION_FAMILY_ID_LABEL,
+  CONVERSATION_FAMILY_NAME_LABEL,
+  CONVERSATION_FAMILY_POSITION_LABEL,
+};
 
 export interface ConversationFamilyMetadata {
   id: string;

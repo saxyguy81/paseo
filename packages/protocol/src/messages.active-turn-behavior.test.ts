@@ -55,6 +55,22 @@ describe("canonical timeline turn ID compatibility", () => {
       "turn-1",
     );
   });
+
+  it("preserves the classified Claude context-overflow failure kind", () => {
+    const failure = AgentStreamEventPayloadSchema.parse({
+      type: "turn_failed",
+      provider: "claude",
+      error: "Prompt is too long",
+      failureKind: "context_overflow",
+    });
+
+    expect(failure).toMatchObject({
+      type: "turn_failed",
+      provider: "claude",
+      error: "Prompt is too long",
+      failureKind: "context_overflow",
+    });
+  });
 });
 
 describe("legacy daemon send request schema compatibility", () => {

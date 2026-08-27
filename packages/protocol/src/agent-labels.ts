@@ -1,4 +1,10 @@
 export const PARENT_AGENT_ID_LABEL = "paseo.parent-agent-id";
+export const CONVERSATION_FAMILY_ID_LABEL = "paseo.family.id";
+export const CONVERSATION_FAMILY_CURRENT_LABEL = "paseo.family.current";
+export const CONVERSATION_FAMILY_NAME_LABEL = "paseo.family.name";
+export const CONVERSATION_FAMILY_POSITION_LABEL = "paseo.family.position";
+export const CONVERSATION_FAMILY_HIDDEN_LABEL = "paseo.family.hidden";
+export const CONVERSATION_FAMILY_PREDECESSOR_LABEL = "paseo.family.predecessor";
 const OPEN_AGENT_TAB_LABEL_PREFIX = "paseo.open-agent-tab.";
 
 export function getOpenAgentTabLabel(clientId: string): string {
