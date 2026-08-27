@@ -3,7 +3,7 @@ import type { Logger } from "pino";
 
 import { createTestLogger } from "../../../../test-utils/test-logger.js";
 import { asInternals } from "../../../test-utils/class-mocks.js";
-import { ClaudeAgentClient, readEventIdentifiers } from "./agent.js";
+import { ClaudeAgentClient, readEventIdentifiers, readRetryableClaudeApiError } from "./agent.js";
 import { streamSession } from "../test-utils/session-stream-adapter.js";
 import type { AgentStreamEvent, AgentTimelineItem } from "../../agent-sdk-types.js";
 
@@ -173,6 +173,254 @@ beforeEach(() => {
 
 afterEach(() => {
   sdkQueryFactory.mockReset();
+});
+
+test("recognizes only retryable synthetic Claude API failures", () => {
+  const apiError = (text: string) => ({
+    type: "assistant",
+    isApiErrorMessage: true,
+    message: { role: "assistant", content: [{ type: "text", text }] },
+  });
+
+  expect(readRetryableClaudeApiError(apiError("API Error: 502 Bad Gateway"))).toBe(
+    "API Error: 502 Bad Gateway",
+  );
+  expect(
+    readRetryableClaudeApiError(
+      apiError("API Error: 409 Conversation already has an active request"),
+    ),
+  ).toBe("API Error: 409 Conversation already has an active request");
+  expect(readRetryableClaudeApiError(apiError("API Error: connection error (ECONNRESET)"))).toBe(
+    "API Error: connection error (ECONNRESET)",
+  );
+  expect(readRetryableClaudeApiError(apiError("API Error: 401 Invalid API key"))).toBeNull();
+  expect(readRetryableClaudeApiError(apiError("API Error: 429 Rate limit exceeded"))).toBeNull();
+  expect(readRetryableClaudeApiError(apiError("API Error: prompt too long"))).toBeNull();
+  expect(
+    readRetryableClaudeApiError({
+      type: "assistant",
+      message: { role: "assistant", content: "API Error: 502 Bad Gateway" },
+    }),
+  ).toBeNull();
+});
+
+test("recycles Claude once and continues a foreground turn after a pre-work API failure", async () => {
+  vi.useFakeTimers();
+  const recoveryPrompts: unknown[] = [];
+  let queryNumber = 0;
+
+  sdkQueryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    queryNumber += 1;
+    if (queryNumber === 1) {
+      const readPromptUuid = createPromptUuidReader(prompt);
+      let step = 0;
+      return createBaseQueryMock(
+        vi.fn(async () => {
+          if (step === 0) {
+            step += 1;
+            return {
+              done: false,
+              value: {
+                type: "system",
+                subtype: "init",
+                session_id: "api-recovery-session",
+                permissionMode: "default",
+                model: "opus",
+              },
+            };
+          }
+          if (step === 1) {
+            step += 1;
+            return {
+              done: false,
+              value: {
+                type: "user",
+                message: { role: "user", content: "original request" },
+                parent_tool_use_id: null,
+                uuid: (await readPromptUuid()) ?? "missing-prompt-uuid",
+                session_id: "api-recovery-session",
+              },
+            };
+          }
+          if (step === 2) {
+            step += 1;
+            return {
+              done: false,
+              value: {
+                type: "assistant",
+                isApiErrorMessage: true,
+                message: {
+                  role: "assistant",
+                  content: [{ type: "text", text: "API Error: 502 Bad Gateway" }],
+                },
+              },
+            };
+          }
+          if (step === 3) {
+            step += 1;
+            return {
+              done: false,
+              value: {
+                type: "result",
+                subtype: "error",
+                usage: buildUsage(),
+                errors: ["stale API failure from retired query"],
+                total_cost_usd: 0,
+              },
+            };
+          }
+          return { done: true, value: undefined };
+        }),
+      );
+    }
+
+    const iterator = prompt[Symbol.asyncIterator]();
+    let step = 0;
+    return createBaseQueryMock(
+      vi.fn(async () => {
+        if (step === 0) {
+          step += 1;
+          const next = await iterator.next();
+          recoveryPrompts.push(next.value);
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              message: { role: "assistant", content: "recovered output" },
+            },
+          };
+        }
+        if (step === 1) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "result",
+              subtype: "success",
+              usage: buildUsage(),
+              total_cost_usd: 0,
+            },
+          };
+        }
+        return { done: true, value: undefined };
+      }),
+    );
+  });
+
+  const session = await createSession();
+  try {
+    const eventsPromise = collectUntilTerminal(streamSession(session, "original request"));
+    await vi.advanceTimersByTimeAsync(2_001);
+    const events = await eventsPromise;
+
+    expect(sdkQueryFactory).toHaveBeenCalledTimes(2);
+    expect(events.filter((event) => event.type === "turn_started")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "turn_completed")).toHaveLength(1);
+    expect(events.some((event) => event.type === "turn_failed")).toBe(false);
+    expect(
+      events.some(
+        (event) =>
+          event.type === "timeline" &&
+          event.item.type === "assistant_message" &&
+          event.item.text.includes("API Error"),
+      ),
+    ).toBe(false);
+    expect(
+      events.some(
+        (event) =>
+          event.type === "timeline" &&
+          event.item.type === "assistant_message" &&
+          event.item.text.includes("recovered output"),
+      ),
+    ).toBe(true);
+    expect(recoveryPrompts).toHaveLength(1);
+    expect(JSON.stringify(recoveryPrompts[0])).toContain("<paseo-system>");
+    expect(JSON.stringify(recoveryPrompts[0])).toContain(
+      "Continue the latest unfinished user instruction",
+    );
+  } finally {
+    await session.close();
+    vi.useRealTimers();
+  }
+});
+
+test("does not replay a turn after Claude has emitted substantive work", async () => {
+  let step = 0;
+  sdkQueryFactory.mockImplementation(() =>
+    createBaseQueryMock(
+      vi.fn(async () => {
+        if (step === 0) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "system",
+              subtype: "init",
+              session_id: "api-failure-after-work-session",
+              permissionMode: "default",
+              model: "opus",
+            },
+          };
+        }
+        if (step === 1) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              message: { role: "assistant", content: "I changed the implementation." },
+            },
+          };
+        }
+        if (step === 2) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              isApiErrorMessage: true,
+              message: {
+                role: "assistant",
+                content: [{ type: "text", text: "API Error: 502 Bad Gateway" }],
+              },
+            },
+          };
+        }
+        if (step === 3) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "result",
+              subtype: "error",
+              usage: buildUsage(),
+              errors: ["API Error: 502 Bad Gateway"],
+              total_cost_usd: 0,
+            },
+          };
+        }
+        return { done: true, value: undefined };
+      }),
+    ),
+  );
+
+  const session = await createSession();
+  try {
+    const events = await collectUntilTerminal(streamSession(session, "make a change"));
+
+    expect(sdkQueryFactory).toHaveBeenCalledTimes(1);
+    expect(events.some((event) => event.type === "turn_failed")).toBe(true);
+    expect(
+      events.some(
+        (event) =>
+          event.type === "timeline" &&
+          event.item.type === "assistant_message" &&
+          event.item.text.includes("I changed the implementation"),
+      ),
+    ).toBe(true);
+  } finally {
+    await session.close();
+  }
 });
 
 test("exposes and applies auto permission mode", async () => {

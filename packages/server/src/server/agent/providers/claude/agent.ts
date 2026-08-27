@@ -514,6 +514,53 @@ interface ClaudeOptionsLogSummary {
 const MAX_RECENT_STDERR_CHARS = 4000;
 const STDERR_FLUSH_WAIT_MS = 150;
 const STDERR_FLUSH_POLL_INTERVAL_MS = 10;
+const CLAUDE_API_RECOVERY_DELAY_MS = 2_000;
+const CLAUDE_API_RECOVERY_PROMPT = `<paseo-system>
+The preceding request failed before any work began because of a transient API error. Continue the latest unfinished user instruction now. Do not repeat completed work.
+</paseo-system>`;
+
+/**
+ * Claude Code normally retries transport failures itself. Occasionally it gives up and emits a
+ * synthetic assistant message instead of a result. Retrying that narrow failure class is safe only
+ * before the turn has produced assistant work; authentication, quota, model, and prompt-size errors
+ * need a real configuration change and must remain visible to the user.
+ */
+export function readRetryableClaudeApiError(message: unknown): string | null {
+  const record = toObjectRecord(message);
+  if (record?.type !== "assistant" || record.isApiErrorMessage !== true) {
+    return null;
+  }
+
+  const assistantMessage = toObjectRecord(record.message);
+  const text = collectClaudeTextContentParts(assistantMessage?.content).join("\n").trim();
+  if (!/^API Error:/i.test(text)) {
+    return null;
+  }
+
+  if (/^API Error:\s*409\s+Conversation already has an active request\b/i.test(text)) {
+    return text;
+  }
+  if (/^API Error:\s*(?:408|500|502|503|504|529)\b/i.test(text)) {
+    return text;
+  }
+  if (
+    /^API Error:.*(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|socket hang up|fetch failed|connection error)/i.test(
+      text,
+    )
+  ) {
+    return text;
+  }
+  return null;
+}
+
+function isForegroundProviderActivityEvent(event: AgentStreamEvent): boolean {
+  return (
+    event.type === "permission_requested" ||
+    event.type === "permission_resolved" ||
+    event.type === "provider_subagent" ||
+    (event.type === "timeline" && event.item.type !== "user_message")
+  );
+}
 
 function summarizeClaudeOptionsForLog(options: ClaudeOptions): ClaudeOptionsLogSummary {
   const systemPromptRaw = options.systemPrompt;
@@ -2081,6 +2128,8 @@ class ClaudeAgentSession implements AgentSession {
   private pendingInterruptAbort = false;
   private foregroundHasVisibleActivity = false;
   private activeTurnHasAssistantText = false;
+  private foregroundHasProviderActivity = false;
+  private foregroundApiRecoveryAttempts = 0;
   private readonly contextUsage: ClaudeContextUsageState;
   private userMessageIds: string[] = [];
   private readonly emittedUserMessageIds = new Set<string>();
@@ -2219,6 +2268,8 @@ class ClaudeAgentSession implements AgentSession {
     this.activeForegroundTurnId = turnId;
     this.foregroundHasVisibleActivity = false;
     this.activeTurnHasAssistantText = false;
+    this.foregroundHasProviderActivity = false;
+    this.foregroundApiRecoveryAttempts = 0;
     this.contextUsage.beginTurn();
     this.transitionTurnState("foreground", "foreground turn started");
     this.clearRecentStderr();
@@ -3553,6 +3604,8 @@ class ClaudeAgentSession implements AgentSession {
     this.activeForegroundInput = null;
     this.cancelCurrentTurn = null;
     this.activeTurnHasAssistantText = false;
+    this.foregroundHasProviderActivity = false;
+    this.foregroundApiRecoveryAttempts = 0;
     this.syncTurnState("foreground turn terminal");
   }
 
@@ -3570,6 +3623,8 @@ class ClaudeAgentSession implements AgentSession {
         this.activeForegroundInput = null;
         this.cancelCurrentTurn = null;
         this.activeTurnHasAssistantText = false;
+        this.foregroundHasProviderActivity = false;
+        this.foregroundApiRecoveryAttempts = 0;
         this.syncTurnState("foreground turn terminal");
       } else if (this.autonomousTurn) {
         this.autonomousTurn = null;
@@ -3731,7 +3786,7 @@ class ClaudeAgentSession implements AgentSession {
       if (await this.handleMissingResumedConversation(message, activeQuery)) {
         return true;
       }
-      await this.routeSdkMessageFromPump(message);
+      await this.routeSdkMessageFromPump(message, activeQuery);
       return false;
     };
     const drainActiveQuery = async (): Promise<boolean> => {
@@ -3820,8 +3875,84 @@ class ClaudeAgentSession implements AgentSession {
     return this.isAssistantishMessage(message);
   }
 
-  private async routeSdkMessageFromPump(message: SDKMessage): Promise<void> {
+  private async recoverForegroundFromApiError(
+    message: SDKMessage,
+    sourceQuery: Query,
+  ): Promise<boolean> {
+    const errorMessage = readRetryableClaudeApiError(message);
+    if (!errorMessage) {
+      return false;
+    }
+
+    const turnId = this.activeForegroundTurnId;
+    if (
+      !turnId ||
+      this.activeForegroundQuery !== sourceQuery ||
+      this.query !== sourceQuery ||
+      this.foregroundHasProviderActivity ||
+      this.activeTurnHasAssistantText ||
+      this.foregroundApiRecoveryAttempts >= 1
+    ) {
+      return false;
+    }
+
+    this.foregroundApiRecoveryAttempts += 1;
+    this.logger.warn(
+      { error: errorMessage, attempt: this.foregroundApiRecoveryAttempts },
+      "Recycling Claude provider after a retryable pre-work API failure",
+    );
+
+    try {
+      this.queryRestartNeeded = true;
+      const recoveredQuery = await this.ensureQuery();
+      const recoveredInput = this.input;
+      if (!recoveredInput) {
+        throw new Error("Claude session input stream not initialized after API recovery");
+      }
+      if (!this.activeForegroundTurnId || this.activeForegroundTurnId !== turnId) {
+        return true;
+      }
+
+      this.activeForegroundQuery = recoveredQuery;
+      this.activeForegroundInput = recoveredInput;
+      this.startQueryPump();
+      await new Promise<void>((resolve) => setTimeout(resolve, CLAUDE_API_RECOVERY_DELAY_MS));
+
+      if (!this.activeForegroundTurnId || this.activeForegroundTurnId !== turnId) {
+        return true;
+      }
+      if (
+        this.query !== recoveredQuery ||
+        this.input !== recoveredInput ||
+        this.activeForegroundQuery !== recoveredQuery ||
+        this.activeForegroundInput !== recoveredInput
+      ) {
+        throw new Error("Claude provider changed while recovering from a transient API failure");
+      }
+
+      recoveredInput.push(this.toSdkUserMessage(CLAUDE_API_RECOVERY_PROMPT));
+      return true;
+    } catch (error) {
+      if (this.activeForegroundTurnId === turnId) {
+        this.finishForegroundTurn(
+          this.buildTurnFailedEvent(
+            error instanceof Error ? error.message : "Claude API recovery failed",
+          ),
+        );
+      }
+      return true;
+    }
+  }
+
+  private async routeSdkMessageFromPump(message: SDKMessage, sourceQuery: Query): Promise<void> {
+    if (this.query && this.query !== sourceQuery) {
+      this.logger.debug("Suppressing a trailing message from a retired Claude provider query");
+      return;
+    }
     if (this.shouldSuppressStaleResult(message)) {
+      return;
+    }
+    if (await this.recoverForegroundFromApiError(message, sourceQuery)) {
       return;
     }
 
@@ -3865,13 +3996,21 @@ class ClaudeAgentSession implements AgentSession {
       this.logger.debug("Suppressing stale Claude interrupt terminal result");
       return;
     }
+    this.rememberForegroundActivity(events);
+
+    this.dispatchEvents(events);
+  }
+
+  private rememberForegroundActivity(events: AgentStreamEvent[]): void {
     if (
       events.some((event) => event.type === "timeline" && event.item.type === "assistant_message")
     ) {
       this.activeTurnHasAssistantText = true;
     }
+    if (!this.activeForegroundTurnId) {
+      return;
+    }
     if (
-      this.activeForegroundTurnId &&
       events.some(
         (event) =>
           event.type === "timeline" ||
@@ -3881,8 +4020,9 @@ class ClaudeAgentSession implements AgentSession {
     ) {
       this.foregroundHasVisibleActivity = true;
     }
-
-    this.dispatchEvents(events);
+    if (events.some(isForegroundProviderActivityEvent)) {
+      this.foregroundHasProviderActivity = true;
+    }
   }
 
   private async buildPumpedMessageEvents(
