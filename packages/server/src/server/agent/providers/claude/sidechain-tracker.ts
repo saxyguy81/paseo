@@ -76,6 +76,10 @@ export class ClaudeSidechainTracker {
     this.needsSyntheticParentToolCard = input.needsSyntheticParentToolCard ?? (() => true);
   }
 
+  get hasActiveSidechains(): boolean {
+    return this.activeSidechains.size > 0;
+  }
+
   handleMessage(message: SDKMessage, parentToolUseId: string): AgentStreamEvent[] {
     const state =
       this.activeSidechains.get(parentToolUseId) ??

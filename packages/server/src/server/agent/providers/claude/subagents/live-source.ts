@@ -208,6 +208,13 @@ export class ClaudeTaskProtocolSource {
     return this.sawAnyTask;
   }
 
+  get hasRunningForegroundTasks(): boolean {
+    for (const [id, status] of this.lastStatusById) {
+      if (status === "running" && !this.backgroundedIds.has(id)) return true;
+    }
+    return false;
+  }
+
   /**
    * Whether this source declared the given subagent. Callers route frames through this before
    * attributing anything to an id: a frame for a task that was never declared belongs to work

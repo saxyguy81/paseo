@@ -50,6 +50,25 @@ function taskProgress(usage: Record<string, number>, taskId = "a1730a6215e1f5cf6
 }
 
 describe("ClaudeTaskProtocolSource", () => {
+  it("reports only running foreground tasks as unsafe recovery activity", () => {
+    const source = new ClaudeTaskProtocolSource();
+
+    expect(source.hasRunningForegroundTasks).toBe(false);
+    source.observe(taskStarted());
+    expect(source.hasRunningForegroundTasks).toBe(true);
+
+    source.observe({
+      type: "system",
+      subtype: "task_updated",
+      task_id: "a1730a6215e1f5cf6",
+      patch: { is_backgrounded: true },
+    } as unknown as SDKMessage);
+    expect(source.hasRunningForegroundTasks).toBe(false);
+
+    source.observe(taskUpdated("completed"));
+    expect(source.hasRunningForegroundTasks).toBe(false);
+  });
+
   it("declares a subagent from its announcement, keyed by the Task tool_use id", () => {
     const source = new ClaudeTaskProtocolSource();
 

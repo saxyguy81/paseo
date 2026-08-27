@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { Logger } from "pino";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { createTestLogger } from "../../../../test-utils/test-logger.js";
 import { asInternals } from "../../../test-utils/class-mocks.js";
@@ -73,6 +76,20 @@ async function createSession() {
   return client.createSession({
     provider: "claude",
     cwd: process.cwd(),
+  });
+}
+
+async function createResumedSession(sessionId: string) {
+  const client = new ClaudeAgentClient({
+    logger: createTestLogger(),
+    queryFactory: sdkQueryFactory,
+    resolveBinary: async () => "/test/claude/bin",
+  });
+  return client.resumeSession({
+    provider: "claude",
+    sessionId,
+    nativeHandle: sessionId,
+    metadata: { cwd: process.cwd() },
   });
 }
 
@@ -192,6 +209,9 @@ test("recognizes only retryable synthetic Claude API failures", () => {
   ).toBe("API Error: 409 Conversation already has an active request");
   expect(readRetryableClaudeApiError(apiError("API Error: connection error (ECONNRESET)"))).toBe(
     "API Error: connection error (ECONNRESET)",
+  );
+  expect(readRetryableClaudeApiError(apiError("API Error: The operation timed out."))).toBe(
+    "API Error: The operation timed out.",
   );
   expect(readRetryableClaudeApiError(apiError("API Error: 401 Invalid API key"))).toBeNull();
   expect(readRetryableClaudeApiError(apiError("API Error: 429 Rate limit exceeded"))).toBeNull();
@@ -344,10 +364,15 @@ test("recycles Claude once and continues a foreground turn after a pre-work API 
   }
 });
 
-test("does not replay a turn after Claude has emitted substantive work", async () => {
+test("continues once on the same query after a transient post-work API failure", async () => {
+  const previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
+  const recoveryConfigDir = mkdtempSync(join(tmpdir(), "paseo-api-recovery-test-"));
+  process.env.CLAUDE_CONFIG_DIR = recoveryConfigDir;
+  const prompts: unknown[] = [];
   let step = 0;
-  sdkQueryFactory.mockImplementation(() =>
-    createBaseQueryMock(
+  sdkQueryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    const iterator = prompt[Symbol.asyncIterator]();
+    return createBaseQueryMock(
       vi.fn(async () => {
         if (step === 0) {
           step += 1;
@@ -364,11 +389,16 @@ test("does not replay a turn after Claude has emitted substantive work", async (
         }
         if (step === 1) {
           step += 1;
+          const next = await iterator.next();
+          prompts.push(next.value);
           return {
             done: false,
             value: {
-              type: "assistant",
-              message: { role: "assistant", content: "I changed the implementation." },
+              type: "user",
+              message: { role: "user", content: "make a change" },
+              parent_tool_use_id: null,
+              uuid: "post-work-original-user",
+              session_id: "api-failure-after-work-session",
             },
           };
         }
@@ -378,10 +408,251 @@ test("does not replay a turn after Claude has emitted substantive work", async (
             done: false,
             value: {
               type: "assistant",
+              uuid: "post-work-assistant",
+              message: { role: "assistant", content: "I changed the implementation." },
+            },
+          };
+        }
+        if (step === 3) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              uuid: "post-work-timeout",
               isApiErrorMessage: true,
               message: {
                 role: "assistant",
-                content: [{ type: "text", text: "API Error: 502 Bad Gateway" }],
+                content: [{ type: "text", text: "API Error: The operation timed out." }],
+              },
+            },
+          };
+        }
+        if (step === 4) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "result",
+              subtype: "error",
+              usage: buildUsage(),
+              errors: ["API Error: The operation timed out."],
+              total_cost_usd: 0,
+            },
+          };
+        }
+        if (step === 5) {
+          step += 1;
+          const next = await iterator.next();
+          prompts.push(next.value);
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              uuid: "post-work-recovered-assistant",
+              message: { role: "assistant", content: "I finished the remaining work." },
+            },
+          };
+        }
+        if (step === 6) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "result",
+              subtype: "success",
+              usage: buildUsage(),
+              total_cost_usd: 0,
+            },
+          };
+        }
+        return { done: true, value: undefined };
+      }),
+    );
+  });
+
+  const session = await createSession();
+  try {
+    const events = await collectUntilTerminal(streamSession(session, "make a change"));
+
+    expect(sdkQueryFactory).toHaveBeenCalledTimes(1);
+    expect(events.filter((event) => event.type === "turn_started")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "turn_completed")).toHaveLength(1);
+    expect(events.some((event) => event.type === "turn_failed")).toBe(false);
+    expect(
+      events.some(
+        (event) =>
+          event.type === "timeline" &&
+          event.item.type === "assistant_message" &&
+          event.item.text.includes("I changed the implementation"),
+      ),
+    ).toBe(true);
+    expect(
+      events.some(
+        (event) =>
+          event.type === "timeline" &&
+          event.item.type === "assistant_message" &&
+          event.item.text.includes("I finished the remaining work"),
+      ),
+    ).toBe(true);
+    expect(prompts).toHaveLength(2);
+    expect(JSON.stringify(prompts[0])).toContain("make a change");
+    expect(JSON.stringify(prompts[1])).toContain("Continue from the last completed step");
+    expect(JSON.stringify(prompts[1])).not.toContain("make a change");
+  } finally {
+    await session.close();
+    restoreEnvValue("CLAUDE_CONFIG_DIR", previousConfigDir);
+    rmSync(recoveryConfigDir, { recursive: true, force: true });
+  }
+});
+
+test("stops after one post-work continuation when the transient API failure repeats", async () => {
+  const previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
+  const recoveryConfigDir = mkdtempSync(join(tmpdir(), "paseo-api-recovery-repeat-test-"));
+  process.env.CLAUDE_CONFIG_DIR = recoveryConfigDir;
+  const prompts: unknown[] = [];
+  let step = 0;
+  sdkQueryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    const iterator = prompt[Symbol.asyncIterator]();
+    return createBaseQueryMock(
+      vi.fn(async () => {
+        if (step === 0) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "system",
+              subtype: "init",
+              session_id: "api-failure-repeat-session",
+              permissionMode: "default",
+              model: "opus",
+            },
+          };
+        }
+        if (step === 1) {
+          step += 1;
+          const next = await iterator.next();
+          prompts.push(next.value);
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              uuid: "repeat-work",
+              message: { role: "assistant", content: "I completed one step." },
+            },
+          };
+        }
+        if (step === 2 || step === 5) {
+          const attempt = step === 2 ? "first" : "second";
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              uuid: `${attempt}-post-work-timeout`,
+              isApiErrorMessage: true,
+              message: {
+                role: "assistant",
+                content: [{ type: "text", text: "API Error: The operation timed out." }],
+              },
+            },
+          };
+        }
+        if (step === 3 || step === 6) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "result",
+              subtype: "error",
+              usage: buildUsage(),
+              errors: ["API Error: The operation timed out."],
+              total_cost_usd: 0,
+            },
+          };
+        }
+        if (step === 4) {
+          step += 1;
+          const next = await iterator.next();
+          prompts.push(next.value);
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              uuid: "repeat-recovery-progress",
+              message: { role: "assistant", content: "I resumed once." },
+            },
+          };
+        }
+        return { done: true, value: undefined };
+      }),
+    );
+  });
+
+  const session = await createSession();
+  try {
+    const events = await collectUntilTerminal(streamSession(session, "make a change"));
+
+    expect(events.filter((event) => event.type === "turn_failed")).toHaveLength(1);
+    expect(events.some((event) => event.type === "turn_completed")).toBe(false);
+    expect(prompts).toHaveLength(2);
+    expect(JSON.stringify(prompts[0])).toContain("make a change");
+    expect(JSON.stringify(prompts[1])).toContain("Continue from the last completed step");
+    expect(JSON.stringify(prompts[1])).not.toContain("make a change");
+  } finally {
+    await session.close();
+    restoreEnvValue("CLAUDE_CONFIG_DIR", previousConfigDir);
+    rmSync(recoveryConfigDir, { recursive: true, force: true });
+  }
+});
+
+test("does not continue a post-work API failure while a tool call is still open", async () => {
+  const prompts: unknown[] = [];
+  let step = 0;
+  sdkQueryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    const iterator = prompt[Symbol.asyncIterator]();
+    return createBaseQueryMock(
+      vi.fn(async () => {
+        if (step === 0) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "system",
+              subtype: "init",
+              session_id: "api-failure-open-tool-session",
+              permissionMode: "default",
+              model: "opus",
+            },
+          };
+        }
+        if (step === 1) {
+          step += 1;
+          const next = await iterator.next();
+          prompts.push(next.value);
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              uuid: "open-tool-assistant",
+              message: {
+                role: "assistant",
+                content: [{ type: "tool_use", id: "tool-still-open", name: "Bash", input: {} }],
+              },
+            },
+          };
+        }
+        if (step === 2) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              uuid: "open-tool-timeout",
+              isApiErrorMessage: true,
+              message: {
+                role: "assistant",
+                content: [{ type: "text", text: "API Error: The operation timed out." }],
               },
             },
           };
@@ -394,32 +665,147 @@ test("does not replay a turn after Claude has emitted substantive work", async (
               type: "result",
               subtype: "error",
               usage: buildUsage(),
-              errors: ["API Error: 502 Bad Gateway"],
+              errors: ["API Error: The operation timed out."],
               total_cost_usd: 0,
             },
           };
         }
         return { done: true, value: undefined };
       }),
-    ),
-  );
+    );
+  });
 
   const session = await createSession();
   try {
-    const events = await collectUntilTerminal(streamSession(session, "make a change"));
+    const events = await collectUntilTerminal(streamSession(session, "run the tool"));
 
-    expect(sdkQueryFactory).toHaveBeenCalledTimes(1);
     expect(events.some((event) => event.type === "turn_failed")).toBe(true);
-    expect(
-      events.some(
-        (event) =>
-          event.type === "timeline" &&
-          event.item.type === "assistant_message" &&
-          event.item.text.includes("I changed the implementation"),
-      ),
-    ).toBe(true);
+    expect(prompts).toHaveLength(1);
+    expect(JSON.stringify(prompts[0])).toContain("run the tool");
   } finally {
     await session.close();
+  }
+});
+
+test("does not duplicate a claimed post-work continuation after session recreation", async () => {
+  const previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
+  const recoveryConfigDir = mkdtempSync(join(tmpdir(), "paseo-api-recovery-restart-test-"));
+  process.env.CLAUDE_CONFIG_DIR = recoveryConfigDir;
+  const promptsByQuery: unknown[][] = [];
+  let queryNumber = 0;
+
+  sdkQueryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    const thisQuery = queryNumber++;
+    const prompts: unknown[] = [];
+    promptsByQuery[thisQuery] = prompts;
+    const iterator = prompt[Symbol.asyncIterator]();
+    let step = 0;
+    return createBaseQueryMock(
+      vi.fn(async () => {
+        if (step === 0) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "system",
+              subtype: "init",
+              session_id: "durable-api-recovery-session",
+              permissionMode: "default",
+              model: "opus",
+            },
+          };
+        }
+        if (step === 1) {
+          step += 1;
+          const next = await iterator.next();
+          prompts.push(next.value);
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              uuid: `durable-work-${thisQuery}`,
+              message: { role: "assistant", content: "I completed one step." },
+            },
+          };
+        }
+        if (step === 2) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              uuid: "same-native-timeout-event",
+              isApiErrorMessage: true,
+              message: {
+                role: "assistant",
+                content: [{ type: "text", text: "API Error: The operation timed out." }],
+              },
+            },
+          };
+        }
+        if (step === 3) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "result",
+              subtype: "error",
+              usage: buildUsage(),
+              errors: ["API Error: The operation timed out."],
+              total_cost_usd: 0,
+            },
+          };
+        }
+        if (thisQuery === 0 && step === 4) {
+          step += 1;
+          const next = await iterator.next();
+          prompts.push(next.value);
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              uuid: "durable-recovered-assistant",
+              message: { role: "assistant", content: "Finished after recovery." },
+            },
+          };
+        }
+        if (thisQuery === 0 && step === 5) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "result",
+              subtype: "success",
+              usage: buildUsage(),
+              total_cost_usd: 0,
+            },
+          };
+        }
+        return { done: true, value: undefined };
+      }),
+    );
+  });
+
+  const firstSession = await createSession();
+  let secondSession: Awaited<ReturnType<typeof createResumedSession>> | null = null;
+  try {
+    const firstEvents = await collectUntilTerminal(streamSession(firstSession, "original request"));
+    expect(firstEvents.some((event) => event.type === "turn_completed")).toBe(true);
+    await firstSession.close();
+
+    secondSession = await createResumedSession("durable-api-recovery-session");
+    const secondEvents = await collectUntilTerminal(
+      streamSession(secondSession, "do not duplicate the recovery"),
+    );
+
+    expect(secondEvents.some((event) => event.type === "turn_failed")).toBe(true);
+    expect(promptsByQuery[0]).toHaveLength(2);
+    expect(promptsByQuery[1]).toHaveLength(1);
+  } finally {
+    await firstSession.close();
+    await secondSession?.close();
+    restoreEnvValue("CLAUDE_CONFIG_DIR", previousConfigDir);
+    rmSync(recoveryConfigDir, { recursive: true, force: true });
   }
 });
 

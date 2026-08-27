@@ -1,5 +1,5 @@
 import type { ChildProcess } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { promises } from "node:fs";
 import os from "node:os";
@@ -518,6 +518,17 @@ const CLAUDE_API_RECOVERY_DELAY_MS = 2_000;
 const CLAUDE_API_RECOVERY_PROMPT = `<paseo-system>
 The preceding request failed before any work began because of a transient API error. Continue the latest unfinished user instruction now. Do not repeat completed work.
 </paseo-system>`;
+const CLAUDE_POST_WORK_API_RECOVERY_PROMPT = `<paseo-system>
+A transient API failure interrupted this turn. Continue from the last completed step. Do not repeat completed work.
+</paseo-system>`;
+
+interface PendingPostWorkApiRecovery {
+  errorMessage: string;
+  errorUuid: string;
+  input: AsyncMessageInput<SDKUserMessage>;
+  query: Query;
+  turnId: string;
+}
 
 /**
  * Claude Code normally retries transport failures itself. Occasionally it gives up and emits a
@@ -541,6 +552,9 @@ export function readRetryableClaudeApiError(message: unknown): string | null {
     return text;
   }
   if (/^API Error:\s*(?:408|500|502|503|504|529)\b/i.test(text)) {
+    return text;
+  }
+  if (/^API Error:\s*The operation timed out\.?$/i.test(text)) {
     return text;
   }
   if (
@@ -2130,6 +2144,7 @@ class ClaudeAgentSession implements AgentSession {
   private activeTurnHasAssistantText = false;
   private foregroundHasProviderActivity = false;
   private foregroundApiRecoveryAttempts = 0;
+  private pendingPostWorkApiRecovery: PendingPostWorkApiRecovery | null = null;
   private readonly contextUsage: ClaudeContextUsageState;
   private userMessageIds: string[] = [];
   private readonly emittedUserMessageIds = new Set<string>();
@@ -2270,6 +2285,7 @@ class ClaudeAgentSession implements AgentSession {
     this.activeTurnHasAssistantText = false;
     this.foregroundHasProviderActivity = false;
     this.foregroundApiRecoveryAttempts = 0;
+    this.pendingPostWorkApiRecovery = null;
     this.contextUsage.beginTurn();
     this.transitionTurnState("foreground", "foreground turn started");
     this.clearRecentStderr();
@@ -3606,6 +3622,7 @@ class ClaudeAgentSession implements AgentSession {
     this.activeTurnHasAssistantText = false;
     this.foregroundHasProviderActivity = false;
     this.foregroundApiRecoveryAttempts = 0;
+    this.pendingPostWorkApiRecovery = null;
     this.syncTurnState("foreground turn terminal");
   }
 
@@ -3625,6 +3642,7 @@ class ClaudeAgentSession implements AgentSession {
         this.activeTurnHasAssistantText = false;
         this.foregroundHasProviderActivity = false;
         this.foregroundApiRecoveryAttempts = 0;
+        this.pendingPostWorkApiRecovery = null;
         this.syncTurnState("foreground turn terminal");
       } else if (this.autonomousTurn) {
         this.autonomousTurn = null;
@@ -3889,11 +3907,13 @@ class ClaudeAgentSession implements AgentSession {
       !turnId ||
       this.activeForegroundQuery !== sourceQuery ||
       this.query !== sourceQuery ||
-      this.foregroundHasProviderActivity ||
-      this.activeTurnHasAssistantText ||
       this.foregroundApiRecoveryAttempts >= 1
     ) {
       return false;
+    }
+
+    if (this.foregroundHasProviderActivity || this.activeTurnHasAssistantText) {
+      return this.preparePostWorkApiRecovery(message, sourceQuery, turnId, errorMessage);
     }
 
     this.foregroundApiRecoveryAttempts += 1;
@@ -3944,12 +3964,111 @@ class ClaudeAgentSession implements AgentSession {
     }
   }
 
+  private preparePostWorkApiRecovery(
+    message: SDKMessage,
+    sourceQuery: Query,
+    turnId: string,
+    errorMessage: string,
+  ): boolean {
+    const input = this.activeForegroundInput;
+    const errorUuid = readTranscriptUuid(message);
+    if (!input || !errorUuid || this.hasUnsafePostWorkRecoveryActivity()) {
+      return false;
+    }
+    this.foregroundApiRecoveryAttempts += 1;
+    this.pendingPostWorkApiRecovery = {
+      errorMessage,
+      errorUuid,
+      input,
+      query: sourceQuery,
+      turnId,
+    };
+    this.logger.warn(
+      { error: errorMessage, attempt: this.foregroundApiRecoveryAttempts },
+      "Preparing one-shot Claude continuation after a retryable post-work API failure",
+    );
+    return true;
+  }
+
+  private hasUnsafePostWorkRecoveryActivity(): boolean {
+    return (
+      this.pendingPermissions.size > 0 ||
+      [...this.toolUseCache.values()].some((entry) => entry.started) ||
+      this.taskProtocolSource.hasRunningForegroundTasks ||
+      this.sidechainTracker.hasActiveSidechains
+    );
+  }
+
+  private claimPostWorkApiRecovery(errorUuid: string): boolean {
+    if (!this.claudeSessionId) return false;
+    const historyPath = this.resolveHistoryPath(this.claudeSessionId);
+    if (!historyPath) return false;
+
+    // Claim before pushing the continuation. This deliberately chooses at-most-once recovery: a
+    // crash in the narrow claim-to-push window may require a manual retry, but cannot duplicate
+    // partial-work side effects after the daemon restarts.
+    const sessionKey = createHash("sha256").update(this.claudeSessionId).digest("hex");
+    const errorKey = createHash("sha256").update(errorUuid).digest("hex");
+    const markerDir = path.join(path.dirname(historyPath), ".paseo-api-recovery", sessionKey);
+    const markerPath = path.join(markerDir, `${errorKey}.claimed`);
+    try {
+      fs.mkdirSync(markerDir, { recursive: true, mode: 0o700 });
+      const markerFd = fs.openSync(markerPath, "wx", 0o600);
+      try {
+        fs.writeFileSync(markerFd, `${new Date().toISOString()}\n`, "utf8");
+        fs.fsyncSync(markerFd);
+      } finally {
+        fs.closeSync(markerFd);
+      }
+      return true;
+    } catch (error) {
+      const code = toObjectRecord(error)?.code;
+      if (code !== "EEXIST") {
+        this.logger.warn({ err: error }, "Failed to persist Claude API recovery claim");
+      }
+      return false;
+    }
+  }
+
+  private continueForegroundAfterApiFailureResult(
+    message: SDKMessage,
+    sourceQuery: Query,
+  ): boolean {
+    const pending = this.pendingPostWorkApiRecovery;
+    if (!pending || message.type !== "result" || pending.query !== sourceQuery) {
+      return false;
+    }
+    this.pendingPostWorkApiRecovery = null;
+    if (message.subtype === "success") return false;
+    if (
+      this.activeForegroundTurnId !== pending.turnId ||
+      this.query !== pending.query ||
+      this.activeForegroundQuery !== pending.query ||
+      this.input !== pending.input ||
+      this.activeForegroundInput !== pending.input ||
+      this.hasUnsafePostWorkRecoveryActivity() ||
+      !this.claimPostWorkApiRecovery(pending.errorUuid)
+    ) {
+      return false;
+    }
+
+    this.logger.warn(
+      { error: pending.errorMessage, attempt: this.foregroundApiRecoveryAttempts },
+      "Continuing Claude turn on the same native session after a post-work API failure",
+    );
+    pending.input.push(this.toSdkUserMessage(CLAUDE_POST_WORK_API_RECOVERY_PROMPT));
+    return true;
+  }
+
   private async routeSdkMessageFromPump(message: SDKMessage, sourceQuery: Query): Promise<void> {
     if (this.query && this.query !== sourceQuery) {
       this.logger.debug("Suppressing a trailing message from a retired Claude provider query");
       return;
     }
     if (this.shouldSuppressStaleResult(message)) {
+      return;
+    }
+    if (this.continueForegroundAfterApiFailureResult(message, sourceQuery)) {
       return;
     }
     if (await this.recoverForegroundFromApiError(message, sourceQuery)) {

@@ -5543,6 +5543,139 @@ test("waitForAgentRunStart resolves while a foreground run is still only pending
   expect(manager.getAgent(snapshot.id)?.lifecycle).toBe("idle");
 });
 
+test("waitForAgentRunStart does not report a stale error after the replacement was accepted", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-retry-start-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const allowRetryStart = deferred<void>();
+  const allowRetryCompletion = deferred<void>();
+  const acceptedPrompts: AgentPromptInput[] = [];
+
+  class ErrorThenRetrySession extends TestAgentSession {
+    private starts = 0;
+
+    override async startTurn(prompt: AgentPromptInput): Promise<{ turnId: string }> {
+      acceptedPrompts.push(prompt);
+      this.starts += 1;
+      const turnId = `turn-${this.starts}`;
+      if (this.starts === 1) {
+        setTimeout(() => {
+          this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+          this.pushEvent({
+            type: "turn_failed",
+            provider: this.provider,
+            turnId,
+            error: "previous provider failure",
+          });
+        }, 0);
+        return { turnId };
+      }
+
+      await allowRetryStart.promise;
+      void allowRetryCompletion.promise.then(() => {
+        this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+        return undefined;
+      });
+      return { turnId };
+    }
+  }
+
+  const session = new ErrorThenRetrySession({ provider: "codex", cwd: workdir });
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+
+  try {
+    const failedRun = manager.streamAgent(snapshot.id, "first");
+    for await (const _event of failedRun) {
+      // Drain the failed run.
+    }
+    expect(manager.getAgent(snapshot.id)?.lifecycle).toBe("error");
+
+    const retryRun = manager.streamAgent(snapshot.id, "retry");
+    const drainRetry = (async () => {
+      for await (const _event of retryRun) {
+        // Drain the retry.
+      }
+    })();
+    await Promise.resolve();
+
+    const startWait = manager.waitForAgentRunStart(snapshot.id);
+    let settled = false;
+    void startWait.then(
+      () => {
+        settled = true;
+        return undefined;
+      },
+      () => {
+        settled = true;
+        return undefined;
+      },
+    );
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    allowRetryStart.resolve(undefined);
+    await expect(startWait).resolves.toBeUndefined();
+    expect(manager.getAgent(snapshot.id)?.lifecycle).toBe("running");
+
+    allowRetryCompletion.resolve(undefined);
+    await drainRetry;
+    expect(acceptedPrompts).toEqual(["first", "retry"]);
+  } finally {
+    await manager.closeAgent(snapshot.id).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("waitForAgentRunStart still reports the current attempt's start failure", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-current-start-failure-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const allowStartFailure = deferred<void>();
+
+  class DeferredStartFailureSession extends TestAgentSession {
+    override async startTurn(): Promise<{ turnId: string }> {
+      await allowStartFailure.promise;
+      throw new Error("current provider start failed");
+    }
+  }
+
+  const session = new DeferredStartFailureSession({ provider: "codex", cwd: workdir });
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+
+  try {
+    const run = manager.streamAgent(snapshot.id, "fail this start");
+    const drainRun = (async () => {
+      for await (const _event of run) {
+        // Drain until the provider rejects the start.
+      }
+    })();
+    await Promise.resolve();
+
+    const startWait = manager.waitForAgentRunStart(snapshot.id);
+    allowStartFailure.resolve(undefined);
+
+    await expect(startWait).rejects.toThrow("current provider start failed");
+    await expect(drainRun).rejects.toThrow("current provider start failed");
+  } finally {
+    await manager.closeAgent(snapshot.id).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("replaceAgentRun does not emit idle or resolve waiters between interrupted and replacement runs", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-replace-run-"));
   const storagePath = join(workdir, "agents");
