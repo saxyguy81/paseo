@@ -26,13 +26,27 @@ class MemoryLocalStorage {
   }
 }
 
-if (typeof window === "undefined") {
+function hasUsableWindowLocalStorage(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    return typeof window.localStorage?.setItem === "function";
+  } catch {
+    return false;
+  }
+}
+
+if (!hasUsableWindowLocalStorage()) {
   const storage = new MemoryLocalStorage();
-  Object.defineProperty(globalThis, "window", {
-    value: {
-      localStorage: storage,
-    },
-    configurable: true,
-    writable: true,
-  });
+  if (typeof window === "undefined") {
+    Object.defineProperty(globalThis, "window", {
+      value: { localStorage: storage },
+      configurable: true,
+      writable: true,
+    });
+  } else {
+    Object.defineProperty(window, "localStorage", {
+      value: storage,
+      configurable: true,
+    });
+  }
 }
