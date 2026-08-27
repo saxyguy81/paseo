@@ -47,6 +47,68 @@ function rowKey(agent: Pick<AggregatedAgent, "serverId" | "id">): string {
   return `${agent.serverId}:${agent.id}`;
 }
 
+type ConversationFamilyWorkspaceAgent = Pick<
+  AggregatedAgent,
+  "serverId" | "id" | "workspaceId" | "labels"
+>;
+
+/**
+ * Returns historical workspaces that the sidebar may safely omit because their
+ * only agents are explicit members of a family whose current workspace is also
+ * present. A workspace shared with any unrelated conversation is retained.
+ */
+export function findSupersededConversationFamilyWorkspaceKeys(
+  agents: readonly ConversationFamilyWorkspaceAgent[],
+): ReadonlySet<string> {
+  const agentsByWorkspaceKey = new Map<string, ConversationFamilyWorkspaceAgent[]>();
+  const agentsByFamilyKey = new Map<string, ConversationFamilyWorkspaceAgent[]>();
+
+  for (const agent of agents) {
+    if (agent.workspaceId) {
+      const workspaceKey = `${agent.serverId}:${agent.workspaceId}`;
+      const workspaceAgents = agentsByWorkspaceKey.get(workspaceKey) ?? [];
+      workspaceAgents.push(agent);
+      agentsByWorkspaceKey.set(workspaceKey, workspaceAgents);
+    }
+
+    const metadata = parseConversationFamilyLabels(agent.labels);
+    if (!metadata) continue;
+    const familyKey = `${agent.serverId}:${metadata.id}`;
+    const familyAgents = agentsByFamilyKey.get(familyKey) ?? [];
+    familyAgents.push(agent);
+    agentsByFamilyKey.set(familyKey, familyAgents);
+  }
+
+  const supersededWorkspaceKeys = new Set<string>();
+  for (const [familyKey, familyAgents] of agentsByFamilyKey) {
+    const firstMetadata = parseConversationFamilyLabels(familyAgents[0]?.labels);
+    if (!firstMetadata) continue;
+    const current = familyAgents.find((agent) => agent.id === firstMetadata.currentAgentId);
+    if (!current?.workspaceId) continue;
+    const currentWorkspaceKey = `${current.serverId}:${current.workspaceId}`;
+
+    for (const member of familyAgents) {
+      if (!member.workspaceId || member.id === current.id) continue;
+      const workspaceKey = `${member.serverId}:${member.workspaceId}`;
+      if (workspaceKey === currentWorkspaceKey) continue;
+      const workspaceAgents = agentsByWorkspaceKey.get(workspaceKey) ?? [];
+      const exclusivelySupersededFamilyMembers = workspaceAgents.every((workspaceAgent) => {
+        const metadata = parseConversationFamilyLabels(workspaceAgent.labels);
+        return (
+          metadata !== null &&
+          `${workspaceAgent.serverId}:${metadata.id}` === familyKey &&
+          workspaceAgent.id !== firstMetadata.currentAgentId
+        );
+      });
+      if (workspaceAgents.length > 0 && exclusivelySupersededFamilyMembers) {
+        supersededWorkspaceKeys.add(workspaceKey);
+      }
+    }
+  }
+
+  return supersededWorkspaceKeys;
+}
+
 interface ConversationFamilyIndex {
   familyMembers: Map<string, AggregatedAgent[]>;
   metadataByAgentKey: Map<string, ConversationFamilyMetadata>;

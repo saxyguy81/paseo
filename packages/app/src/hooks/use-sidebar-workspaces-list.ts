@@ -8,6 +8,8 @@ import { useHostProjects } from "@/projects/host-projects";
 import { getHostRuntimeStore, useHostRegistryLoaded, useHosts } from "@/runtime/host-runtime";
 import { useSidebarOrderStore } from "@/stores/sidebar-order-store";
 import { useSidebarViewStore } from "@/stores/sidebar-view-store";
+import { findSupersededConversationFamilyWorkspaceKeys } from "@/conversation-family";
+import { useAggregatedAgents } from "./use-aggregated-agents";
 import {
   buildSidebarWorkspacePlacementModel,
   computeSidebarOrderUpdates,
@@ -139,13 +141,19 @@ export function useSidebarWorkspacesList(options?: {
   const directoryServerIds = useWorkspaceDirectoryServerIds(serverIds);
 
   const hostProjects = useHostProjects(directoryServerIds);
+  const { agents } = useAggregatedAgents({ includeArchived: true, demand: false });
+  const supersededFamilyWorkspaceKeys = useMemo(
+    () => findSupersededConversationFamilyWorkspaceKeys(agents),
+    [agents],
+  );
 
   const sidebarModel = useMemo(
     () =>
       buildSidebarWorkspacePlacementModel({
         projects: hostProjects,
+        excludedWorkspaceKeys: supersededFamilyWorkspaceKeys,
       }),
-    [hostProjects],
+    [hostProjects, supersededFamilyWorkspaceKeys],
   );
 
   const projects = sidebarModel.projects.length > 0 ? sidebarModel.projects : EMPTY_PROJECTS;

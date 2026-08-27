@@ -8,6 +8,7 @@ import {
   CONVERSATION_FAMILY_NAME_LABEL,
   CONVERSATION_FAMILY_POSITION_LABEL,
   collapseConversationFamilies,
+  findSupersededConversationFamilyWorkspaceKeys,
   parseConversationFamilyLabels,
   searchConversationFamily,
   stitchConversationFamilyTimeline,
@@ -158,6 +159,39 @@ describe("conversation families", () => {
     });
 
     expect(collapseConversationFamilies({ agents: [duplicate] }).agents).toEqual([]);
+  });
+
+  it("identifies obsolete family workspaces while preserving shared workspaces", () => {
+    const original = agent({
+      id: "original",
+      title: "VCLP original",
+      labels: familyLabels({ position: 0 }),
+      workspaceId: "old-workspace",
+    });
+    const duplicate = agent({
+      id: "duplicate",
+      title: "VCLP duplicate",
+      labels: familyLabels({ position: 1, hidden: true }),
+      workspaceId: "duplicate-workspace",
+    });
+    const current = agent({
+      id: "current",
+      title: "VCLP current",
+      labels: familyLabels({ position: 2 }),
+      workspaceId: "current-workspace",
+    });
+    const shared = agent({
+      id: "shared",
+      title: "Independent conversation",
+      workspaceId: "old-workspace",
+    });
+
+    expect(findSupersededConversationFamilyWorkspaceKeys([original, duplicate, current])).toEqual(
+      new Set(["server-1:old-workspace", "server-1:duplicate-workspace"]),
+    );
+    expect(
+      findSupersededConversationFamilyWorkspaceKeys([original, duplicate, current, shared]),
+    ).toEqual(new Set(["server-1:duplicate-workspace"]));
   });
 
   it("stitches ordered sessions with boundaries and keeps only the current ids live", () => {

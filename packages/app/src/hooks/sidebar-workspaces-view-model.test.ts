@@ -293,6 +293,23 @@ describe("buildSidebarProjectsFromStructure", () => {
 });
 
 describe("shared sidebar workspace model", () => {
+  it("omits superseded conversation-family workspaces and retains the canonical one", () => {
+    const model = buildSidebarWorkspacePlacementModel({
+      projects: [
+        project({
+          projectKey: "vclp",
+          workspaceKeys: ["srv:original", "srv:recovery", "srv:current"],
+        }),
+      ],
+      excludedWorkspaceKeys: new Set(["srv:original", "srv:recovery"]),
+    });
+
+    expect(model.workspaces.map((entry) => entry.workspaceKey)).toEqual(["srv:current"]);
+    expect(model.projects[0]?.workspaces.map((entry) => entry.workspaceKey)).toEqual([
+      "srv:current",
+    ]);
+  });
+
   it("feeds project placement and status grouping from the same cross-host workspace identities", () => {
     const model = buildSidebarWorkspacePlacementModel({
       projects: [
