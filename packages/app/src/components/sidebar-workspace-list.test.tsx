@@ -2,6 +2,7 @@
  * @vitest-environment jsdom
  */
 import { act } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { WorkspaceScriptPayload } from "@getpaseo/protocol/messages";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -53,6 +54,7 @@ vi.mock("@react-native-async-storage/async-storage", () => ({
 }));
 
 const SERVER_ID = "sidebar-render-count";
+const QUERY_CLIENT = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
 interface RenderCounts {
   frame: number;
@@ -322,7 +324,11 @@ async function renderProbe(counts: RenderCounts): Promise<{ root: Root; containe
 }
 
 function renderSidebarFrame(root: Root, counts: RenderCounts) {
-  root.render(<SidebarFrameProbe counts={counts} />);
+  root.render(
+    <QueryClientProvider client={QUERY_CLIENT}>
+      <SidebarFrameProbe counts={counts} />
+    </QueryClientProvider>,
+  );
 }
 
 describe("sidebar workspace render isolation", () => {

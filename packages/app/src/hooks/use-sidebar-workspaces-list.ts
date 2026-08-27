@@ -9,7 +9,7 @@ import { getHostRuntimeStore, useHostRegistryLoaded, useHosts } from "@/runtime/
 import { useSidebarOrderStore } from "@/stores/sidebar-order-store";
 import { useSidebarViewStore } from "@/stores/sidebar-view-store";
 import { findSupersededConversationFamilyWorkspaceKeys } from "@/conversation-family";
-import { useAggregatedAgents } from "./use-aggregated-agents";
+import { useAgentHistory } from "./use-agent-history";
 import {
   buildSidebarWorkspacePlacementModel,
   computeSidebarOrderUpdates,
@@ -141,7 +141,13 @@ export function useSidebarWorkspacesList(options?: {
   const directoryServerIds = useWorkspaceDirectoryServerIds(serverIds);
 
   const hostProjects = useHostProjects(directoryServerIds);
-  const { agents } = useAggregatedAgents({ includeArchived: true, demand: false });
+  // Family predecessors are intentionally archived, while their workspaces stay
+  // available so stitched history remains readable. The live directory omits
+  // archived agents, so use the complete history index for this projection.
+  const { agents, refreshAll: refreshAgentHistory } = useAgentHistory({
+    enabled: isActive,
+    autoLoadAll: true,
+  });
   const supersededFamilyWorkspaceKeys = useMemo(
     () => findSupersededConversationFamilyWorkspaceKeys(agents),
     [agents],
@@ -183,6 +189,7 @@ export function useSidebarWorkspacesList(options?: {
 
   const refreshAll = useCallback(() => {
     if (!isActive) return;
+    void refreshAgentHistory();
     for (const serverId of serverIds) {
       void runtime.refreshDirectories(serverId).catch((error) => {
         console.error("[WorkspaceFetch][sidebar-refresh] failed", {
@@ -191,7 +198,7 @@ export function useSidebarWorkspacesList(options?: {
         });
       });
     }
-  }, [isActive, runtime, serverIds]);
+  }, [isActive, refreshAgentHistory, runtime, serverIds]);
 
   const loadingState = deriveSidebarLoadingState({
     isActive,

@@ -5,7 +5,7 @@ import type {
 } from "@getpaseo/client/internal/daemon-client";
 import type { AgentSearchMatch } from "@getpaseo/protocol/messages";
 import { useInfiniteQuery } from "@tanstack/react-query";
-import { useCallback, useMemo, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
 import type { AggregatedAgent } from "@/hooks/use-aggregated-agents";
 import { getHostRuntimeStore, isHostRuntimeConnected, useHosts } from "@/runtime/host-runtime";
@@ -295,6 +295,8 @@ export function useAgentHistory(options: {
   serverId?: string | null;
   enabled?: boolean;
   search?: string;
+  /** Keep fetching until every unfiltered history page has been loaded. */
+  autoLoadAll?: boolean;
 }): AgentHistoryResult {
   const { t } = useTranslation();
   const daemons = useHosts();
@@ -410,6 +412,28 @@ export function useAgentHistory(options: {
     }
     void fetchNextPage();
   }, [enabled, fetchNextPage, hasNextPage, isFetchingNextPage, targetHosts.length]);
+
+  useEffect(() => {
+    if (
+      !options.autoLoadAll ||
+      search ||
+      !enabled ||
+      targetHosts.length === 0 ||
+      !hasNextPage ||
+      isFetchingNextPage
+    ) {
+      return;
+    }
+    void fetchNextPage();
+  }, [
+    enabled,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+    options.autoLoadAll,
+    search,
+    targetHosts.length,
+  ]);
 
   const agents = useMemo(() => {
     const pages = data?.pages ?? [];
