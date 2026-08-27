@@ -172,6 +172,10 @@ function restoreEnvValue(key: string, previousValue: string | undefined): void {
   process.env[key] = previousValue;
 }
 
+function ignoreExpectedRejection(): undefined {
+  return undefined;
+}
+
 async function collectUntilTerminal(
   stream: AsyncGenerator<AgentStreamEvent>,
 ): Promise<AgentStreamEvent[]> {
@@ -827,6 +831,200 @@ test("does not continue a post-work API failure while a tool call is still open"
     expect(events.some((event) => event.type === "turn_failed")).toBe(true);
     expect(prompts).toHaveLength(1);
     expect(JSON.stringify(prompts[0])).toContain("run the tool");
+  } finally {
+    await session.close();
+  }
+});
+
+test("does not continue a post-work API failure while permission is pending", async () => {
+  const prompts: unknown[] = [];
+  let step = 0;
+  sdkQueryFactory.mockImplementation(
+    ({
+      prompt,
+      options,
+    }: {
+      prompt: AsyncIterable<unknown>;
+      options: {
+        canUseTool?: (
+          toolName: string,
+          input: Record<string, unknown>,
+          options: Record<string, unknown>,
+        ) => Promise<unknown>;
+      };
+    }) => {
+      const iterator = prompt[Symbol.asyncIterator]();
+      return createBaseQueryMock(
+        vi.fn(async () => {
+          if (step === 0) {
+            step += 1;
+            return {
+              done: false,
+              value: {
+                type: "system",
+                subtype: "init",
+                session_id: "api-failure-pending-permission-session",
+                permissionMode: "default",
+                model: "opus",
+              },
+            };
+          }
+          if (step === 1) {
+            step += 1;
+            const next = await iterator.next();
+            prompts.push(next.value);
+            void options
+              .canUseTool?.("Bash", { command: "touch should-not-run" }, { toolUseID: "tool-1" })
+              .catch(ignoreExpectedRejection);
+            return {
+              done: false,
+              value: {
+                type: "user",
+                message: { role: "user", content: "request permission" },
+                parent_tool_use_id: null,
+                uuid: "pending-permission-user",
+                session_id: "api-failure-pending-permission-session",
+              },
+            };
+          }
+          if (step === 2) {
+            step += 1;
+            return {
+              done: false,
+              value: {
+                type: "assistant",
+                uuid: "pending-permission-timeout",
+                isApiErrorMessage: true,
+                message: {
+                  role: "assistant",
+                  content: [{ type: "text", text: "API Error: The operation timed out." }],
+                },
+              },
+            };
+          }
+          if (step === 3) {
+            step += 1;
+            return {
+              done: false,
+              value: {
+                type: "result",
+                subtype: "error",
+                usage: buildUsage(),
+                errors: ["API Error: The operation timed out."],
+                total_cost_usd: 0,
+              },
+            };
+          }
+          return { done: true, value: undefined };
+        }),
+      );
+    },
+  );
+
+  const session = await createSession();
+  try {
+    const events = await collectUntilTerminal(streamSession(session, "request permission"));
+
+    expect(events.some((event) => event.type === "permission_requested")).toBe(true);
+    expect(events.some((event) => event.type === "turn_failed")).toBe(true);
+    expect(prompts).toHaveLength(1);
+    expect(JSON.stringify(prompts[0])).toContain("request permission");
+  } finally {
+    await session.close();
+  }
+});
+
+test("does not continue a post-work API failure while a sidechain is active", async () => {
+  const prompts: unknown[] = [];
+  let step = 0;
+  sdkQueryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    const iterator = prompt[Symbol.asyncIterator]();
+    return createBaseQueryMock(
+      vi.fn(async () => {
+        if (step === 0) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "system",
+              subtype: "init",
+              session_id: "api-failure-active-sidechain-session",
+              permissionMode: "default",
+              model: "opus",
+            },
+          };
+        }
+        if (step === 1) {
+          step += 1;
+          const next = await iterator.next();
+          prompts.push(next.value);
+          return {
+            done: false,
+            value: {
+              type: "user",
+              message: { role: "user", content: "delegate work" },
+              parent_tool_use_id: null,
+              uuid: "active-sidechain-user",
+              session_id: "api-failure-active-sidechain-session",
+            },
+          };
+        }
+        if (step === 2) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              uuid: "active-sidechain-work",
+              parent_tool_use_id: "task-active",
+              message: {
+                role: "assistant",
+                content: [{ type: "text", text: "The child is still working." }],
+              },
+            },
+          };
+        }
+        if (step === 3) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              uuid: "active-sidechain-timeout",
+              isApiErrorMessage: true,
+              message: {
+                role: "assistant",
+                content: [{ type: "text", text: "API Error: The operation timed out." }],
+              },
+            },
+          };
+        }
+        if (step === 4) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "result",
+              subtype: "error",
+              usage: buildUsage(),
+              errors: ["API Error: The operation timed out."],
+              total_cost_usd: 0,
+            },
+          };
+        }
+        return { done: true, value: undefined };
+      }),
+    );
+  });
+
+  const session = await createSession();
+  try {
+    const events = await collectUntilTerminal(streamSession(session, "delegate work"));
+
+    expect(events.some((event) => event.type === "provider_subagent")).toBe(true);
+    expect(events.some((event) => event.type === "turn_failed")).toBe(true);
+    expect(prompts).toHaveLength(1);
+    expect(JSON.stringify(prompts[0])).toContain("delegate work");
   } finally {
     await session.close();
   }
