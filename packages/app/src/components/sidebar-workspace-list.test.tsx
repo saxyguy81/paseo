@@ -359,6 +359,23 @@ describe("sidebar workspace render isolation", () => {
     });
   });
 
+  it("refreshes the authoritative directory when the sidebar mounts", async () => {
+    const refreshDirectories = vi
+      .spyOn(getHostRuntimeStore(), "refreshDirectories")
+      .mockResolvedValue(undefined);
+    const counts: RenderCounts = {
+      frame: 0,
+      headers: {},
+      rows: {},
+      projectSelection: {},
+      rowSelection: {},
+    };
+
+    ({ root, container } = await renderProbe(counts));
+
+    expect(refreshDirectories).toHaveBeenCalledWith(SERVER_ID);
+  });
+
   it("re-renders only the changed workspace row for a status update", async () => {
     const counts: RenderCounts = {
       frame: 0,

@@ -10,6 +10,7 @@ import { useSidebarOrderStore } from "@/stores/sidebar-order-store";
 import { useSidebarViewStore } from "@/stores/sidebar-view-store";
 import { findSupersededConversationFamilyWorkspaceKeys } from "@/conversation-family";
 import { useAgentHistory } from "./use-agent-history";
+import { useAppVisible } from "./use-app-visible";
 import {
   buildSidebarWorkspacePlacementModel,
   computeSidebarOrderUpdates,
@@ -109,6 +110,7 @@ export function useSidebarWorkspacesList(options?: {
   const hostFilters = options?.hostFilters ?? storeHostFilters;
   const reconcileHostFilters = useSidebarViewStore((state) => state.reconcileHostFilters);
   const isActive = options?.enabled !== false;
+  const isAppVisible = useAppVisible();
 
   const serverIds = useMemo(() => {
     if (hostFilters.length === 0) {
@@ -199,6 +201,14 @@ export function useSidebarWorkspacesList(options?: {
       });
     }
   }, [isActive, refreshAgentHistory, runtime, serverIds]);
+
+  // Directory demand keeps a live subscription, but an already-satisfied demand can retain
+  // a cached snapshot while the app is backgrounded. Force an authoritative refresh whenever
+  // the sidebar mounts or returns to the foreground so externally archived workspaces disappear.
+  useEffect(() => {
+    if (!isAppVisible) return;
+    refreshAll();
+  }, [isAppVisible, refreshAll]);
 
   const loadingState = deriveSidebarLoadingState({
     isActive,
