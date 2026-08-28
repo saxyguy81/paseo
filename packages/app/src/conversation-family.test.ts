@@ -225,6 +225,33 @@ describe("conversation families", () => {
     expect(result.readOnlyItemIds.has("shared")).toBe(false);
   });
 
+  it("renders the current session last even when stale family positions put history after it", () => {
+    const result = stitchConversationFamilyTimeline({
+      currentAgentId: "current",
+      members: [
+        {
+          agentId: "current",
+          title: "Current",
+          position: 4,
+          items: [message("assistant_message", "current-answer", "Current answer")],
+        },
+        {
+          agentId: "stale-recovery",
+          title: "Stale recovery",
+          position: 5,
+          items: [message("assistant_message", "overflow", "Prompt is too long")],
+        },
+      ],
+    });
+
+    expect(result.items.map((item) => item.id)).toEqual([
+      "family-boundary:stale-recovery",
+      "family:stale-recovery:overflow",
+      "family-boundary:current",
+      "current-answer",
+    ]);
+  });
+
   it("searches message text by default and includes tool activity only when requested", () => {
     const firstTool: StreamItem = {
       kind: "tool_call",

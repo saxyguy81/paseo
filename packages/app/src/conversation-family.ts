@@ -268,7 +268,12 @@ export function stitchConversationFamilyTimeline(input: {
 }): StitchedConversationFamilyTimeline {
   const items: StreamItem[] = [];
   const readOnlyItemIds = new Set<string>();
-  const members = [...input.members].sort((left, right) => left.position - right.position);
+  const members = [...input.members].sort((left, right) => {
+    const leftIsCurrent = left.agentId === input.currentAgentId;
+    const rightIsCurrent = right.agentId === input.currentAgentId;
+    if (leftIsCurrent !== rightIsCurrent) return leftIsCurrent ? 1 : -1;
+    return left.position - right.position;
+  });
 
   for (const [index, member] of members.entries()) {
     const firstTimestamp = member.items[0]?.timestamp ?? new Date(0);
