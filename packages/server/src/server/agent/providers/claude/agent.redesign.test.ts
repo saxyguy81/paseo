@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { Logger } from "pino";
-import { mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -13,6 +14,7 @@ import {
   readEventIdentifiers,
   readRetryableClaudeApiError,
 } from "./agent.js";
+import { claudeProjectDirSync } from "./project-dir.js";
 import { streamSession } from "../test-utils/session-stream-adapter.js";
 import type { AgentStreamEvent, AgentTimelineItem } from "../../agent-sdk-types.js";
 
@@ -1130,6 +1132,102 @@ test("stops after one post-work continuation when the transient API failure repe
     expect(JSON.stringify(prompts[0])).toContain("make a change");
     expect(JSON.stringify(prompts[1])).toContain("Continue from the last completed step");
     expect(JSON.stringify(prompts[1])).not.toContain("make a change");
+  } finally {
+    await session.close();
+    restoreEnvValue("CLAUDE_CONFIG_DIR", previousConfigDir);
+    rmSync(recoveryConfigDir, { recursive: true, force: true });
+  }
+});
+
+test("preserves a post-work continuation error when its durable recovery claim fails", async () => {
+  const previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
+  const recoveryConfigDir = mkdtempSync(join(tmpdir(), "paseo-api-recovery-claim-test-"));
+  process.env.CLAUDE_CONFIG_DIR = recoveryConfigDir;
+  const errorText = "API Error: 503 Continuation matching is temporarily unavailable";
+  const sessionId = "post-work-unclaimable-continuation-session";
+  const errorUuid = "post-work-unclaimable-continuation-error";
+  const markerDir = join(
+    claudeProjectDirSync(process.cwd(), { configDir: recoveryConfigDir }),
+    ".paseo-api-recovery",
+    createHash("sha256").update(sessionId).digest("hex"),
+  );
+  mkdirSync(markerDir, { recursive: true });
+  writeFileSync(
+    join(markerDir, `${createHash("sha256").update(errorUuid).digest("hex")}.claimed`),
+    "existing owner\n",
+  );
+
+  let step = 0;
+  sdkQueryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    const iterator = prompt[Symbol.asyncIterator]();
+    return createBaseQueryMock(
+      vi.fn(async () => {
+        if (step === 0) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "system",
+              subtype: "init",
+              session_id: sessionId,
+              permissionMode: "default",
+              model: "opus",
+            },
+          };
+        }
+        if (step === 1) {
+          step += 1;
+          await iterator.next();
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              uuid: "post-work-progress",
+              message: { role: "assistant", content: "I completed one step." },
+            },
+          };
+        }
+        if (step === 2) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              uuid: errorUuid,
+              isApiErrorMessage: true,
+              message: { role: "assistant", content: [{ type: "text", text: errorText }] },
+            },
+          };
+        }
+        if (step === 3) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "result",
+              subtype: "error_during_execution",
+              usage: buildUsage(),
+              errors: ["Claude run failed"],
+              total_cost_usd: 0,
+            },
+          };
+        }
+        return { done: true, value: undefined };
+      }),
+    );
+  });
+
+  const session = await createSession();
+  try {
+    const events = await collectUntilTerminal(streamSession(session, "continue the work"));
+
+    expect(events.filter((event) => event.type === "turn_failed")).toEqual([
+      expect.objectContaining({
+        type: "turn_failed",
+        error: errorText,
+        failureKind: "conversation_unresolved",
+      }),
+    ]);
   } finally {
     await session.close();
     restoreEnvValue("CLAUDE_CONFIG_DIR", previousConfigDir);

@@ -4099,7 +4099,6 @@ class ClaudeAgentSession implements AgentSession {
       query: sourceQuery,
       turnId,
     };
-    this.clearCapturedConversationRolloverError(errorMessage);
     this.logger.warn(
       { error: errorMessage, attempt: this.foregroundApiRecoveryAttempts },
       "Preparing one-shot Claude continuation after a retryable post-work API failure",
@@ -4169,6 +4168,7 @@ class ClaudeAgentSession implements AgentSession {
       return false;
     }
 
+    this.clearCapturedConversationRolloverError(pending.errorMessage);
     this.logger.warn(
       { error: pending.errorMessage, attempt: this.foregroundApiRecoveryAttempts },
       "Continuing Claude turn on the same native session after a post-work API failure",
