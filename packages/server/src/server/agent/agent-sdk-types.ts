@@ -187,6 +187,12 @@ export interface AgentCapabilityFlags {
   supportsNativePaseoTools?: boolean;
   supportsReasoningStream: boolean;
   supportsToolInvocations: boolean;
+  /**
+   * The provider can add input to an already-running turn without starting a
+   * second provider request. When false or absent, Paseo must preserve a
+   * follow-up in its durable FIFO instead of attempting an in-flight steer.
+   */
+  supportsInFlightSteering?: boolean;
   supportsRewindConversation?: boolean;
   supportsRewindFiles?: boolean;
   supportsRewindBoth?: boolean;

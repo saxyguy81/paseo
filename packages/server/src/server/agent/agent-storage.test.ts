@@ -226,6 +226,35 @@ describe("AgentStorage", () => {
     await expect(reloaded.listPendingPrompts("agent-queue")).resolves.toEqual([]);
   });
 
+  test("waits for only the pending prompt ids captured at the caller boundary", async () => {
+    await storage.applySnapshot(createManagedAgent({ id: "agent-wait-boundary" }));
+    await storage.enqueuePendingPrompt("agent-wait-boundary", {
+      id: "message-before-wait",
+      prompt: "first accepted request",
+    });
+
+    let settled = false;
+    const wait = storage
+      .waitForPendingPromptIds("agent-wait-boundary", ["message-before-wait"])
+      .then(() => {
+        settled = true;
+        return undefined;
+      });
+    await storage.enqueuePendingPrompt("agent-wait-boundary", {
+      id: "message-after-wait",
+      prompt: "unrelated later request",
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    await storage.completePendingPrompt("agent-wait-boundary", "message-before-wait");
+    await wait;
+    expect(settled).toBe(true);
+    await expect(storage.listPendingPrompts("agent-wait-boundary")).resolves.toMatchObject([
+      { id: "message-after-wait" },
+    ]);
+  });
+
   test("moves queued and interrupted dispatches to a context-overflow successor", async () => {
     await storage.applySnapshot(createManagedAgent({ id: "agent-overflowed" }));
     await storage.applySnapshot(createManagedAgent({ id: "agent-successor" }));

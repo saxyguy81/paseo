@@ -458,7 +458,10 @@ test("keeps context overflow classified after an AskUserQuestion response", asyn
   }
 });
 
-test("recycles Claude once and continues a foreground turn after a pre-work API failure", async () => {
+test.each([
+  "API Error: 502 Bad Gateway",
+  "API Error: 409 Conversation already has an active request",
+])("recycles Claude once and continues a foreground turn after %s", async (apiErrorText) => {
   vi.useFakeTimers();
   const recoveryPrompts: unknown[] = [];
   let queryNumber = 0;
@@ -505,7 +508,7 @@ test("recycles Claude once and continues a foreground turn after a pre-work API 
                 isApiErrorMessage: true,
                 message: {
                   role: "assistant",
-                  content: [{ type: "text", text: "API Error: 502 Bad Gateway" }],
+                  content: [{ type: "text", text: apiErrorText }],
                 },
               },
             };

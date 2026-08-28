@@ -115,6 +115,7 @@ export class AgentStorage {
   private pathById: Map<string, string> = new Map();
   private pathsById: Map<string, Set<string>> = new Map();
   private pendingWrites: Map<string, Promise<void>> = new Map();
+  private recordChangeListeners: Map<string, Set<() => void>> = new Map();
   private deleting: Set<string> = new Set();
   private daemonAgentIdsByExecution: Map<string, string> = new Map();
   private daemonExecutionKeysByAgentId: Map<string, string> = new Map();
@@ -219,6 +220,67 @@ export class AgentStorage {
         attemptCount: item.attemptCount,
       })) ?? []
     );
+  }
+
+  /**
+   * Wait until the exact durable prompts accepted before a caller's boundary
+   * have left the FIFO. Prompts accepted later are deliberately ignored.
+   */
+  async waitForPendingPromptIds(
+    agentId: string,
+    promptIds: readonly string[],
+    options?: { signal?: AbortSignal },
+  ): Promise<void> {
+    await this.load();
+    const targets = new Set(promptIds);
+    if (targets.size === 0) return;
+
+    const settled = () => {
+      const record = this.cache.get(agentId);
+      if (!record) return true;
+      return !record.pendingPrompts.some((prompt) => targets.has(prompt.id));
+    };
+    if (settled()) return;
+    if (options?.signal?.aborted) {
+      const error = new Error("wait_for_pending_prompts aborted");
+      error.name = "AbortError";
+      throw error;
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      let finished = false;
+      const listeners = this.recordChangeListeners.get(agentId) ?? new Set<() => void>();
+      this.recordChangeListeners.set(agentId, listeners);
+
+      const cleanup = () => {
+        listeners.delete(check);
+        if (listeners.size === 0) this.recordChangeListeners.delete(agentId);
+        options?.signal?.removeEventListener("abort", abort);
+      };
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        cleanup();
+        resolve();
+      };
+      const check = () => {
+        if (settled()) finish();
+      };
+      const abort = () => {
+        if (finished) return;
+        finished = true;
+        cleanup();
+        const error = new Error("wait_for_pending_prompts aborted");
+        error.name = "AbortError";
+        reject(error);
+      };
+
+      listeners.add(check);
+      options?.signal?.addEventListener("abort", abort, { once: true });
+      // Close the check/register race if a queued write settled between the
+      // initial observation above and listener installation.
+      check();
+    });
   }
 
   async claimPendingPrompt(agentId: string): Promise<StoredPendingAgentPrompt | null> {
@@ -367,6 +429,7 @@ export class AgentStorage {
     this.cache.set(agentId, record);
     this.indexOwner(record);
     this.pathById.set(agentId, nextPath);
+    for (const listener of this.recordChangeListeners.get(agentId) ?? []) listener();
   }
 
   beginDelete(agentId: string): void {
@@ -398,6 +461,7 @@ export class AgentStorage {
     this.removeOwnerIndex(agentId);
     this.pathById.delete(agentId);
     this.pathsById.delete(agentId);
+    for (const listener of this.recordChangeListeners.get(agentId) ?? []) listener();
   }
 
   async applySnapshot(

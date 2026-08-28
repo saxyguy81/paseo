@@ -148,6 +148,11 @@ export interface AgentCapabilityFlags {
   supportsMcpServers: boolean;
   supportsReasoningStream: boolean;
   supportsToolInvocations: boolean;
+  /**
+   * The provider can add input to an already-running turn without starting a
+   * second provider request. Providers that omit this capability are queued.
+   */
+  supportsInFlightSteering?: boolean;
   supportsRewindConversation?: boolean;
   supportsRewindFiles?: boolean;
   supportsRewindBoth?: boolean;

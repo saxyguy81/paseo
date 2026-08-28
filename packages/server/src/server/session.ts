@@ -118,6 +118,7 @@ import type { StructuredGenerationDaemonConfig } from "./agent/structured-genera
 import {
   getAgentStreamEventTurnId,
   type AgentPersistenceHandle,
+  type AgentPermissionRequest,
   type AgentPermissionResponse,
   type AgentRunOptions,
   type AgentSessionConfig,
@@ -7357,6 +7358,113 @@ export class Session {
     }
   }
 
+  private emitStoredWaitForFinishResponse(record: StoredAgentRecord, requestId: string): void {
+    const final = this.buildStoredAgentPayload(record);
+    let status: "permission" | "error" | "idle" = "idle";
+    if (record.attentionReason === "permission") {
+      status = "permission";
+    } else if (record.lastStatus === "error") {
+      status = "error";
+    }
+    const error = resolveWaitForFinishError({ status, final });
+    this.emit({
+      type: "wait_for_finish_response",
+      payload: { requestId, status, final, error, lastMessage: null },
+    });
+  }
+
+  private async ensureWaitForFinishTarget(
+    agentId: string,
+    pendingPromptIds: readonly string[],
+    requestId: string,
+  ): Promise<boolean> {
+    if (this.agentManager.getAgent(agentId)) return true;
+
+    const record = await this.agentStorage.get(agentId);
+    if (!record || record.internal) {
+      this.emit({
+        type: "wait_for_finish_response",
+        payload: {
+          requestId,
+          status: "error",
+          final: null,
+          error: `Agent not found: ${agentId}`,
+          lastMessage: null,
+        },
+      });
+      return false;
+    }
+    if (record.archivedAt || pendingPromptIds.length === 0) {
+      this.emitStoredWaitForFinishResponse(record, requestId);
+      return false;
+    }
+
+    await ensureAgentLoaded(agentId, {
+      agentManager: this.agentManager,
+      agentStorage: this.agentStorage,
+      logger: this.sessionLogger,
+    });
+    void this.agentManager.drainStoredPendingPrompts(agentId).catch((error) => {
+      this.sessionLogger.error(
+        { err: error, agentId },
+        "Failed to resume durable prompts while waiting for agent completion",
+      );
+    });
+    if (this.agentManager.getAgent(agentId)) return true;
+
+    this.emitStoredWaitForFinishResponse(record, requestId);
+    return false;
+  }
+
+  private async waitForDurablePromptBoundary(
+    agentId: string,
+    pendingPromptIds: readonly string[],
+    signal: AbortSignal,
+  ): Promise<AgentPermissionRequest | null> {
+    return await new Promise<AgentPermissionRequest | null>((resolveOutcome, rejectOutcome) => {
+      let finished = false;
+      let unsubscribe: () => void = () => undefined;
+      const cleanup = () => unsubscribe();
+      const finish = (permission: AgentPermissionRequest | null) => {
+        if (finished) return;
+        finished = true;
+        cleanup();
+        resolveOutcome(permission);
+      };
+      const fail = (error: unknown) => {
+        if (finished) return;
+        finished = true;
+        cleanup();
+        rejectOutcome(error);
+      };
+
+      unsubscribe = this.agentManager.subscribe(
+        (event) => {
+          if (event.type === "agent_stream" && event.event.type === "permission_requested") {
+            finish(event.event.request);
+            return;
+          }
+          if (event.type !== "agent_state") return;
+          const permission = event.agent.pendingPermissions.values().next().value;
+          if (permission) finish(permission);
+        },
+        { agentId, replayState: false },
+      );
+
+      const currentPermission = this.agentManager
+        .getAgent(agentId)
+        ?.pendingPermissions.values()
+        .next().value;
+      if (currentPermission) {
+        finish(currentPermission);
+        return;
+      }
+      void this.agentStorage
+        .waitForPendingPromptIds(agentId, pendingPromptIds, { signal })
+        .then(() => finish(null), fail);
+    });
+  }
+
   private async handleWaitForFinish(
     agentIdOrIdentifier: string,
     requestId: string,
@@ -7378,38 +7486,10 @@ export class Session {
     }
 
     const agentId = resolved.agentId;
-    const live = this.agentManager.getAgent(agentId);
-    if (!live) {
-      const record = await this.agentStorage.get(agentId);
-      if (!record || record.internal) {
-        this.emit({
-          type: "wait_for_finish_response",
-          payload: {
-            requestId,
-            status: "error",
-            final: null,
-            error: `Agent not found: ${agentId}`,
-            lastMessage: null,
-          },
-        });
-        return;
-      }
-      const final = this.buildStoredAgentPayload(record);
-      let status: "permission" | "error" | "idle";
-      if (record.attentionReason === "permission") {
-        status = "permission";
-      } else if (record.lastStatus === "error") {
-        status = "error";
-      } else {
-        status = "idle";
-      }
-      const error = resolveWaitForFinishError({ status, final });
-      this.emit({
-        type: "wait_for_finish_response",
-        payload: { requestId, status, final, error, lastMessage: null },
-      });
-      return;
-    }
+    const pendingPromptIds = (await this.agentStorage.listPendingPrompts(agentId)).map(
+      (prompt) => prompt.id,
+    );
+    if (!(await this.ensureWaitForFinishTarget(agentId, pendingPromptIds, requestId))) return;
 
     const abortController = new AbortController();
     const hasTimeout = typeof timeoutMs === "number" && timeoutMs > 0;
@@ -7424,6 +7504,22 @@ export class Session {
         signal: abortController.signal,
         waitForActive: true,
       });
+      if (!result.permission && pendingPromptIds.length > 0) {
+        const permission = await this.waitForDurablePromptBoundary(
+          agentId,
+          pendingPromptIds,
+          abortController.signal,
+        );
+        if (permission) {
+          result = { ...result, permission };
+        } else {
+          result = {
+            status: this.agentManager.getAgent(agentId)?.lifecycle ?? result.status,
+            permission: null,
+            lastMessage: await this.agentManager.getLastAssistantMessage(agentId),
+          };
+        }
+      }
       let final = await this.getAgentPayloadById(agentId);
       if (!final) {
         throw new Error(`Agent ${agentId} disappeared while waiting`);

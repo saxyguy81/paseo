@@ -19,6 +19,7 @@ import {
 import type { AgentManagerEvent, ManagedAgent } from "./agent-manager.js";
 import type {
   AgentClient,
+  AgentPermissionRequest,
   AgentRunResult,
   AgentSession,
   AgentStreamEvent,
@@ -89,6 +90,7 @@ function createFinishNotificationScenario(
   Reflect.set(callerAgent, "id", "caller-agent");
   Reflect.set(callerAgent, "lifecycle", "idle");
   Reflect.set(callerAgent, "config", { title: "Caller Agent" });
+  Reflect.set(callerAgent, "capabilities", { supportsInFlightSteering: true });
 
   const agentManager: AgentManager = Object.create(AgentManager.prototype);
   Reflect.set(agentManager, "getAgent", (agentId: string) => {
@@ -550,6 +552,7 @@ const RUN_START_TEST_CAPABILITIES = {
   supportsMcpServers: false,
   supportsReasoningStream: false,
   supportsToolInvocations: false,
+  supportsInFlightSteering: false,
 } as const;
 
 /**
@@ -726,6 +729,15 @@ class QueuedPromptAgentSession implements AgentSession {
   }
   async interrupt(): Promise<void> {
     this.interruptCount += 1;
+    const turnId = this.activeTurnId;
+    if (!turnId) return;
+    this.activeTurnId = null;
+    this.pushEvent({
+      type: "turn_canceled",
+      provider: this.provider,
+      turnId,
+      reason: "Interrupted",
+    });
   }
   async close(): Promise<void> {}
 }
@@ -805,6 +817,178 @@ test("serializes all queue-mode prompts through one durable FIFO", async () => {
     await vi.waitFor(async () => {
       await expect(storage.listPendingPrompts(snapshot.id)).resolves.toEqual([]);
     });
+  } finally {
+    await agentManager.closeAgent(snapshot.id).catch(() => undefined);
+    await agentManager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("falls back from unsafe in-flight steering to the durable FIFO", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-durable-prompt-steer-fallback-"));
+  const logger = createTestLogger();
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new QueuedPromptAgentClient();
+  const agentManager = new AgentManager({
+    clients: { "claude-acc": client },
+    registry: storage,
+    logger,
+  });
+  const snapshot = await agentManager.createAgent(
+    { provider: "claude-acc", cwd: workdir },
+    undefined,
+    { workspaceId: undefined },
+  );
+
+  try {
+    await sendPromptToAgent({
+      agentManager,
+      agentStorage: storage,
+      agentId: snapshot.id,
+      prompt: "first request",
+      messageId: "message-1",
+      activeTurnBehavior: "queue",
+      logger,
+    });
+    await vi.waitFor(() => expect(client.session.prompts).toEqual(["first request"]));
+
+    await expect(
+      sendPromptToAgent({
+        agentManager,
+        agentStorage: storage,
+        agentId: snapshot.id,
+        prompt: "follow-up while working",
+        messageId: "message-2",
+        activeTurnBehavior: "steer",
+        logger,
+      }),
+    ).resolves.toEqual({ disposition: "queued" });
+
+    expect(client.session.prompts).toEqual(["first request"]);
+    expect(client.session.interruptCount).toBe(0);
+    await expect(storage.listPendingPrompts(snapshot.id)).resolves.toMatchObject([
+      { id: "message-1", state: "dispatching" },
+      { id: "message-2", prompt: "follow-up while working", state: "queued" },
+    ]);
+
+    client.session.complete();
+    await vi.waitFor(() =>
+      expect(client.session.prompts).toEqual(["first request", "follow-up while working"]),
+    );
+    client.session.complete();
+  } finally {
+    await agentManager.closeAgent(snapshot.id).catch(() => undefined);
+    await agentManager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("routes an idle unsafe steer through the durable FIFO before starting it", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-durable-prompt-idle-steer-"));
+  const logger = createTestLogger();
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const enqueueSpy = vi.spyOn(storage, "enqueuePendingPrompt");
+  const client = new QueuedPromptAgentClient();
+  const agentManager = new AgentManager({
+    clients: { "claude-acc": client },
+    registry: storage,
+    logger,
+  });
+  const snapshot = await agentManager.createAgent(
+    { provider: "claude-acc", cwd: workdir },
+    undefined,
+    { workspaceId: undefined },
+  );
+
+  try {
+    await expect(
+      sendPromptToAgent({
+        agentManager,
+        agentStorage: storage,
+        agentId: snapshot.id,
+        prompt: "idle follow-up",
+        messageId: "message-idle-steer",
+        activeTurnBehavior: "steer",
+        logger,
+      }),
+    ).resolves.toEqual({ disposition: "queued" });
+
+    expect(enqueueSpy).toHaveBeenCalledWith(snapshot.id, {
+      id: "message-idle-steer",
+      prompt: "idle follow-up",
+    });
+    await vi.waitFor(() => expect(client.session.prompts).toEqual(["idle follow-up"]));
+    client.session.complete();
+    await vi.waitFor(async () => {
+      await expect(storage.listPendingPrompts(snapshot.id)).resolves.toEqual([]);
+    });
+  } finally {
+    await agentManager.closeAgent(snapshot.id).catch(() => undefined);
+    await agentManager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("retires a permission-blocked unsafe turn before replacing it", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-permission-steer-replacement-"));
+  const logger = createTestLogger();
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new QueuedPromptAgentClient();
+  const agentManager = new AgentManager({
+    clients: { "claude-acc": client },
+    registry: storage,
+    logger,
+  });
+  const snapshot = await agentManager.createAgent(
+    { provider: "claude-acc", cwd: workdir },
+    undefined,
+    { workspaceId: undefined },
+  );
+
+  try {
+    await sendPromptToAgent({
+      agentManager,
+      agentStorage: storage,
+      agentId: snapshot.id,
+      prompt: "request awaiting approval",
+      messageId: "message-before-permission",
+      activeTurnBehavior: "queue",
+      logger,
+    });
+    await vi.waitFor(() => expect(client.session.prompts).toEqual(["request awaiting approval"]));
+
+    const live = agentManager.getAgent(snapshot.id);
+    if (!live) throw new Error("Expected live test agent");
+    live.pendingPermissions.set("permission-1", {
+      id: "permission-1",
+      provider: "claude-acc",
+      name: "ExitPlanMode",
+      kind: "plan",
+    } satisfies AgentPermissionRequest);
+
+    await expect(
+      sendPromptToAgent({
+        agentManager,
+        agentStorage: storage,
+        agentId: snapshot.id,
+        prompt: "replace the blocked plan",
+        messageId: "message-after-permission",
+        activeTurnBehavior: "steer",
+        clearPendingPermissions: true,
+        logger,
+      }),
+    ).resolves.toEqual({ disposition: "turn_started" });
+
+    expect(client.session.interruptCount).toBe(1);
+    expect(client.session.prompts).toEqual([
+      "request awaiting approval",
+      "replace the blocked plan",
+    ]);
+    expect(agentManager.getAgent(snapshot.id)?.pendingPermissions.size).toBe(0);
+    client.session.complete();
   } finally {
     await agentManager.closeAgent(snapshot.id).catch(() => undefined);
     await agentManager.flush().catch(() => undefined);

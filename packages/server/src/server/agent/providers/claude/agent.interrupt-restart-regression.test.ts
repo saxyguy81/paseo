@@ -1039,7 +1039,7 @@ test("steers an autonomous turn through its existing query without restarting it
   await session.close();
 });
 
-test("auto-completes an open autonomous turn when a foreground prompt starts", async () => {
+test("rejects a foreground prompt until an autonomous turn actually completes", async () => {
   const logger = createTestLogger();
   let queryRef: ScriptedQuery | null = null;
 
@@ -1092,8 +1092,15 @@ test("auto-completes an open autonomous turn when a foreground prompt starts", a
 
   const autonomousStart = await subscribedEvents.next();
   const autonomousTimeline = await subscribedEvents.next();
-  const foregroundEvents = await collectUntilTerminal(streamSession(session, "foreground prompt"));
+
+  await expect(session.startTurn("foreground prompt")).rejects.toThrow(
+    "An autonomous turn is already active",
+  );
+  expect(queryRef?.prompts.map((prompt) => prompt.text)).toEqual(["seed prompt"]);
+
+  queryRef?.emit(buildSuccessResult("autonomous-handoff-session"));
   const autonomousComplete = await subscribedEvents.next();
+  const foregroundEvents = await collectUntilTerminal(streamSession(session, "foreground prompt"));
 
   expect(autonomousStart.value).toMatchObject({
     type: "turn_started",

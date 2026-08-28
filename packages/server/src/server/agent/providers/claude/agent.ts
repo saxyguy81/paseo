@@ -310,6 +310,7 @@ const CLAUDE_CAPABILITIES: AgentCapabilityFlags = {
   supportsMcpServers: true,
   supportsReasoningStream: true,
   supportsToolInvocations: true,
+  supportsInFlightSteering: false,
   supportsRewindConversation: true,
   supportsRewindFiles: true,
   supportsRewindBoth: true,
@@ -2311,7 +2312,7 @@ class ClaudeAgentSession implements AgentSession {
     }
 
     if (this.autonomousTurn) {
-      this.completeAutonomousTurn();
+      throw new Error("An autonomous turn is already active");
     }
 
     const sdkMessage = this.toSdkUserMessage(prompt, options?.clientMessageId);

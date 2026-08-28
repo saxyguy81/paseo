@@ -398,7 +398,21 @@ export async function sendPromptToAgent(
     : params.runOptions;
 
   return await runPromptAdmission(params.agentManager, params.agentId, async () => {
-    if (params.activeTurnBehavior === "queue") {
+    const snapshot = params.agentManager.getAgent(params.agentId);
+    // A provider must explicitly prove that pushing input cannot open a second
+    // upstream request. Otherwise the durable FIFO is the sole turn owner even
+    // during the brief idle edge between two queued prompts.
+    const replaceBlockedPermission =
+      params.activeTurnBehavior === "steer" &&
+      snapshot?.capabilities.supportsInFlightSteering !== true &&
+      params.clearPendingPermissions === true &&
+      Boolean(snapshot?.pendingPermissions.size);
+    const shouldQueue =
+      params.activeTurnBehavior === "queue" ||
+      (params.activeTurnBehavior === "steer" &&
+        snapshot?.capabilities.supportsInFlightSteering !== true &&
+        !replaceBlockedPermission);
+    if (shouldQueue) {
       if (
         params.agentManager.hasInFlightRun(params.agentId) &&
         params.agentManager.tryRunOutOfBand(params.agentId, params.prompt, runOptions)
@@ -437,7 +451,9 @@ export async function sendPromptToAgent(
 
     return await startAgentRun(params.agentManager, params.agentId, params.prompt, params.logger, {
       replaceRunning: true,
-      activeTurnBehavior: params.activeTurnBehavior,
+      // A permission-blocked request cannot drain a FIFO. Retire it through
+      // the acknowledged interrupt path before starting the replacement.
+      activeTurnBehavior: replaceBlockedPermission ? "interrupt" : params.activeTurnBehavior,
       clearPendingPermissions: params.clearPendingPermissions,
       runOptions,
       onIteratorSettled: async (settlement) => {

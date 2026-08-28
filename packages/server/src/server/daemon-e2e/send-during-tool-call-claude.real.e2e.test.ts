@@ -323,7 +323,7 @@ describe("daemon E2E (real claude) - send message during tool call", () => {
     }
   });
 
-  test("steers one active Claude turn without starting another", async () => {
+  test("serializes an unsafe Claude steer behind the active request", async () => {
     const logger = pino({ level: "silent" });
     const resources: SteeringResources = {
       cwd: tmpCwd(),
@@ -364,8 +364,8 @@ describe("daemon E2E (real claude) - send message during tool call", () => {
           agent.id,
           [
             "Use the Bash tool.",
-            "Run exactly: sleep 5. Run it in the foreground. Do not finish until a later user message arrives.",
-            "After that message arrives, use the Bash tool again and run exactly: printf SECOND_BOUNDARY. Then reply exactly: STEERED_SAME_TURN.",
+            "Run exactly: sleep 5. Run it in the foreground.",
+            "After it completes, reply exactly: FIRST_TURN_DONE.",
             "Do not use a background task.",
           ].join(" "),
           { messageId: generateClientMessageId() },
@@ -396,10 +396,14 @@ describe("daemon E2E (real claude) - send message during tool call", () => {
       await within(
         "submit Claude active-turn steer",
         30_000,
-        client.sendAgentMessage(agent.id, "hello", {
-          messageId: steeringMessageId,
-          activeTurnBehavior: "steer",
-        }),
+        client.sendAgentMessage(
+          agent.id,
+          "Use Bash to run exactly: printf SECOND_BOUNDARY. Then reply exactly: SECOND_TURN_DONE.",
+          {
+            messageId: steeringMessageId,
+            activeTurnBehavior: "steer",
+          },
+        ),
       );
       const finish = await within(
         "wait for steered Claude turn to finish",
@@ -414,7 +418,10 @@ describe("daemon E2E (real claude) - send message during tool call", () => {
           message.payload.agentId === agent.id &&
           message.payload.event.type === "turn_started",
       );
-      expect(turnStarts).toHaveLength(0);
+      expect(turnStarts).toHaveLength(1);
+      const queuedTurnId = turnStarts[0]?.payload.event.turnId;
+      expect(queuedTurnId).toEqual(expect.any(String));
+      expect(queuedTurnId).not.toBe(initialTurnId);
       expect(
         postSteerMessages.filter(
           (message) =>
@@ -430,7 +437,7 @@ describe("daemon E2E (real claude) - send message during tool call", () => {
             message.payload.agentId === agent.id &&
             message.payload.event.type === "turn_completed",
         ),
-      ).toHaveLength(1);
+      ).toHaveLength(2);
       expect(
         postSteerMessages.some((message) =>
           isCapturedSleepCompletion(message, agent.id, foregroundSleep.callId),
@@ -459,15 +466,15 @@ describe("daemon E2E (real claude) - send message during tool call", () => {
             message.payload.event.item.type === "tool_call" &&
             message.payload.event.item.status === "completed",
         ),
-        "hello must drive a second completed tool call in the same active loop",
+        "the queued follow-up must drive a second completed tool call",
       ).toBe(true);
       expect(
         secondBoundaryEvents.every(
           (message) =>
             message.payload.event.type === "timeline" &&
-            message.payload.event.turnId === initialTurnId,
+            message.payload.event.turnId === queuedTurnId,
         ),
-        "both Claude tool boundaries must retain the original turn ID",
+        "the follow-up tool boundary must belong to the serialized second turn",
       ).toBe(true);
       const timeline = await within(
         "fetch steered Claude timeline",
@@ -481,15 +488,18 @@ describe("daemon E2E (real claude) - send message during tool call", () => {
         )
         .join("\\n");
       const steeringRows = timeline.entries.filter(
-        (entry) => entry.item.type === "user_message" && entry.item.text === "hello",
+        (entry) =>
+          entry.item.type === "user_message" &&
+          entry.item.text ===
+            "Use Bash to run exactly: printf SECOND_BOUNDARY. Then reply exactly: SECOND_TURN_DONE.",
       );
       expect(steeringRows).toHaveLength(1);
       expect(steeringRows[0]?.item).toMatchObject({
         messageId: steeringMessageId,
         clientMessageId: steeringMessageId,
       });
-      expect(steeringRows[0]?.turnId).toBe(initialTurnId);
-      expect(assistantText).toContain("STEERED_SAME_TURN");
+      expect(steeringRows[0]?.turnId).toBe(queuedTurnId);
+      expect(assistantText).toContain("SECOND_TURN_DONE");
     } finally {
       const cleanup = await Promise.allSettled([
         Promise.resolve(resources.collector?.unsubscribe()),

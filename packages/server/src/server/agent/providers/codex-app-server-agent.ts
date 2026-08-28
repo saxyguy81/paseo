@@ -217,6 +217,7 @@ const CODEX_APP_SERVER_CAPABILITIES: AgentCapabilityFlags = {
   supportsMcpServers: true,
   supportsReasoningStream: true,
   supportsToolInvocations: true,
+  supportsInFlightSteering: true,
   supportsRewindConversation: true,
   supportsRewindFiles: false,
   supportsRewindBoth: false,

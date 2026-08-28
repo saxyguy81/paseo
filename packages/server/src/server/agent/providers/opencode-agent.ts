@@ -133,6 +133,7 @@ const OPENCODE_CAPABILITIES: AgentCapabilityFlags = {
   supportsMcpServers: true,
   supportsReasoningStream: true,
   supportsToolInvocations: true,
+  supportsInFlightSteering: true,
   supportsRewindConversation: false,
   supportsRewindFiles: false,
   supportsRewindBoth: true,
