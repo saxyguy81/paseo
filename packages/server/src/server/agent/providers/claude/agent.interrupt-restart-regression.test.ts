@@ -299,6 +299,91 @@ test("interrupt only calls query.interrupt and leaves the query open", async () 
   await session.close();
 });
 
+test("interrupt does not acknowledge cancellation before Claude retires the active request", async () => {
+  const queries: ScriptedQuery[] = [];
+  let acknowledgeInterrupt: (() => void) | null = null;
+
+  queryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    const scriptedQuery = createScriptedQuery({
+      prompt,
+      sessionId: "interrupt-acknowledgement-session",
+    });
+    scriptedQuery.interrupt.mockImplementation(
+      async () =>
+        await new Promise<void>((resolve) => {
+          acknowledgeInterrupt = resolve;
+        }),
+    );
+    queries.push(scriptedQuery);
+    return scriptedQuery;
+  });
+
+  const session = await new ClaudeAgentClient({
+    logger: createTestLogger(),
+    queryFactory,
+    resolveBinary: async () => "/test/claude/bin",
+  }).createSession({ provider: "claude", cwd: process.cwd() });
+
+  const turn = streamSession(session, "first prompt");
+  await turn.next();
+  await waitFor(() => queries[0]?.prompts.length === 1);
+
+  let interruptSettled = false;
+  const interrupt = session.interrupt().then(() => {
+    interruptSettled = true;
+    return undefined;
+  });
+  await waitFor(() => queries[0]?.interrupt.mock.calls.length === 1);
+  await Promise.resolve();
+  expect(interruptSettled).toBe(false);
+
+  acknowledgeInterrupt?.();
+  await interrupt;
+  expect(interruptSettled).toBe(true);
+  expect(await collectUntilTerminal(turn)).toContainEqual(
+    expect.objectContaining({ type: "turn_canceled" }),
+  );
+
+  await session.close();
+});
+
+test("interrupt rejects instead of falsely acknowledging an active request it could not retire", async () => {
+  let query: ScriptedQuery | null = null;
+  queryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    query = createScriptedQuery({
+      prompt,
+      sessionId: "interrupt-rejection-session",
+    });
+    query.interrupt.mockRejectedValueOnce(new Error("provider still owns the active request"));
+    return query;
+  });
+
+  const session = await new ClaudeAgentClient({
+    logger: createTestLogger(),
+    queryFactory,
+    resolveBinary: async () => "/test/claude/bin",
+  }).createSession({ provider: "claude", cwd: process.cwd() });
+
+  const turn = streamSession(session, "first prompt");
+  await turn.next();
+  await waitFor(() => query?.prompts.length === 1);
+
+  await expect(session.interrupt()).rejects.toThrow("provider still owns the active request");
+  expect(query?.interrupt).toHaveBeenCalledTimes(1);
+
+  query?.emit({
+    type: "assistant",
+    message: { content: "THE_ORIGINAL_REQUEST_CONTINUED" },
+    session_id: "interrupt-rejection-session",
+  });
+  query?.emit(buildSuccessResult("interrupt-rejection-session"));
+  const events = await collectUntilTerminal(turn);
+  expect(collectAssistantText(events)).toContain("THE_ORIGINAL_REQUEST_CONTINUED");
+  expect(events.some((event) => event.type === "turn_completed")).toBe(true);
+
+  await session.close();
+});
+
 async function startSteeredTurn(sessionId: string): Promise<{
   session: AgentSession;
   query: () => ScriptedQuery | null;

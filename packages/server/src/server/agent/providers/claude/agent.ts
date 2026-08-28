@@ -2161,7 +2161,7 @@ class ClaudeAgentSession implements AgentSession {
   private historyPending = false;
   private turnState: TurnState = "idle";
   private nextTurnOrdinal = 1;
-  private cancelCurrentTurn: (() => void) | null = null;
+  private cancelCurrentTurn: (() => Promise<void>) | null = null;
   private cachedRuntimeInfo: AgentRuntimeInfo | null = null;
   private lastOptionsModel: string | null = null;
   private lastRuntimeModel: string | null = null;
@@ -2321,24 +2321,31 @@ class ClaudeAgentSession implements AgentSession {
     this.transitionTurnState("foreground", "foreground turn started");
     this.clearRecentStderr();
 
-    let cancelIssued = false;
-    const requestCancel = () => {
-      if (cancelIssued) {
-        return;
+    let cancellationInFlight: Promise<void> | null = null;
+    const requestCancel = (): Promise<void> => {
+      if (cancellationInFlight) {
+        return cancellationInFlight;
       }
-      cancelIssued = true;
-      if (this.cancelCurrentTurn === requestCancel) {
-        this.cancelCurrentTurn = null;
-      }
-      this.rejectAllPendingPermissions(new Error("Permission request canceled"));
-      this.finishForegroundTurn({
-        type: "turn_canceled",
-        provider: "claude",
-        reason: "Interrupted",
-      });
-      void this.interruptActiveTurn().catch((error) => {
-        this.logger.warn({ err: error }, "Failed to interrupt during cancel");
-      });
+      let cancellation!: Promise<void>;
+      cancellation = (async () => {
+        try {
+          this.rejectAllPendingPermissions(new Error("Permission request canceled"));
+          await this.interruptActiveTurn();
+          if (this.activeForegroundTurnId === turnId) {
+            this.finishForegroundTurn({
+              type: "turn_canceled",
+              provider: "claude",
+              reason: "Interrupted",
+            });
+          }
+        } finally {
+          if (cancellationInFlight === cancellation) {
+            cancellationInFlight = null;
+          }
+        }
+      })();
+      cancellationInFlight = cancellation;
+      return cancellation;
     };
     this.cancelCurrentTurn = requestCancel;
 
@@ -2434,7 +2441,7 @@ class ClaudeAgentSession implements AgentSession {
 
   async interrupt(): Promise<void> {
     if (this.cancelCurrentTurn) {
-      this.cancelCurrentTurn();
+      await this.cancelCurrentTurn();
       return;
     }
 
@@ -2769,7 +2776,15 @@ class ClaudeAgentSession implements AgentSession {
     );
     this.closed = true;
     this.rejectAllPendingPermissions(new Error("Claude session closed"));
-    this.cancelCurrentTurn?.();
+    let foregroundInterruptAcknowledged = false;
+    if (this.cancelCurrentTurn) {
+      try {
+        await this.cancelCurrentTurn();
+        foregroundInterruptAcknowledged = true;
+      } catch (error) {
+        this.logger.warn({ err: error }, "Failed to interrupt foreground turn during close");
+      }
+    }
     this.subscribers.clear();
     this.activeForegroundTurnId = null;
     this.activeForegroundQuery = null;
@@ -2781,7 +2796,9 @@ class ClaudeAgentSession implements AgentSession {
     this.taskProtocolSource.reset();
     this.input?.end();
     this.query?.close?.();
-    await this.awaitWithTimeout(this.query?.interrupt?.(), "close query interrupt");
+    if (!foregroundInterruptAcknowledged) {
+      await this.awaitWithTimeout(this.query?.interrupt?.(), "close query interrupt");
+    }
     await this.awaitWithTimeout(this.query?.return?.(), "close query return");
     this.query = null;
     this.input = null;
@@ -4304,12 +4321,11 @@ class ClaudeAgentSession implements AgentSession {
     this.pendingInterruptAbort = true;
     await this.discardQueuedSteers(queryToInterrupt);
     try {
-      await this.awaitWithTimeout(
-        queryToInterrupt.interrupt(),
-        "interruptActiveTurn query.interrupt()",
-      );
+      await withTimeout(queryToInterrupt.interrupt(), 3_000, "Claude interrupt timed out");
     } catch (error) {
+      this.pendingInterruptAbort = false;
       this.logger.warn({ err: error }, "Failed to interrupt active turn");
+      throw error;
     }
   }
 
