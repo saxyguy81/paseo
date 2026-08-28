@@ -2169,6 +2169,7 @@ class ClaudeAgentSession implements AgentSession {
   private foregroundHasProviderActivity = false;
   private foregroundApiRecoveryAttempts = 0;
   private pendingPostWorkApiRecovery: PendingPostWorkApiRecovery | null = null;
+  private pendingContextOverflowError: string | null = null;
   private readonly contextUsage: ClaudeContextUsageState;
   private userMessageIds: string[] = [];
   private readonly emittedUserMessageIds = new Set<string>();
@@ -2310,6 +2311,7 @@ class ClaudeAgentSession implements AgentSession {
     this.foregroundHasProviderActivity = false;
     this.foregroundApiRecoveryAttempts = 0;
     this.pendingPostWorkApiRecovery = null;
+    this.pendingContextOverflowError = null;
     this.contextUsage.beginTurn();
     this.transitionTurnState("foreground", "foreground turn started");
     this.clearRecentStderr();
@@ -3663,6 +3665,7 @@ class ClaudeAgentSession implements AgentSession {
     this.foregroundHasProviderActivity = false;
     this.foregroundApiRecoveryAttempts = 0;
     this.pendingPostWorkApiRecovery = null;
+    this.pendingContextOverflowError = null;
     this.syncTurnState("foreground turn terminal");
   }
 
@@ -3683,12 +3686,14 @@ class ClaudeAgentSession implements AgentSession {
         this.foregroundHasProviderActivity = false;
         this.foregroundApiRecoveryAttempts = 0;
         this.pendingPostWorkApiRecovery = null;
+        this.pendingContextOverflowError = null;
         this.syncTurnState("foreground turn terminal");
       } else if (this.autonomousTurn) {
         this.autonomousTurn = null;
         this.activeForegroundQuery = null;
         this.activeForegroundInput = null;
         this.activeTurnHasAssistantText = false;
+        this.pendingContextOverflowError = null;
         this.syncTurnState("autonomous turn terminal");
       }
     }
@@ -3704,6 +3709,7 @@ class ClaudeAgentSession implements AgentSession {
     this.activeForegroundQuery = this.query;
     this.activeForegroundInput = this.input;
     this.activeTurnHasAssistantText = false;
+    this.pendingContextOverflowError = null;
     this.contextUsage.beginTurn();
     this.notifySubscribers({ type: "turn_started", provider: "claude" });
     this.syncTurnState("autonomous turn started");
@@ -3718,11 +3724,12 @@ class ClaudeAgentSession implements AgentSession {
     this.activeForegroundQuery = null;
     this.activeForegroundInput = null;
     this.activeTurnHasAssistantText = false;
+    this.pendingContextOverflowError = null;
     this.syncTurnState("autonomous turn completed");
   }
 
   private failActiveTurns(errorMessage: string): void {
-    const failure = this.buildTurnFailedEvent(errorMessage);
+    const failure = this.buildTurnFailedEvent(this.pendingContextOverflowError ?? errorMessage);
     this.flushPendingToolCalls();
     if (this.activeForegroundTurnId) {
       this.finishForegroundTurn(failure);
@@ -4100,6 +4107,13 @@ class ClaudeAgentSession implements AgentSession {
     return true;
   }
 
+  private captureContextOverflowError(message: SDKMessage): void {
+    const error = readClaudeContextOverflowError(message);
+    if (error) {
+      this.pendingContextOverflowError = error;
+    }
+  }
+
   private async routeSdkMessageFromPump(message: SDKMessage, sourceQuery: Query): Promise<void> {
     if (this.query && this.query !== sourceQuery) {
       this.logger.debug("Suppressing a trailing message from a retired Claude provider query");
@@ -4108,6 +4122,7 @@ class ClaudeAgentSession implements AgentSession {
     if (this.shouldSuppressStaleResult(message)) {
       return;
     }
+    this.captureContextOverflowError(message);
     if (this.continueForegroundAfterApiFailureResult(message, sourceQuery)) {
       return;
     }
@@ -4716,10 +4731,11 @@ class ClaudeAgentSession implements AgentSession {
       events.push({ type: "turn_completed", provider: "claude", usage });
       return;
     }
-    const errorMessage =
+    const resultErrorMessage =
       "errors" in message && Array.isArray(message.errors) && message.errors.length > 0
         ? message.errors.join("\n")
         : "Claude run failed";
+    const errorMessage = this.pendingContextOverflowError ?? resultErrorMessage;
     events.push(...this.sidechainTracker.finishAll("failed"));
     events.push(this.buildTurnFailedEvent(errorMessage));
   }

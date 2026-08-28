@@ -255,6 +255,80 @@ test("classifies Claude context overflow without treating it as a same-session r
   expect(readRetryableClaudeApiError(apiError("API Error: prompt too long"))).toBeNull();
 });
 
+test("preserves a context overflow assistant error when the terminal result is generic", async () => {
+  let step = 0;
+  sdkQueryFactory.mockImplementation(() =>
+    createBaseQueryMock(
+      vi.fn(async () => {
+        if (step === 0) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "system",
+              subtype: "init",
+              session_id: "generic-result-overflow-session",
+              permissionMode: "bypassPermissions",
+              model: "claude-opus-5",
+            },
+          };
+        }
+        if (step === 1) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              uuid: "generic-result-overflow-assistant",
+              session_id: "generic-result-overflow-session",
+              isApiErrorMessage: true,
+              message: {
+                role: "assistant",
+                content: [
+                  {
+                    type: "text",
+                    text: "Prompt is too long · automatic compaction failed: selected model unavailable",
+                  },
+                ],
+              },
+            },
+          };
+        }
+        if (step === 2) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "result",
+              subtype: "error_during_execution",
+              uuid: "generic-result-overflow-result",
+              session_id: "generic-result-overflow-session",
+              usage: buildUsage(),
+              errors: [],
+              total_cost_usd: 0,
+            },
+          };
+        }
+        return { done: true, value: undefined };
+      }),
+    ),
+  );
+
+  const session = await createSession();
+  try {
+    const events = await collectUntilTerminal(streamSession(session, "continue the review"));
+    expect(events.filter((event) => event.type === "turn_failed")).toEqual([
+      expect.objectContaining({
+        type: "turn_failed",
+        error: "Prompt is too long · automatic compaction failed: selected model unavailable",
+        failureKind: "context_overflow",
+      }),
+    ]);
+  } finally {
+    await session.close();
+  }
+});
+
 test("keeps context overflow classified after an AskUserQuestion response", async () => {
   let canUseTool:
     | ((
