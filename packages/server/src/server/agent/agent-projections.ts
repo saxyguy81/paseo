@@ -94,6 +94,7 @@ export function toStoredAgentRecord(
       : null,
     internal: options?.internal,
     owner: agent.owner,
+    pendingPrompts: [],
   } satisfies StoredAgentRecord;
 }
 

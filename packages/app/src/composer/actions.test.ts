@@ -179,7 +179,7 @@ interface FakeSendCall {
   text: string;
   options: {
     messageId: string;
-    activeTurnBehavior?: "interrupt" | "steer";
+    activeTurnBehavior?: "interrupt" | "steer" | "queue";
     images: Array<{ data: string; mimeType: string }>;
     attachments: AgentAttachment[];
   };
@@ -433,6 +433,18 @@ describe("dispatchComposerAgentMessage", () => {
     });
 
     expect(client.calls[0]?.options.activeTurnBehavior).toBe("steer");
+
+    await dispatchComposerAgentMessage({
+      client,
+      agentId: "agent",
+      text: "run this after the active turn",
+      attachments: [],
+      encodeImages: async () => [],
+      submission: stream,
+      activeTurnBehavior: "queue",
+    });
+
+    expect(client.calls[1]?.options.activeTurnBehavior).toBe("queue");
   });
 
   it("stamps only a steer optimistic row with the daemon active turn ID", async () => {

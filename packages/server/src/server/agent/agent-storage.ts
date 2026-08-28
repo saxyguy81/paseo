@@ -7,7 +7,7 @@ import { writeJsonFileAtomic } from "../atomic-file.js";
 import { AgentFeatureSchema, AgentStatusSchema } from "../messages.js";
 import { toStoredAgentRecord } from "./agent-projections.js";
 import type { ManagedAgent } from "./agent-manager.js";
-import type { AgentSessionConfig } from "./agent-sdk-types.js";
+import type { AgentPromptInput, AgentSessionConfig } from "./agent-sdk-types.js";
 import { AgentOwnerSchema, daemonExecutionKey, type DaemonAgentOwner } from "./agent-owner.js";
 
 const SERIALIZABLE_CONFIG_SCHEMA = z
@@ -42,6 +42,21 @@ const PERSISTENCE_HANDLE_SCHEMA = z
   .nullable()
   .optional();
 
+const STORED_PENDING_AGENT_PROMPT_SCHEMA = z
+  .object({
+    id: z.string().min(1),
+    prompt: z.custom<AgentPromptInput>(
+      (value) => typeof value === "string" || Array.isArray(value),
+      "Expected a string or structured agent prompt",
+    ),
+    createdAt: z.string(),
+    state: z.enum(["queued", "dispatching"]).default("queued"),
+    attemptCount: z.number().int().nonnegative().default(0),
+  })
+  .strict();
+
+export type StoredPendingAgentPrompt = z.infer<typeof STORED_PENDING_AGENT_PROMPT_SCHEMA>;
+
 const STORED_AGENT_SCHEMA = z.object({
   id: z.string(),
   provider: z.string(),
@@ -75,6 +90,7 @@ const STORED_AGENT_SCHEMA = z.object({
   internal: z.boolean().optional(),
   archivedAt: z.string().nullable().optional(),
   owner: AgentOwnerSchema.optional(),
+  pendingPrompts: z.array(STORED_PENDING_AGENT_PROMPT_SCHEMA).max(32).default([]),
 });
 
 export type SerializableAgentConfig = Pick<
@@ -153,6 +169,153 @@ export class AgentStorage {
   async upsert(record: StoredAgentRecord): Promise<void> {
     await this.load();
     await this.queueRecordWrite(record);
+  }
+
+  async enqueuePendingPrompt(
+    agentId: string,
+    input: Pick<StoredPendingAgentPrompt, "id" | "prompt">,
+  ): Promise<{ enqueued: boolean; position: number }> {
+    await this.load();
+    let result: { enqueued: boolean; position: number } | null = null;
+    await this.queueRecordMutation(agentId, (existing) => {
+      if (!existing) {
+        throw new Error(`Agent ${agentId} not found`);
+      }
+      const duplicateIndex = existing.pendingPrompts.findIndex((item) => item.id === input.id);
+      if (duplicateIndex >= 0) {
+        result = { enqueued: false, position: duplicateIndex + 1 };
+        return existing;
+      }
+      if (existing.pendingPrompts.length >= 32) {
+        throw new Error(`Agent ${agentId} prompt queue is full (32 messages)`);
+      }
+      const pendingPrompts = [
+        ...existing.pendingPrompts,
+        {
+          id: input.id,
+          prompt: input.prompt,
+          createdAt: new Date().toISOString(),
+          state: "queued" as const,
+          attemptCount: 0,
+        },
+      ];
+      result = { enqueued: true, position: pendingPrompts.length };
+      return { ...existing, pendingPrompts };
+    });
+    if (!result) {
+      throw new Error(`Failed to queue prompt for agent ${agentId}`);
+    }
+    return result;
+  }
+
+  async listPendingPrompts(agentId: string): Promise<StoredPendingAgentPrompt[]> {
+    const record = await this.get(agentId);
+    return (
+      record?.pendingPrompts.map((item) => ({
+        id: item.id,
+        prompt: item.prompt,
+        createdAt: item.createdAt,
+        state: item.state,
+        attemptCount: item.attemptCount,
+      })) ?? []
+    );
+  }
+
+  async claimPendingPrompt(agentId: string): Promise<StoredPendingAgentPrompt | null> {
+    await this.load();
+    let claimed: StoredPendingAgentPrompt | null = null;
+    await this.queueRecordMutation(agentId, (existing) => {
+      if (!existing) {
+        throw new Error(`Agent ${agentId} not found`);
+      }
+      const index = existing.pendingPrompts.findIndex((item) => item.state === "queued");
+      if (index < 0) {
+        return existing;
+      }
+      const next = [...existing.pendingPrompts];
+      claimed = {
+        ...next[index]!,
+        state: "dispatching",
+        attemptCount: next[index]!.attemptCount + 1,
+      };
+      next[index] = claimed;
+      return { ...existing, pendingPrompts: next };
+    });
+    return claimed;
+  }
+
+  async completePendingPrompt(agentId: string, promptId: string): Promise<void> {
+    await this.load();
+    await this.queueRecordMutation(agentId, (existing) => {
+      if (!existing) {
+        throw new Error(`Agent ${agentId} not found`);
+      }
+      return {
+        ...existing,
+        pendingPrompts: existing.pendingPrompts.filter((item) => item.id !== promptId),
+      };
+    });
+  }
+
+  async releasePendingPrompt(agentId: string, promptId: string): Promise<void> {
+    await this.load();
+    await this.queueRecordMutation(agentId, (existing) => {
+      if (!existing) {
+        throw new Error(`Agent ${agentId} not found`);
+      }
+      return {
+        ...existing,
+        pendingPrompts: existing.pendingPrompts.map((item) =>
+          item.id === promptId ? { ...item, state: "queued" as const } : item,
+        ),
+      };
+    });
+  }
+
+  async transferPendingPrompts(sourceAgentId: string, targetAgentId: string): Promise<void> {
+    if (sourceAgentId === targetAgentId) return;
+    await this.load();
+    await this.waitForPendingWrite(sourceAgentId);
+    const source = await this.get(sourceAgentId);
+    if (!source || source.pendingPrompts.length === 0) return;
+
+    const prompts = source.pendingPrompts.map((item) => ({
+      id: item.id,
+      prompt: item.prompt,
+      createdAt: item.createdAt,
+      // A provider iterator cannot survive a family rollover. The successor
+      // owns replay admission and will claim the prompt again once its bounded
+      // handoff turn settles.
+      state: "queued" as const,
+      attemptCount: item.attemptCount,
+    }));
+    await this.queueRecordMutation(targetAgentId, (target) => {
+      if (!target) {
+        throw new Error(`Agent ${targetAgentId} not found`);
+      }
+      const existingIds = new Set(target.pendingPrompts.map((item) => item.id));
+      const pendingPrompts = [
+        ...prompts.filter((item) => !existingIds.has(item.id)),
+        // The family pointer is redirected before transfer, so anything
+        // already queued on the successor arrived after these predecessor
+        // prompts and must remain behind them.
+        ...target.pendingPrompts,
+      ];
+      if (pendingPrompts.length > 32) {
+        throw new Error(`Agent ${targetAgentId} prompt queue is full (32 messages)`);
+      }
+      return { ...target, pendingPrompts };
+    });
+    await this.queueRecordMutation(sourceAgentId, (latestSource) => {
+      if (!latestSource) {
+        throw new Error(`Agent ${sourceAgentId} not found`);
+      }
+      const movedIds = new Set(prompts.map((item) => item.id));
+      return {
+        ...latestSource,
+        pendingPrompts: latestSource.pendingPrompts.filter((item) => !movedIds.has(item.id)),
+      };
+    });
   }
 
   private queueRecordWrite(record: StoredAgentRecord): Promise<void> {
@@ -258,6 +421,9 @@ export class AgentStorage {
       // stale pre-archive record after the archive mutation.
       if (existing && existing.archivedAt !== undefined) {
         record.archivedAt = existing.archivedAt;
+      }
+      if (existing) {
+        record.pendingPrompts = existing.pendingPrompts;
       }
       return record;
     });

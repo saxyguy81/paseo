@@ -14,6 +14,13 @@ const AppliedMigrationsSchema = z.strictObject({ applied: z.array(z.string()) })
 const STEER_DEFAULT_MIGRATION = "steer-default";
 
 /**
+ * Steering is not a safe default for providers whose upstream permits only one
+ * request per conversation. Queue once for existing defaults; users can still
+ * explicitly select steer afterwards.
+ */
+const DURABLE_QUEUE_DEFAULT_MIGRATION = "durable-queue-default";
+
+/**
  * Brings stored settings up to date, returning what the caller should use. Owns both writes so
  * the marker can only ever be written after the settings it describes: a failed marker write
  * leaves the migration to re-run harmlessly, while a failed settings write must leave the marker
@@ -30,12 +37,17 @@ export async function migrateAppSettings(
     AppliedMigrationsSchema,
   );
   const applied = new Set(migrationMarker?.applied ?? []);
-  if (applied.has(STEER_DEFAULT_MIGRATION)) {
-    return settings;
+  let migrated = settings;
+  if (!applied.has(STEER_DEFAULT_MIGRATION)) {
+    migrated =
+      migrated.sendBehavior === "interrupt" ? { ...migrated, sendBehavior: "steer" } : migrated;
+    applied.add(STEER_DEFAULT_MIGRATION);
   }
-
-  const migrated: AppSettings =
-    settings.sendBehavior === "interrupt" ? { ...settings, sendBehavior: "steer" } : settings;
+  if (!applied.has(DURABLE_QUEUE_DEFAULT_MIGRATION)) {
+    migrated =
+      migrated.sendBehavior === "steer" ? { ...migrated, sendBehavior: "queue" } : migrated;
+    applied.add(DURABLE_QUEUE_DEFAULT_MIGRATION);
+  }
   if (migrated !== settings) {
     const storedSidebarRowItems = stored?.sidebarRowItems ?? {};
     await storage.setItem(
@@ -48,7 +60,6 @@ export async function migrateAppSettings(
     );
   }
 
-  applied.add(STEER_DEFAULT_MIGRATION);
   await storage.setItem(SETTINGS_MIGRATIONS_KEY, JSON.stringify({ applied: [...applied] }));
   return migrated;
 }

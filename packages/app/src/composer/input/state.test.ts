@@ -186,6 +186,31 @@ describe("dictation transcript behavior", () => {
       "submit:typed context spoken prompt",
     ]);
   });
+
+  it("submits queue-mode dictation to the daemon while a turn is active", () => {
+    const queued = vi.fn();
+    const submitted = vi.fn();
+
+    applyDictationTranscript("follow up", {
+      value: "",
+      defaultSendBehavior: "queue",
+      isAgentRunning: true,
+      onQueue: queued,
+      replaceText: vi.fn(),
+      onSubmit: submitted,
+      attachments: [],
+      cwd: "/repo",
+      autoSend: true,
+    });
+
+    expect(queued).not.toHaveBeenCalled();
+    expect(submitted).toHaveBeenCalledWith({
+      text: "follow up",
+      attachments: [],
+      cwd: "/repo",
+      forceSend: true,
+    });
+  });
 });
 
 describe("composer send behavior", () => {
@@ -251,7 +276,7 @@ describe("composer send behavior", () => {
     expect(alternateAction.calls).toEqual(["queue"]);
   });
 
-  it("uses Enter to queue and Mod+Enter to submit when queue is selected", () => {
+  it("submits queue-mode sends immediately so the daemon owns durability", () => {
     const defaultAction = actions();
     runDefaultSendAction({
       defaultSendBehavior: "queue",
@@ -270,7 +295,7 @@ describe("composer send behavior", () => {
       handleQueueMessage: alternateAction.handleQueueMessage,
     });
 
-    expect(defaultAction.calls).toEqual(["queue"]);
+    expect(defaultAction.calls).toEqual(["send"]);
     expect(alternateAction.calls).toEqual(["send"]);
   });
 });

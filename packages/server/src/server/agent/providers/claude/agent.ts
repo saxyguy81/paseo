@@ -370,6 +370,15 @@ const STEER_SUPERSEDED_PERMISSION_MESSAGE =
   "The user answered with a message instead of approving. Their message follows.";
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+function toStableClaudeUserMessageUuid(stableMessageId?: string): SDKUserMessage["uuid"] {
+  const stableId = stableMessageId?.trim();
+  if (!stableId) return randomUUID();
+  if (UUID_PATTERN.test(stableId)) return stableId as SDKUserMessage["uuid"];
+
+  const digest = createHash("sha256").update(stableId).digest("hex");
+  return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-5${digest.slice(13, 16)}-a${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
+}
+
 interface SlashCommandInvocation {
   commandName: string;
   args?: string;
@@ -2305,7 +2314,7 @@ class ClaudeAgentSession implements AgentSession {
       this.completeAutonomousTurn();
     }
 
-    const sdkMessage = this.toSdkUserMessage(prompt);
+    const sdkMessage = this.toSdkUserMessage(prompt, options?.clientMessageId);
     const sdkUserMessageId =
       typeof sdkMessage.uuid === "string" && sdkMessage.uuid.length > 0 ? sdkMessage.uuid : null;
     this.rememberRewindUserAnchor(sdkUserMessageId);
@@ -3475,7 +3484,7 @@ class ClaudeAgentSession implements AgentSession {
     return result;
   }
 
-  private toSdkUserMessage(prompt: AgentPromptInput): SDKUserMessage {
+  private toSdkUserMessage(prompt: AgentPromptInput, stableMessageId?: string): SDKUserMessage {
     const content: Array<
       | { type: "text"; text: string }
       | {
@@ -3510,7 +3519,7 @@ class ClaudeAgentSession implements AgentSession {
       content.push({ type: "text", text: prompt });
     }
 
-    const messageId = randomUUID();
+    const messageId = toStableClaudeUserMessageUuid(stableMessageId);
     this.rememberUserMessageId(messageId);
 
     return {

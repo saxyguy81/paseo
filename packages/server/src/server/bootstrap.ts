@@ -131,6 +131,7 @@ import { createSpeechService } from "./speech/speech-runtime.js";
 import { AgentManager } from "./agent/agent-manager.js";
 import { AgentStorage } from "./agent/agent-storage.js";
 import { reconcileStoredContextOverflowContinuations } from "./agent/agent-loading.js";
+import { resumePendingAgentPrompts } from "./agent/agent-prompt.js";
 import { attachAgentStoragePersistence } from "./persistence-hooks.js";
 import { createAgentMcpServer } from "./agent/mcp-server.js";
 import {
@@ -1669,6 +1670,7 @@ export async function createPaseoDaemon(
                 "Reconciled persisted context overflow continuations",
               );
             }
+            await resumePendingAgentPrompts({ agentManager, agentStorage, logger });
             wsServer.beginAcceptingConnections();
             relayRuntime = createRelayRuntime({
               config: {

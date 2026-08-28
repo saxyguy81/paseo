@@ -1934,7 +1934,11 @@ describe("ClaudeAgentSession context window usage", () => {
     expect(events.slice(0, 2).map((event) => event.type)).toEqual(["turn_started", "timeline"]);
     expect(events[1]).toMatchObject({
       type: "timeline",
-      item: { type: "user_message", clientMessageId: "client-message-1" },
+      item: {
+        type: "user_message",
+        clientMessageId: "client-message-1",
+        messageId: "bba77e15-0c34-5a04-ae11-51a7ea293956",
+      },
     });
     await session.close();
   });

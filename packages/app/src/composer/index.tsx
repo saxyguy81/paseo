@@ -1356,7 +1356,7 @@ function ComposerContentImpl({
         agentId: string,
         text: string,
         attachments: ComposerAttachment[],
-        activeTurnBehavior: "interrupt" | "steer",
+        activeTurnBehavior: "interrupt" | "steer" | "queue",
       ) => Promise<void>)
     | null
   >(null);
@@ -1410,7 +1410,11 @@ function ComposerContentImpl({
   }, [focusInput, onFocusInput]);
 
   const submitMessage = useCallback(
-    async (text: string, submitAttachments: ComposerAttachment[]) => {
+    async (
+      text: string,
+      submitAttachments: ComposerAttachment[],
+      activeTurnBehaviorOverride?: "interrupt" | "steer" | "queue",
+    ) => {
       onMessageSent?.();
       if (onSubmitMessageRef.current) {
         await onSubmitMessageRef.current({ text, attachments: submitAttachments, cwd });
@@ -1423,7 +1427,7 @@ function ComposerContentImpl({
         agentIdRef.current,
         text,
         submitAttachments,
-        appSettings.sendBehavior === "steer" ? "steer" : "interrupt",
+        activeTurnBehaviorOverride ?? appSettings.sendBehavior,
       );
     },
     [appSettings.sendBehavior, cwd, onMessageSent, t],
@@ -1438,7 +1442,7 @@ function ComposerContentImpl({
       targetAgentId: string,
       text: string,
       sendAttachments: ComposerAttachment[],
-      activeTurnBehavior: "interrupt" | "steer",
+      activeTurnBehavior: "interrupt" | "steer" | "queue",
     ) => {
       if (!client) {
         throw new Error(t("workspace.terminal.hostDisconnected"));
@@ -1531,6 +1535,7 @@ function ComposerContentImpl({
       outgoingMessage: string,
       outgoingAttachments: ComposerAttachment[],
       forceSend?: boolean,
+      activeTurnBehaviorOverride?: "interrupt" | "steer" | "queue",
     ) => {
       const result = await submitAgentInput({
         message: outgoingMessage,
@@ -1550,7 +1555,11 @@ function ComposerContentImpl({
           if (submitBehavior !== "preserve-and-lock") {
             beginSubmit(submitAttachments);
           }
-          await submitMessage(submitText, submitAttachments);
+          await submitMessage(
+            submitText,
+            submitAttachments,
+            activeTurnBehaviorOverride ?? activeSendBehavior,
+          );
         },
         clearDraft,
         setUserInput: replaceUserInput,
@@ -1571,6 +1580,7 @@ function ComposerContentImpl({
     },
     [
       allowEmptySubmit,
+      activeSendBehavior,
       beginSubmit,
       clearDraft,
       completeSubmit,
@@ -1834,7 +1844,7 @@ function ComposerContentImpl({
   const handleSendQueuedNow = useCallback(
     async (id: string) => {
       if (!sendAgentMessageRef.current && !onSubmitMessageRef.current) return;
-      // Reuse the regular send path; server-side send atomically interrupts any active run.
+      // Reuse the regular send path; the server queues behind any active run.
       const result = await sendQueuedComposerMessageNow({
         agentId,
         messageId: id,
@@ -1860,9 +1870,13 @@ function ComposerContentImpl({
       if (clientSlashCommand && runClientSlashCommand(clientSlashCommand)) {
         return;
       }
-      queueMessage(payload.text, outgoingAttachments);
+      // The daemon owns active-turn admission. Submit the follow-up now so it is
+      // durably queued even if this browser disconnects or another device opens
+      // the conversation. The legacy client queue remains only to drain drafts
+      // created by older Paseo versions.
+      void sendMessageWithContent(payload.text, outgoingAttachments, true, "queue");
     },
-    [attachments, buildOutgoingAttachments, queueMessage, runClientSlashCommand],
+    [attachments, buildOutgoingAttachments, runClientSlashCommand, sendMessageWithContent],
   );
 
   const hasSendableContent = userInput.trim().length > 0 || selectedAttachments.length > 0;

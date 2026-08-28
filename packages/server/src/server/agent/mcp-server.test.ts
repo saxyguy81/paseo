@@ -238,6 +238,7 @@ function buildAgentStorageSpies() {
     upsert: vi.fn().mockResolvedValue(undefined),
     applySnapshot: vi.fn(),
     list: vi.fn().mockResolvedValue([]),
+    listPendingPrompts: vi.fn().mockResolvedValue([]),
     remove: vi.fn(),
   };
 }

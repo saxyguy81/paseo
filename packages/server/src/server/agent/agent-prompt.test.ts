@@ -11,6 +11,8 @@ import { AgentStorage } from "./agent-storage.js";
 import {
   formatSystemNotificationPrompt,
   isSystemInjectedEnvelope,
+  resumePendingAgentPrompts,
+  sendPromptToAgent,
   setupFinishNotification,
   waitForAgentRunStartWithTimeout,
 } from "./agent-prompt.js";
@@ -660,6 +662,337 @@ class SlowStartAgentClient implements AgentClient {
     return await this.createSession();
   }
 }
+
+class QueuedPromptAgentSession implements AgentSession {
+  readonly provider = "claude-acc";
+  readonly capabilities = RUN_START_TEST_CAPABILITIES;
+  readonly id = randomUUID();
+  readonly prompts: string[] = [];
+  interruptCount = 0;
+  private readonly subscribers = new Set<(event: AgentStreamEvent) => void>();
+  private activeTurnId: string | null = null;
+
+  async run(): Promise<AgentRunResult> {
+    return { sessionId: this.id, finalText: "", timeline: [] };
+  }
+
+  async startTurn(prompt: string | unknown[]): Promise<{ turnId: string }> {
+    if (this.activeTurnId) throw new Error("Conversation already has an active request");
+    this.prompts.push(typeof prompt === "string" ? prompt : JSON.stringify(prompt));
+    this.activeTurnId = `turn-${this.prompts.length}`;
+    return { turnId: this.activeTurnId };
+  }
+
+  complete(): void {
+    const turnId = this.activeTurnId;
+    if (!turnId) throw new Error("No active turn");
+    this.activeTurnId = null;
+    this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+  }
+
+  fail(error = "transient provider failure"): void {
+    const turnId = this.activeTurnId;
+    if (!turnId) throw new Error("No active turn");
+    this.activeTurnId = null;
+    this.pushEvent({ type: "turn_failed", provider: this.provider, turnId, error });
+  }
+
+  subscribe(callback: (event: AgentStreamEvent) => void): () => void {
+    this.subscribers.add(callback);
+    return () => this.subscribers.delete(callback);
+  }
+
+  private pushEvent(event: AgentStreamEvent): void {
+    for (const callback of this.subscribers) callback(event);
+  }
+
+  async *streamHistory(): AsyncGenerator<AgentStreamEvent> {}
+  async getRuntimeInfo() {
+    return { provider: this.provider, sessionId: this.id, model: null, modeId: null };
+  }
+  async getAvailableModes() {
+    return [];
+  }
+  async getCurrentMode() {
+    return null;
+  }
+  async setMode(): Promise<void> {}
+  getPendingPermissions() {
+    return [];
+  }
+  async respondToPermission(): Promise<void> {}
+  describePersistence() {
+    return { provider: this.provider, sessionId: this.id };
+  }
+  async interrupt(): Promise<void> {
+    this.interruptCount += 1;
+  }
+  async close(): Promise<void> {}
+}
+
+class QueuedPromptAgentClient implements AgentClient {
+  readonly provider = "claude-acc";
+  readonly capabilities = RUN_START_TEST_CAPABILITIES;
+  readonly session = new QueuedPromptAgentSession();
+  async isAvailable(): Promise<boolean> {
+    return true;
+  }
+  async createSession(): Promise<AgentSession> {
+    return this.session;
+  }
+  async resumeSession(): Promise<AgentSession> {
+    return this.session;
+  }
+  async fetchCatalog() {
+    return { models: [], modes: [] };
+  }
+}
+
+test("serializes all queue-mode prompts through one durable FIFO", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-durable-prompt-queue-"));
+  const logger = createTestLogger();
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new QueuedPromptAgentClient();
+  const agentManager = new AgentManager({
+    clients: { "claude-acc": client },
+    registry: storage,
+    logger,
+  });
+  const snapshot = await agentManager.createAgent(
+    { provider: "claude-acc", cwd: workdir },
+    undefined,
+    { workspaceId: undefined },
+  );
+
+  try {
+    await expect(
+      sendPromptToAgent({
+        agentManager,
+        agentStorage: storage,
+        agentId: snapshot.id,
+        prompt: "first request",
+        messageId: "message-1",
+        activeTurnBehavior: "queue",
+        logger,
+      }),
+    ).resolves.toEqual({ disposition: "queued" });
+    await vi.waitFor(() => expect(client.session.prompts).toEqual(["first request"]));
+
+    await expect(
+      sendPromptToAgent({
+        agentManager,
+        agentStorage: storage,
+        agentId: snapshot.id,
+        prompt: "second request",
+        messageId: "message-2",
+        activeTurnBehavior: "queue",
+        logger,
+      }),
+    ).resolves.toEqual({ disposition: "queued" });
+    expect(client.session.prompts).toEqual(["first request"]);
+    expect(client.session.interruptCount).toBe(0);
+    await expect(storage.listPendingPrompts(snapshot.id)).resolves.toMatchObject([
+      { id: "message-1", prompt: "first request", state: "dispatching" },
+      { id: "message-2", prompt: "second request", state: "queued" },
+    ]);
+
+    client.session.complete();
+    await vi.waitFor(() =>
+      expect(client.session.prompts).toEqual(["first request", "second request"]),
+    );
+    expect(client.session.interruptCount).toBe(0);
+    client.session.complete();
+    await vi.waitFor(async () => {
+      await expect(storage.listPendingPrompts(snapshot.id)).resolves.toEqual([]);
+    });
+  } finally {
+    await agentManager.closeAgent(snapshot.id).catch(() => undefined);
+    await agentManager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("a repeated client message id is not enqueued after provider acceptance", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-durable-prompt-dedupe-"));
+  const logger = createTestLogger();
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new QueuedPromptAgentClient();
+  const agentManager = new AgentManager({
+    clients: { "claude-acc": client },
+    registry: storage,
+    logger,
+  });
+  const snapshot = await agentManager.createAgent(
+    { provider: "claude-acc", cwd: workdir },
+    undefined,
+    { workspaceId: undefined },
+  );
+
+  try {
+    const send = (prompt: string) =>
+      sendPromptToAgent({
+        agentManager,
+        agentStorage: storage,
+        agentId: snapshot.id,
+        prompt,
+        messageId: "stable-message-id",
+        activeTurnBehavior: "queue",
+        logger,
+      });
+    await send("run this once");
+    await vi.waitFor(() => expect(client.session.prompts).toEqual(["run this once"]));
+    await expect(send("browser retried this request")).resolves.toEqual({ disposition: "queued" });
+    expect(client.session.prompts).toEqual(["run this once"]);
+    await expect(storage.listPendingPrompts(snapshot.id)).resolves.toHaveLength(1);
+
+    client.session.complete();
+    await vi.waitFor(async () => {
+      await expect(storage.listPendingPrompts(snapshot.id)).resolves.toEqual([]);
+    });
+    await send("browser retried after completion");
+    expect(client.session.prompts).toEqual(["run this once"]);
+  } finally {
+    await agentManager.closeAgent(snapshot.id).catch(() => undefined);
+    await agentManager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("a terminal failure advances the durable prompt FIFO instead of wedging it", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-durable-prompt-failure-"));
+  const logger = createTestLogger();
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new QueuedPromptAgentClient();
+  const agentManager = new AgentManager({
+    clients: { "claude-acc": client },
+    registry: storage,
+    logger,
+  });
+  const snapshot = await agentManager.createAgent(
+    { provider: "claude-acc", cwd: workdir },
+    undefined,
+    { workspaceId: undefined },
+  );
+  const send = (prompt: string, messageId: string) =>
+    sendPromptToAgent({
+      agentManager,
+      agentStorage: storage,
+      agentId: snapshot.id,
+      prompt,
+      messageId,
+      activeTurnBehavior: "queue",
+      logger,
+    });
+
+  try {
+    await send("first request", "message-1");
+    await vi.waitFor(() => expect(client.session.prompts).toEqual(["first request"]));
+    await send("second request", "message-2");
+    await send("third request", "message-3");
+
+    client.session.fail();
+    await vi.waitFor(() =>
+      expect(client.session.prompts).toEqual(["first request", "second request"]),
+    );
+    client.session.fail();
+    await vi.waitFor(() =>
+      expect(client.session.prompts).toEqual(["first request", "second request", "third request"]),
+    );
+    client.session.complete();
+    await vi.waitFor(async () => {
+      await expect(storage.listPendingPrompts(snapshot.id)).resolves.toEqual([]);
+    });
+  } finally {
+    await agentManager.closeAgent(snapshot.id).catch(() => undefined);
+    await agentManager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("daemon recovery reclaims an interrupted dispatch without blocking startup", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-durable-prompt-restart-"));
+  const logger = createTestLogger();
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new QueuedPromptAgentClient();
+  const agentManager = new AgentManager({
+    clients: { "claude-acc": client },
+    registry: storage,
+    logger,
+  });
+  const snapshot = await agentManager.createAgent(
+    { provider: "claude-acc", cwd: workdir },
+    undefined,
+    { workspaceId: undefined },
+  );
+
+  try {
+    await storage.enqueuePendingPrompt(snapshot.id, {
+      id: "stable-recovery-message",
+      prompt: "resume this after daemon restart",
+    });
+    await storage.claimPendingPrompt(snapshot.id);
+
+    await resumePendingAgentPrompts({ agentManager, agentStorage: storage, logger });
+    await vi.waitFor(() =>
+      expect(client.session.prompts).toEqual(["resume this after daemon restart"]),
+    );
+    await expect(storage.listPendingPrompts(snapshot.id)).resolves.toMatchObject([
+      { id: "stable-recovery-message", state: "dispatching", attemptCount: 2 },
+    ]);
+
+    client.session.complete();
+    await vi.waitFor(async () => {
+      await expect(storage.listPendingPrompts(snapshot.id)).resolves.toEqual([]);
+    });
+  } finally {
+    await agentManager.closeAgent(snapshot.id).catch(() => undefined);
+    await agentManager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("daemon recovery retires a dispatch already committed to the durable timeline", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-durable-prompt-committed-"));
+  const logger = createTestLogger();
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new QueuedPromptAgentClient();
+  const agentManager = new AgentManager({
+    clients: { "claude-acc": client },
+    registry: storage,
+    logger,
+  });
+  const snapshot = await agentManager.createAgent(
+    { provider: "claude-acc", cwd: workdir },
+    undefined,
+    { workspaceId: undefined },
+  );
+
+  try {
+    await storage.enqueuePendingPrompt(snapshot.id, {
+      id: "accepted-before-restart",
+      prompt: "do not replay me",
+    });
+    await storage.claimPendingPrompt(snapshot.id);
+    await agentManager.appendTimelineItem(snapshot.id, {
+      type: "user_message",
+      text: "do not replay me",
+      clientMessageId: "accepted-before-restart",
+    });
+
+    await resumePendingAgentPrompts({ agentManager, agentStorage: storage, logger });
+    await expect(storage.listPendingPrompts(snapshot.id)).resolves.toEqual([]);
+    expect(client.session.prompts).toEqual([]);
+  } finally {
+    await agentManager.closeAgent(snapshot.id).catch(() => undefined);
+    await agentManager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
 
 /**
  * Real AgentManager driving a real agent, so the run-start wait exercises the production

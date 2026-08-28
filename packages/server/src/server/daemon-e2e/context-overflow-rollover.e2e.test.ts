@@ -99,33 +99,48 @@ class ContextOverflowSession implements AgentSession {
             text: "The implementation review is complete. The test matrix remains.",
           },
         });
-        const overflow: AgentStreamEvent = {
-          type: "turn_failed",
-          provider: this.provider,
-          turnId,
-          error: "Prompt is too long",
-          failureKind: "context_overflow",
-        };
-        this.emit(overflow);
-        this.emit(overflow);
+        void this.client.allowPredecessorOverflow.promise.then(() => {
+          const overflow: AgentStreamEvent = {
+            type: "turn_failed",
+            provider: this.provider,
+            turnId,
+            error: "Prompt is too long",
+            failureKind: "context_overflow",
+          };
+          this.emit(overflow);
+          this.emit(overflow);
+          return undefined;
+        });
       }, 0);
       return { turnId };
     }
 
-    this.client.successorTurnStarted.release();
+    const isHandoff = this.turnOrdinal === 1;
+    if (isHandoff) this.client.successorTurnStarted.release();
     setTimeout(() => {
       this.emit({ type: "turn_started", provider: this.provider, turnId });
+      if (!isHandoff) {
+        this.emit({
+          type: "timeline",
+          provider: this.provider,
+          turnId,
+          item: { type: "assistant_message", text: "The queued follow-up completed cleanly." },
+        });
+        this.emit({ type: "turn_completed", provider: this.provider, turnId });
+      }
     }, 0);
-    void this.client.allowSuccessorCompletion.promise.then(() => {
-      this.emit({
-        type: "timeline",
-        provider: this.provider,
-        turnId,
-        item: { type: "assistant_message", text: "The rollover review completed cleanly." },
+    if (isHandoff) {
+      void this.client.allowSuccessorCompletion.promise.then(() => {
+        this.emit({
+          type: "timeline",
+          provider: this.provider,
+          turnId,
+          item: { type: "assistant_message", text: "The rollover review completed cleanly." },
+        });
+        this.emit({ type: "turn_completed", provider: this.provider, turnId });
+        return undefined;
       });
-      this.emit({ type: "turn_completed", provider: this.provider, turnId });
-      return undefined;
-    });
+    }
     return { turnId };
   }
 
@@ -184,6 +199,7 @@ class ContextOverflowClient implements AgentClient {
   readonly startedPrompts: Array<{ nativeSessionId: string; text: string }> = [];
   readonly createdSessionIds: string[] = [];
   readonly resumedSessionIds: string[] = [];
+  readonly allowPredecessorOverflow = createDeferredGate();
   readonly successorTurnStarted = createDeferredGate();
   readonly allowSuccessorCompletion = createDeferredGate();
 
@@ -233,6 +249,13 @@ test("DaemonClient observes one clean fresh-session rollover after context overf
     });
 
     await client.sendMessage(predecessor.id, oldTranscriptMarker);
+    await client.waitForAgentUpsert(predecessor.id, (agent) => agent.status === "running", 5_000);
+    await client.sendMessage(
+      predecessor.id,
+      "After rollover, verify the queued follow-up also runs.",
+    );
+    expect(provider.startedPrompts).toHaveLength(1);
+    provider.allowPredecessorOverflow.release();
     await provider.successorTurnStarted.promise;
 
     let successorId: string | undefined;
@@ -298,10 +321,17 @@ test("DaemonClient observes one clean fresh-session rollover after context overf
       text: "The rollover review completed cleanly.",
     });
 
+    await vi.waitFor(() => expect(provider.startedPrompts).toHaveLength(3));
+    expect(provider.startedPrompts[2]).toEqual({
+      nativeSessionId: "native-context-overflow-successor-1",
+      text: "After rollover, verify the queued follow-up also runs.",
+    });
+
     await new Promise((resolve) => setTimeout(resolve, 25));
     expect(provider.createdSessionIds).toHaveLength(2);
-    expect(provider.startedPrompts).toHaveLength(2);
+    expect(provider.startedPrompts).toHaveLength(3);
   } finally {
+    provider.allowPredecessorOverflow.release();
     provider.allowSuccessorCompletion.release();
     await client.close();
     await daemon.close();

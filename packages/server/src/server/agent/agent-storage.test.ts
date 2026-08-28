@@ -195,6 +195,64 @@ describe("AgentStorage", () => {
     expect(persisted.config?.providerOptions).toEqual({ allowedTools: ["Read"] });
   });
 
+  test("persists and atomically claims queued prompts across storage reloads", async () => {
+    await storage.applySnapshot(createManagedAgent({ id: "agent-queue" }));
+
+    await expect(
+      storage.enqueuePendingPrompt("agent-queue", { id: "message-1", prompt: "second request" }),
+    ).resolves.toEqual({ enqueued: true, position: 1 });
+    await expect(
+      storage.enqueuePendingPrompt("agent-queue", { id: "message-1", prompt: "duplicate" }),
+    ).resolves.toEqual({ enqueued: false, position: 1 });
+
+    const reloaded = new AgentStorage(storagePath, logger);
+    await expect(reloaded.listPendingPrompts("agent-queue")).resolves.toMatchObject([
+      { id: "message-1", prompt: "second request", state: "queued", attemptCount: 0 },
+    ]);
+    await expect(reloaded.claimPendingPrompt("agent-queue")).resolves.toMatchObject({
+      id: "message-1",
+      state: "dispatching",
+      attemptCount: 1,
+    });
+    await expect(reloaded.claimPendingPrompt("agent-queue")).resolves.toBeNull();
+
+    await reloaded.releasePendingPrompt("agent-queue", "message-1");
+    await expect(reloaded.claimPendingPrompt("agent-queue")).resolves.toMatchObject({
+      id: "message-1",
+      state: "dispatching",
+      attemptCount: 2,
+    });
+    await reloaded.completePendingPrompt("agent-queue", "message-1");
+    await expect(reloaded.listPendingPrompts("agent-queue")).resolves.toEqual([]);
+  });
+
+  test("moves queued and interrupted dispatches to a context-overflow successor", async () => {
+    await storage.applySnapshot(createManagedAgent({ id: "agent-overflowed" }));
+    await storage.applySnapshot(createManagedAgent({ id: "agent-successor" }));
+    await storage.enqueuePendingPrompt("agent-overflowed", {
+      id: "message-dispatching",
+      prompt: "continue the first queued request",
+    });
+    await storage.claimPendingPrompt("agent-overflowed");
+    await storage.enqueuePendingPrompt("agent-overflowed", {
+      id: "message-queued",
+      prompt: "then run the next request",
+    });
+    await storage.enqueuePendingPrompt("agent-successor", {
+      id: "message-after-redirect",
+      prompt: "a message submitted after the family pointer moved",
+    });
+
+    await storage.transferPendingPrompts("agent-overflowed", "agent-successor");
+
+    await expect(storage.listPendingPrompts("agent-overflowed")).resolves.toEqual([]);
+    await expect(storage.listPendingPrompts("agent-successor")).resolves.toMatchObject([
+      { id: "message-dispatching", state: "queued", attemptCount: 1 },
+      { id: "message-queued", state: "queued", attemptCount: 0 },
+      { id: "message-after-redirect", state: "queued", attemptCount: 0 },
+    ]);
+  });
+
   test("applySnapshot stores and reloads featureValues when present", async () => {
     await storage.applySnapshot(
       createManagedAgent({

@@ -759,6 +759,7 @@ export class AgentManager {
   private readonly inFlightAgentCloses = new Map<string, Promise<void>>();
   private readonly lifecycleMutationTails = new Map<string, Promise<void>>();
   private readonly contextOverflowRollovers = new Map<string, Promise<string | null>>();
+  private readonly pendingPromptDrainTasks = new Map<string, Promise<void>>();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private readonly mcpAuthToken: string | null;
@@ -940,6 +941,88 @@ export class AgentManager {
       Boolean(agent.activeForegroundTurnId) ||
       this.runs.hasRun(agentId)
     );
+  }
+
+  hasSubmittedPrompt(agentId: string, clientMessageId: string): boolean {
+    return Boolean(this.timelineStore.getSubmittedUserMessage(agentId, clientMessageId));
+  }
+
+  /**
+   * Drain the durable prompt FIFO for one agent. AgentManager owns this loop so
+   * family rollover, daemon recovery, and live WebSocket sends all share the
+   * same single-writer boundary.
+   */
+  async drainStoredPendingPrompts(agentId: string): Promise<void> {
+    const existing = this.pendingPromptDrainTasks.get(agentId);
+    if (existing) {
+      return await existing;
+    }
+    const drain = this.consumeStoredPendingPromptQueue(agentId);
+    this.pendingPromptDrainTasks.set(agentId, drain);
+    try {
+      await drain;
+    } finally {
+      if (this.pendingPromptDrainTasks.get(agentId) === drain) {
+        this.pendingPromptDrainTasks.delete(agentId);
+      }
+    }
+  }
+
+  private async consumeStoredPendingPromptQueue(agentId: string): Promise<void> {
+    const registry = this.requireRegistry();
+    while (!this.hasInFlightRun(agentId)) {
+      const pending = await registry.claimPendingPrompt(agentId);
+      if (!pending) return;
+
+      let started = false;
+      let terminal: "completed" | "failed" | "canceled" | null = null;
+      let failureKind: Extract<AgentStreamEvent, { type: "turn_failed" }>["failureKind"];
+      try {
+        for await (const event of this.streamAgent(agentId, pending.prompt, {
+          clientMessageId: pending.id,
+        })) {
+          if (event.type === "turn_started") started = true;
+          if (event.type === "turn_completed") terminal = "completed";
+          if (event.type === "turn_canceled") terminal = "canceled";
+          if (event.type === "turn_failed") {
+            terminal = "failed";
+            failureKind = event.failureKind;
+          }
+        }
+      } catch (error) {
+        if (!started) {
+          await registry.releasePendingPrompt(agentId, pending.id);
+        } else {
+          await registry.completePendingPrompt(agentId, pending.id);
+        }
+        this.logger.error(
+          { err: error, agentId, messageId: pending.id, started },
+          "Durable queued prompt failed to settle",
+        );
+        if (!started) return;
+        continue;
+      }
+
+      if (!started) {
+        await registry.releasePendingPrompt(agentId, pending.id);
+        return;
+      }
+      await registry.completePendingPrompt(agentId, pending.id);
+      if (terminal === null) {
+        this.logger.error(
+          { agentId, messageId: pending.id },
+          "Durable queued prompt ended without a terminal event",
+        );
+        continue;
+      }
+      if (failureKind === "context_overflow") {
+        // The rollover task transfers the remaining FIFO to the fresh family
+        // member and that member drains it after its bounded handoff settles.
+        return;
+      }
+      // A failed or canceled prompt is terminal too. Its error remains in the
+      // timeline; it must not wedge unrelated messages behind it forever.
+    }
   }
 
   subscribe(callback: AgentSubscriber, options?: SubscribeOptions): () => void {
@@ -1289,6 +1372,7 @@ export class AgentManager {
         ),
       });
     }
+    await this.requireRegistry().transferPendingPrompts(predecessorId, successorId);
     await this.archiveContextOverflowPredecessor(predecessorId);
   }
 
@@ -1308,8 +1392,13 @@ export class AgentManager {
 
   private async consumeContextOverflowContinuation(agentId: string, prompt: string): Promise<void> {
     try {
-      for await (const _event of this.streamAgent(agentId, prompt)) {
+      let completed = false;
+      for await (const event of this.streamAgent(agentId, prompt)) {
         // Consuming the stream owns the foreground run; events are persisted by AgentManager.
+        if (event.type === "turn_completed") completed = true;
+      }
+      if (completed) {
+        await this.drainStoredPendingPrompts(agentId);
       }
     } catch (error) {
       this.logger.error({ err: error, agentId }, "Fresh context overflow continuation failed");
@@ -2455,6 +2544,7 @@ export class AgentManager {
     const streamForwarder = async function* streamForwarder(this: AgentManager) {
       let turnId: string;
       let turnStream: ReturnType<AgentRunState["createTurnStream"]> | null = null;
+      let contextOverflow = false;
       turnId = await this.startPendingForegroundTurn({
         agent,
         agentId,
@@ -2531,6 +2621,9 @@ export class AgentManager {
         };
         yield acceptedTurnStartedEvent;
         for await (const event of turnStream.events(isTurnTerminalEvent)) {
+          if (event.type === "turn_failed" && event.failureKind === "context_overflow") {
+            contextOverflow = true;
+          }
           yield event;
         }
       } finally {
@@ -2540,6 +2633,17 @@ export class AgentManager {
         this.runs.settleForegroundRun(agentId, pendingRun.token);
         if (!agent.activeForegroundTurnId) {
           await this.refreshRuntimeInfo(agent);
+        }
+        if (!contextOverflow) {
+          // Do not await: a queue-owned run is itself holding the drain task.
+          // Its loop advances after this generator settles; direct runs need a
+          // fresh drain task so messages queued behind them cannot be stranded.
+          void this.drainStoredPendingPrompts(agentId).catch((error) => {
+            this.logger.error(
+              { err: error, agentId },
+              "Failed to drain prompts after foreground turn settled",
+            );
+          });
         }
       }
     }.call(this);

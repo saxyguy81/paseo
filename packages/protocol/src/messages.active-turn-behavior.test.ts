@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 import { z } from "zod";
 
 describe("send_agent_message_request active-turn behavior", () => {
-  it("accepts an optional steer intent while retaining interrupt compatibility", () => {
+  it("accepts steer and durable queue intents while retaining interrupt compatibility", () => {
     expect(
       SendAgentMessageRequestSchema.parse({
         type: "send_agent_message_request",
@@ -17,6 +17,16 @@ describe("send_agent_message_request active-turn behavior", () => {
         activeTurnBehavior: "steer",
       }).activeTurnBehavior,
     ).toBe("steer");
+
+    expect(
+      SendAgentMessageRequestSchema.parse({
+        type: "send_agent_message_request",
+        requestId: "request-queue",
+        agentId: "agent-1",
+        text: "Run this after the current turn",
+        activeTurnBehavior: "queue",
+      }).activeTurnBehavior,
+    ).toBe("queue");
 
     expect(
       SendAgentMessageRequestSchema.parse({
