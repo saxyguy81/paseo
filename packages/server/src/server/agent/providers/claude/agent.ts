@@ -4027,6 +4027,11 @@ class ClaudeAgentSession implements AgentSession {
       return this.preparePostWorkApiRecovery(message, sourceQuery, turnId, errorMessage);
     }
 
+    // This message is now owned by the bounded retry path. Clear the rollover candidate so a
+    // successful retry cannot make a later, unrelated terminal failure look like a repeated 503.
+    // If the continuation error recurs, the recovered query will capture it again; the exhausted
+    // retry budget then leaves that new marker in place for fresh-session rollover.
+    this.clearCapturedConversationRolloverError(errorMessage);
     this.foregroundApiRecoveryAttempts += 1;
     this.logger.warn(
       { error: errorMessage, attempt: this.foregroundApiRecoveryAttempts },
@@ -4094,6 +4099,7 @@ class ClaudeAgentSession implements AgentSession {
       query: sourceQuery,
       turnId,
     };
+    this.clearCapturedConversationRolloverError(errorMessage);
     this.logger.warn(
       { error: errorMessage, attempt: this.foregroundApiRecoveryAttempts },
       "Preparing one-shot Claude continuation after a retryable post-work API failure",
@@ -4175,6 +4181,12 @@ class ClaudeAgentSession implements AgentSession {
     const error = readClaudeContextOverflowError(message) ?? readClaudeUnresolvedTurnError(message);
     if (error) {
       this.pendingConversationRolloverError = error;
+    }
+  }
+
+  private clearCapturedConversationRolloverError(errorMessage: string): void {
+    if (this.pendingConversationRolloverError === errorMessage) {
+      this.pendingConversationRolloverError = null;
     }
   }
 

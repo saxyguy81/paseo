@@ -60,4 +60,18 @@ describe("readTerminalConversationRolloverFailure", () => {
       text: "API Error: 409 Conversation has an unresolved prior request",
     });
   });
+
+  test("classifies repeated continuation-matching unavailability as an unresolved conversation", () => {
+    expect(
+      readTerminalConversationRolloverFailure(
+        rows({
+          type: "assistant_message",
+          text: "API Error: 503 Continuation matching is temporarily unavailable. This is a server-side issue, usually temporary.",
+        }),
+      ),
+    ).toEqual({
+      kind: "conversation_unresolved",
+      text: "API Error: 503 Continuation matching is temporarily unavailable. This is a server-side issue, usually temporary.",
+    });
+  });
 });

@@ -251,6 +251,11 @@ test("recognizes only retryable synthetic Claude API failures", () => {
       errors: ["API Error: 409 Conversation has an unresolved prior request"],
     }),
   ).toBe("API Error: 409 Conversation has an unresolved prior request");
+  expect(
+    readClaudeUnresolvedTurnError(
+      apiError("API Error: 503 Continuation matching is temporarily unavailable"),
+    ),
+  ).toBe("API Error: 503 Continuation matching is temporarily unavailable");
   expect(readRetryableClaudeApiError(apiError("API Error: 429 Rate limit exceeded"))).toBeNull();
   expect(readRetryableClaudeApiError(apiError("API Error: prompt too long"))).toBeNull();
   expect(
@@ -688,6 +693,202 @@ test.each([
     expect(JSON.stringify(recoveryPrompts[0])).toContain(
       "Continue the latest unfinished user instruction",
     );
+  } finally {
+    await session.close();
+    vi.useRealTimers();
+  }
+});
+
+test("retries continuation matching once, then requires a fresh native session", async () => {
+  vi.useFakeTimers();
+  const errorText = "API Error: 503 Continuation matching is temporarily unavailable";
+  let queryNumber = 0;
+
+  sdkQueryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    queryNumber += 1;
+    if (queryNumber === 1) {
+      let step = 0;
+      return createBaseQueryMock(
+        vi.fn(async () => {
+          if (step === 0) {
+            step += 1;
+            return {
+              done: false,
+              value: {
+                type: "system",
+                subtype: "init",
+                session_id: "continuation-matching-session",
+                permissionMode: "default",
+                model: "opus",
+              },
+            };
+          }
+          if (step === 1) {
+            step += 1;
+            return {
+              done: false,
+              value: {
+                type: "assistant",
+                isApiErrorMessage: true,
+                message: { role: "assistant", content: [{ type: "text", text: errorText }] },
+              },
+            };
+          }
+          return { done: true, value: undefined };
+        }),
+      );
+    }
+
+    const iterator = prompt[Symbol.asyncIterator]();
+    let step = 0;
+    return createBaseQueryMock(
+      vi.fn(async () => {
+        if (step === 0) {
+          step += 1;
+          await iterator.next();
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              isApiErrorMessage: true,
+              message: { role: "assistant", content: [{ type: "text", text: errorText }] },
+            },
+          };
+        }
+        if (step === 1) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "result",
+              subtype: "error_during_execution",
+              usage: buildUsage(),
+              errors: ["Claude run failed"],
+              total_cost_usd: 0,
+            },
+          };
+        }
+        return { done: true, value: undefined };
+      }),
+    );
+  });
+
+  const session = await createSession();
+  try {
+    const eventsPromise = collectUntilTerminal(streamSession(session, "continue the work"));
+    await vi.advanceTimersByTimeAsync(2_001);
+    const events = await eventsPromise;
+
+    expect(sdkQueryFactory).toHaveBeenCalledTimes(2);
+    expect(events.filter((event) => event.type === "turn_completed")).toHaveLength(0);
+    expect(events.filter((event) => event.type === "turn_failed")).toEqual([
+      expect.objectContaining({
+        type: "turn_failed",
+        error: errorText,
+        failureKind: "conversation_unresolved",
+      }),
+    ]);
+  } finally {
+    await session.close();
+    vi.useRealTimers();
+  }
+});
+
+test("does not reuse a recovered continuation error for a later unrelated failure", async () => {
+  vi.useFakeTimers();
+  const continuationError = "API Error: 503 Continuation matching is temporarily unavailable";
+  let queryNumber = 0;
+
+  sdkQueryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    queryNumber += 1;
+    if (queryNumber === 1) {
+      let step = 0;
+      return createBaseQueryMock(
+        vi.fn(async () => {
+          if (step === 0) {
+            step += 1;
+            return {
+              done: false,
+              value: {
+                type: "system",
+                subtype: "init",
+                session_id: "recovered-continuation-session",
+                permissionMode: "default",
+                model: "opus",
+              },
+            };
+          }
+          if (step === 1) {
+            step += 1;
+            return {
+              done: false,
+              value: {
+                type: "assistant",
+                isApiErrorMessage: true,
+                message: {
+                  role: "assistant",
+                  content: [{ type: "text", text: continuationError }],
+                },
+              },
+            };
+          }
+          return { done: true, value: undefined };
+        }),
+      );
+    }
+
+    const iterator = prompt[Symbol.asyncIterator]();
+    let step = 0;
+    return createBaseQueryMock(
+      vi.fn(async () => {
+        if (step === 0) {
+          step += 1;
+          await iterator.next();
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              message: { role: "assistant", content: "the retry recovered and did work" },
+            },
+          };
+        }
+        if (step === 1) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "result",
+              subtype: "error_during_execution",
+              usage: buildUsage(),
+              errors: ["unrelated terminal failure"],
+              total_cost_usd: 0,
+            },
+          };
+        }
+        return { done: true, value: undefined };
+      }),
+    );
+  });
+
+  const session = await createSession();
+  try {
+    const eventsPromise = collectUntilTerminal(streamSession(session, "continue the work"));
+    await vi.advanceTimersByTimeAsync(2_001);
+    const events = await eventsPromise;
+
+    expect(sdkQueryFactory).toHaveBeenCalledTimes(2);
+    expect(events.filter((event) => event.type === "turn_failed")).toEqual([
+      expect.objectContaining({
+        type: "turn_failed",
+        error: "unrelated terminal failure",
+      }),
+    ]);
+    expect(events.some((event) => event.type === "turn_completed")).toBe(false);
+    expect(
+      events.some(
+        (event) => event.type === "turn_failed" && event.failureKind === "conversation_unresolved",
+      ),
+    ).toBe(false);
   } finally {
     await session.close();
     vi.useRealTimers();
