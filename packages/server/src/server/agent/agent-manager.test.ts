@@ -8150,225 +8150,266 @@ test("turn_failed emits a system error assistant timeline message and keeps erro
   expect(systemErrors[0]?.text).toContain("invalid model id");
 });
 
-test("context overflow rolls into exactly one fresh family session without resuming or copying history", async () => {
-  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-context-overflow-"));
-  const storage = new AgentStorage(join(workdir, "agents"), logger);
-  const oldAgentId = "00000000-0000-4000-8000-000000000201";
-  const successorAgentId = "00000000-0000-4000-8000-000000000202";
-  const createdSessions: TestAgentSession[] = [];
-  const startedPrompts: AgentPromptInput[] = [];
+test.each([
+  {
+    name: "context overflow",
+    failureKind: "context_overflow" as const,
+    failureText: "Prompt is too long",
+  },
+  {
+    name: "unresolved prior turn",
+    failureKind: "conversation_unresolved" as const,
+    failureText: "API Error: 409 Conversation has an unresolved prior request",
+  },
+])(
+  "$name rolls into exactly one fresh family session without resuming or copying history",
+  async ({ failureKind, failureText }) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-manager-context-overflow-"));
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const oldAgentId = "00000000-0000-4000-8000-000000000201";
+    const successorAgentId = "00000000-0000-4000-8000-000000000202";
+    const createdSessions: TestAgentSession[] = [];
+    const startedPrompts: AgentPromptInput[] = [];
+    const queuedPrompt = "After recovery, run the remaining integration test once.";
 
-  class OverflowSession extends TestAgentSession {
-    constructor(
-      config: AgentSessionConfig,
-      private readonly nativeSessionId: string,
-      private readonly overflows: boolean,
-    ) {
-      super(config);
-    }
+    class OverflowSession extends TestAgentSession {
+      private lastTurnId = "continuation-turn";
 
-    override async startTurn(prompt: AgentPromptInput): Promise<{ turnId: string }> {
-      startedPrompts.push(prompt);
-      const turnId = this.overflows ? "overflow-turn" : "continuation-turn";
-      setTimeout(() => {
-        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
-        if (!this.overflows) {
+      constructor(
+        config: AgentSessionConfig,
+        private readonly nativeSessionId: string,
+        private readonly overflows: boolean,
+      ) {
+        super(config);
+      }
+
+      override async startTurn(prompt: AgentPromptInput): Promise<{ turnId: string }> {
+        startedPrompts.push(prompt);
+        const turnId = this.overflows
+          ? "overflow-turn"
+          : `continuation-turn-${startedPrompts.length}`;
+        this.lastTurnId = turnId;
+        setTimeout(() => {
+          this.pushEvent({
+            type: "turn_started",
+            provider: this.provider,
+            turnId,
+          });
+          if (!this.overflows) {
+            this.pushEvent({
+              type: "timeline",
+              provider: this.provider,
+              turnId,
+              item: {
+                type: "user_message",
+                text: typeof prompt === "string" ? prompt : "unexpected structured handoff",
+              },
+            });
+            if (prompt === queuedPrompt) {
+              this.pushEvent({
+                type: "turn_completed",
+                provider: this.provider,
+                turnId,
+              });
+            }
+            return;
+          }
           this.pushEvent({
             type: "timeline",
             provider: this.provider,
             turnId,
             item: {
               type: "user_message",
-              text: typeof prompt === "string" ? prompt : "unexpected structured handoff",
+              text: "Finish the MR review and report blockers.",
             },
           });
-          return;
-        }
-        this.pushEvent({
-          type: "timeline",
-          provider: this.provider,
-          turnId,
-          item: { type: "user_message", text: "Finish the MR review and report blockers." },
-        });
-        this.pushEvent({
-          type: "timeline",
-          provider: this.provider,
-          turnId,
-          item: { type: "assistant_message", text: "The diff is reviewed; tests remain." },
-        });
-        this.pushEvent({
-          type: "timeline",
-          provider: this.provider,
-          turnId,
-          item: {
-            type: "tool_call",
-            callId: "question-1",
-            name: "AskUserQuestion",
-            status: "completed",
-            detail: {
-              type: "unknown",
-              input: { questions: [{ question: "Run the full suite?" }] },
-              output: { answers: { "Run the full suite?": "Yes" } },
+          this.pushEvent({
+            type: "timeline",
+            provider: this.provider,
+            turnId,
+            item: {
+              type: "assistant_message",
+              text: "The diff is reviewed; tests remain.",
             },
-            error: null,
-          },
+          });
+          this.pushEvent({
+            type: "timeline",
+            provider: this.provider,
+            turnId,
+            item: {
+              type: "tool_call",
+              callId: "question-1",
+              name: "AskUserQuestion",
+              status: "completed",
+              detail: {
+                type: "unknown",
+                input: { questions: [{ question: "Run the full suite?" }] },
+                output: { answers: { "Run the full suite?": "Yes" } },
+              },
+              error: null,
+            },
+          });
+          this.pushEvent({
+            type: "turn_failed",
+            provider: this.provider,
+            turnId,
+            error: failureText,
+            failureKind,
+          });
+          // A repeated provider terminal must not allocate another continuation.
+          this.pushEvent({
+            type: "turn_failed",
+            provider: this.provider,
+            turnId,
+            error: failureText,
+            failureKind,
+          });
+        }, 0);
+        return { turnId };
+      }
+
+      complete(): void {
+        this.pushEvent({
+          type: "timeline",
+          provider: this.provider,
+          turnId: this.lastTurnId,
+          item: { type: "assistant_message", text: "Review complete." },
         });
         this.pushEvent({
-          type: "turn_failed",
+          type: "turn_completed",
           provider: this.provider,
-          turnId,
-          error: "Prompt is too long",
-          failureKind: "context_overflow",
+          turnId: this.lastTurnId,
         });
-        // A repeated provider terminal must not allocate another continuation.
-        this.pushEvent({
-          type: "turn_failed",
-          provider: this.provider,
-          turnId,
-          error: "Prompt is too long",
-          failureKind: "context_overflow",
-        });
-      }, 0);
-      return { turnId };
+      }
+
+      override describePersistence(): AgentPersistenceHandle {
+        return { provider: "codex", sessionId: this.nativeSessionId };
+      }
     }
 
-    complete(): void {
-      this.pushEvent({
-        type: "timeline",
-        provider: this.provider,
-        turnId: "continuation-turn",
-        item: { type: "assistant_message", text: "Review complete." },
-      });
-      this.pushEvent({
-        type: "turn_completed",
-        provider: this.provider,
-        turnId: "continuation-turn",
-      });
+    class OverflowClient extends TestAgentClient {
+      override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+        const index = createdSessions.length;
+        const session = new OverflowSession(
+          config,
+          index === 0 ? "old-full-native-session" : "fresh-native-session",
+          index === 0,
+        );
+        createdSessions.push(session);
+        return session;
+      }
     }
 
-    override describePersistence(): AgentPersistenceHandle {
-      return { provider: "codex", sessionId: this.nativeSessionId };
-    }
-  }
+    const client = new OverflowClient();
+    const ids = [oldAgentId, successorAgentId];
+    const manager = new AgentManager({
+      clients: { codex: client },
+      registry: storage,
+      logger,
+      idFactory: () => ids.shift() ?? randomUUID(),
+    });
 
-  class OverflowClient extends TestAgentClient {
-    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
-      const index = createdSessions.length;
-      const session = new OverflowSession(
-        config,
-        index === 0 ? "old-full-native-session" : "fresh-native-session",
-        index === 0,
-      );
-      createdSessions.push(session);
-      return session;
-    }
-  }
+    const old = await manager.createAgent(
+      { provider: "codex", cwd: workdir, model: "gpt-5.4" },
+      undefined,
+      { initialTitle: "Long review", workspaceId: "review-workspace" },
+    );
+    await manager.appendTimelineItem(old.id, {
+      type: "user_message",
+      text: `old-transcript-marker-${"x".repeat(2_000)}`,
+    });
+    await storage.enqueuePendingPrompt(old.id, {
+      id: "queued-after-rollover",
+      prompt: queuedPrompt,
+    });
 
-  const client = new OverflowClient();
-  const ids = [oldAgentId, successorAgentId];
-  const manager = new AgentManager({
-    clients: { codex: client },
-    registry: storage,
-    logger,
-    idFactory: () => ids.shift() ?? randomUUID(),
-  });
+    await expect(manager.runAgent(old.id, "ignored provider echo")).rejects.toThrow(failureText);
+    await vi.waitFor(() => expect(createdSessions).toHaveLength(2));
+    await vi.waitFor(async () => {
+      const records = await storage.list();
+      expect(records).toHaveLength(2);
+      expect(records.find((record) => record.id === oldAgentId)?.archivedAt).toBeTruthy();
+    });
 
-  const old = await manager.createAgent(
-    { provider: "codex", cwd: workdir, model: "gpt-5.4" },
-    undefined,
-    { initialTitle: "Long review", workspaceId: "review-workspace" },
-  );
-  await manager.appendTimelineItem(old.id, {
-    type: "user_message",
-    text: `old-transcript-marker-${"x".repeat(2_000)}`,
-  });
-
-  await expect(manager.runAgent(old.id, "ignored provider echo")).rejects.toThrow(
-    "Prompt is too long",
-  );
-  await vi.waitFor(() => expect(createdSessions).toHaveLength(2));
-  await vi.waitFor(async () => {
     const records = await storage.list();
-    expect(records).toHaveLength(2);
-    expect(records.find((record) => record.id === oldAgentId)?.archivedAt).toBeTruthy();
-  });
+    const predecessor = records.find((record) => record.id === oldAgentId)!;
+    const successor = records.find((record) => record.id === successorAgentId)!;
+    expect(successor.labels[CONVERSATION_FAMILY_PREDECESSOR_LABEL]).toBe(oldAgentId);
+    expect(successor.labels[CONVERSATION_FAMILY_ID_LABEL]).toBeTruthy();
+    expect(successor.labels[CONVERSATION_FAMILY_CURRENT_LABEL]).toBe(successorAgentId);
+    expect(successor.labels[CONVERSATION_FAMILY_NAME_LABEL]).toBe("Long review");
+    expect(successor.labels[CONVERSATION_FAMILY_POSITION_LABEL]).toBe("1");
+    expect(predecessor.persistence?.sessionId).toBe("old-full-native-session");
+    expect(successor.persistence?.sessionId).toBe("fresh-native-session");
+    expect(predecessor.labels[CONVERSATION_FAMILY_CURRENT_LABEL]).toBe(successorAgentId);
+    expect(predecessor.labels[CONVERSATION_FAMILY_POSITION_LABEL]).toBe("0");
+    expect(client.resumeOverrides).toHaveLength(0);
+    expect(startedPrompts).toHaveLength(2);
+    const continuationPrompt = startedPrompts[1];
+    expect(typeof continuationPrompt).toBe("string");
+    expect(continuationPrompt).toContain("Finish the MR review and report blockers.");
+    expect(continuationPrompt).toContain("Run the full suite?");
+    expect(continuationPrompt).toContain("Yes");
+    expect(continuationPrompt).not.toContain("old-transcript-marker");
+    expect(continuationPrompt).not.toContain("old-full-native-session");
+    expect(continuationPrompt).not.toContain(failureText);
+    expect(manager.getAgent(successorAgentId)?.lifecycle).toBe("running");
+    expect(manager.getTimeline(successorAgentId)).not.toContainEqual(
+      expect.objectContaining({ type: "user_message" }),
+    );
 
-  const records = await storage.list();
-  const predecessor = records.find((record) => record.id === oldAgentId)!;
-  const successor = records.find((record) => record.id === successorAgentId)!;
-  expect(successor.labels[CONVERSATION_FAMILY_PREDECESSOR_LABEL]).toBe(oldAgentId);
-  expect(successor.labels[CONVERSATION_FAMILY_ID_LABEL]).toBeTruthy();
-  expect(successor.labels[CONVERSATION_FAMILY_CURRENT_LABEL]).toBe(successorAgentId);
-  expect(successor.labels[CONVERSATION_FAMILY_NAME_LABEL]).toBe("Long review");
-  expect(successor.labels[CONVERSATION_FAMILY_POSITION_LABEL]).toBe("1");
-  expect(predecessor.persistence?.sessionId).toBe("old-full-native-session");
-  expect(successor.persistence?.sessionId).toBe("fresh-native-session");
-  expect(predecessor.labels[CONVERSATION_FAMILY_CURRENT_LABEL]).toBe(successorAgentId);
-  expect(predecessor.labels[CONVERSATION_FAMILY_POSITION_LABEL]).toBe("0");
-  expect(client.resumeOverrides).toHaveLength(0);
-  expect(startedPrompts).toHaveLength(2);
-  const continuationPrompt = startedPrompts[1];
-  expect(typeof continuationPrompt).toBe("string");
-  expect(continuationPrompt).toContain("Finish the MR review and report blockers.");
-  expect(continuationPrompt).toContain("Run the full suite?");
-  expect(continuationPrompt).toContain("Yes");
-  expect(continuationPrompt).not.toContain("old-transcript-marker");
-  expect(continuationPrompt).not.toContain("old-full-native-session");
-  expect(continuationPrompt).not.toContain("Prompt is too long");
-  expect(manager.getAgent(successorAgentId)?.lifecycle).toBe("running");
-  expect(manager.getTimeline(successorAgentId)).not.toContainEqual(
-    expect.objectContaining({ type: "user_message" }),
-  );
+    (createdSessions[1] as OverflowSession).complete();
+    await vi.waitFor(() => expect(startedPrompts).toHaveLength(3));
+    await vi.waitFor(() => expect(manager.getAgent(successorAgentId)?.lifecycle).toBe("idle"));
+    expect(startedPrompts[2]).toBe(queuedPrompt);
+    await expect(manager.ensureAgentFailureContinuation(oldAgentId, failureKind)).resolves.toBe(
+      successorAgentId,
+    );
+    expect(createdSessions).toHaveLength(2);
+    expect(client.resumeOverrides).toHaveLength(0);
 
-  (createdSessions[1] as OverflowSession).complete();
-  await vi.waitFor(() => expect(manager.getAgent(successorAgentId)?.lifecycle).toBe("idle"));
-  await expect(manager.ensureAgentContextOverflowContinuation(oldAgentId)).resolves.toBe(
-    successorAgentId,
-  );
-  expect(createdSessions).toHaveLength(2);
-  expect(client.resumeOverrides).toHaveLength(0);
+    // Simulate a daemon crash between durable successor creation and the final
+    // family-pointer/archive writes. A restart repairs the same family instead
+    // of creating or resuming another native session.
+    const storedPredecessor = (await storage.get(oldAgentId))!;
+    const storedSuccessor = (await storage.get(successorAgentId))!;
+    await storage.upsert({
+      ...storedPredecessor,
+      archivedAt: null,
+      labels: {
+        ...storedPredecessor.labels,
+        [CONVERSATION_FAMILY_CURRENT_LABEL]: oldAgentId,
+      },
+    });
+    await storage.upsert({
+      ...storedSuccessor,
+      labels: {
+        ...storedSuccessor.labels,
+        [CONVERSATION_FAMILY_CURRENT_LABEL]: oldAgentId,
+      },
+    });
 
-  // Simulate a daemon crash between durable successor creation and the final
-  // family-pointer/archive writes. A restart repairs the same family instead
-  // of creating or resuming another native session.
-  const storedPredecessor = (await storage.get(oldAgentId))!;
-  const storedSuccessor = (await storage.get(successorAgentId))!;
-  await storage.upsert({
-    ...storedPredecessor,
-    archivedAt: null,
-    labels: {
-      ...storedPredecessor.labels,
-      [CONVERSATION_FAMILY_CURRENT_LABEL]: oldAgentId,
-    },
-  });
-  await storage.upsert({
-    ...storedSuccessor,
-    labels: {
-      ...storedSuccessor.labels,
-      [CONVERSATION_FAMILY_CURRENT_LABEL]: oldAgentId,
-    },
-  });
-
-  const restartClient = new OverflowClient();
-  const restartedManager = new AgentManager({
-    clients: { codex: restartClient },
-    registry: new AgentStorage(join(workdir, "agents"), logger),
-    logger,
-  });
-  await expect(restartedManager.ensureAgentContextOverflowContinuation(oldAgentId)).resolves.toBe(
-    successorAgentId,
-  );
-  expect(restartClient.createdConfigs).toHaveLength(0);
-  expect(restartClient.resumeOverrides).toHaveLength(0);
-  const repairedStorage = new AgentStorage(join(workdir, "agents"), logger);
-  expect((await repairedStorage.get(oldAgentId))?.archivedAt).toBeTruthy();
-  expect((await repairedStorage.get(oldAgentId))?.labels[CONVERSATION_FAMILY_CURRENT_LABEL]).toBe(
-    successorAgentId,
-  );
-  expect(
-    (await repairedStorage.get(successorAgentId))?.labels[CONVERSATION_FAMILY_CURRENT_LABEL],
-  ).toBe(successorAgentId);
-});
+    const restartClient = new OverflowClient();
+    const restartedManager = new AgentManager({
+      clients: { codex: restartClient },
+      registry: new AgentStorage(join(workdir, "agents"), logger),
+      logger,
+    });
+    await expect(
+      restartedManager.ensureAgentFailureContinuation(oldAgentId, failureKind),
+    ).resolves.toBe(successorAgentId);
+    expect(restartClient.createdConfigs).toHaveLength(0);
+    expect(restartClient.resumeOverrides).toHaveLength(0);
+    const repairedStorage = new AgentStorage(join(workdir, "agents"), logger);
+    expect((await repairedStorage.get(oldAgentId))?.archivedAt).toBeTruthy();
+    expect((await repairedStorage.get(oldAgentId))?.labels[CONVERSATION_FAMILY_CURRENT_LABEL]).toBe(
+      successorAgentId,
+    );
+    expect(
+      (await repairedStorage.get(successorAgentId))?.labels[CONVERSATION_FAMILY_CURRENT_LABEL],
+    ).toBe(successorAgentId);
+  },
+);
 
 test("turn_failed surfaces provider code and diagnostic in system error message", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-turn-failed-detail-"));

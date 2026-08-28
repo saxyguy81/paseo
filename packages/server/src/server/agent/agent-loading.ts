@@ -8,8 +8,10 @@ import type { AgentProvider } from "./agent-sdk-types.js";
 import type { AgentManager, ManagedAgent } from "./agent-manager.js";
 import type { AgentStorage } from "./agent-storage.js";
 import {
+  type TerminalConversationRolloverFailure,
+  isConversationUnresolvedFailureText,
   isContextOverflowFailureText,
-  readTerminalContextOverflowFailure,
+  readTerminalConversationRolloverFailure,
 } from "./context-overflow.js";
 import {
   buildConfigOverrides,
@@ -44,28 +46,30 @@ export interface EnsureAgentLoadedDeps {
   logger: Logger;
 }
 
-export interface ContextOverflowReconciliationResult {
+export interface ConversationRolloverReconciliationResult {
   predecessorId: string;
   successorId: string;
 }
 
 /**
- * Recover context overflows that were recorded before the daemon exited.
+ * Recover native conversations that became unsafe to continue before daemon exit.
  * Loading the predecessor hydrates its native history so the fresh session
- * receives a bounded handoff rather than a copy of the exhausted transcript.
+ * receives a bounded handoff rather than a copy of the unusable transcript.
  */
-export async function reconcileStoredContextOverflowContinuations(deps: {
+export async function reconcileStoredConversationContinuations(deps: {
   agentManager: AgentManager;
   agentStorage: AgentStorage;
   logger: Logger;
-}): Promise<ContextOverflowReconciliationResult[]> {
+}): Promise<ConversationRolloverReconciliationResult[]> {
   const records = await deps.agentStorage.list();
   const recordById = new Map(records.map((record) => [record.id, record]));
   const candidates = records.filter((record) => {
     if (
       record.archivedAt ||
       record.internal ||
-      (record.lastStatus !== "error" && !isContextOverflowFailureText(record.lastError))
+      (record.lastStatus !== "error" &&
+        !isContextOverflowFailureText(record.lastError) &&
+        !isConversationUnresolvedFailureText(record.lastError))
     ) {
       return false;
     }
@@ -77,16 +81,28 @@ export async function reconcileStoredContextOverflowContinuations(deps: {
     return successor?.labels?.[CONVERSATION_FAMILY_PREDECESSOR_LABEL] === record.id;
   });
 
-  const reconciled: ContextOverflowReconciliationResult[] = [];
+  const reconciled: ConversationRolloverReconciliationResult[] = [];
   for (const predecessor of candidates) {
     try {
       await ensureAgentLoaded(predecessor.id, deps);
-      const hydratedFailureText = readTerminalContextOverflowFailure(
+      const hydratedFailure = readTerminalConversationRolloverFailure(
         await deps.agentManager.getTimelineRows(predecessor.id),
       );
-      const successorId = await deps.agentManager.ensureAgentContextOverflowContinuation(
+      let storedFailure: TerminalConversationRolloverFailure | null = null;
+      if (isContextOverflowFailureText(predecessor.lastError)) {
+        storedFailure = { kind: "context_overflow", text: predecessor.lastError };
+      } else if (isConversationUnresolvedFailureText(predecessor.lastError)) {
+        storedFailure = {
+          kind: "conversation_unresolved",
+          text: predecessor.lastError,
+        };
+      }
+      const failure = hydratedFailure ?? storedFailure;
+      if (!failure) continue;
+      const successorId = await deps.agentManager.ensureAgentFailureContinuation(
         predecessor.id,
-        hydratedFailureText ?? predecessor.lastError ?? undefined,
+        failure.kind,
+        failure.text,
       );
       if (successorId && successorId !== predecessor.id) {
         reconciled.push({ predecessorId: predecessor.id, successorId });
@@ -94,7 +110,7 @@ export async function reconcileStoredContextOverflowContinuations(deps: {
     } catch (error) {
       deps.logger.error(
         { err: error, agentId: predecessor.id },
-        "Failed to reconcile persisted context overflow",
+        "Failed to reconcile persisted conversation rollover",
       );
     }
   }

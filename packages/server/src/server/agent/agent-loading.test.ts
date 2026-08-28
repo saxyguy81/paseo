@@ -9,7 +9,7 @@ import { expect, test, vi } from "vitest";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { AgentManager } from "./agent-manager.js";
-import { ensureAgentLoaded, reconcileStoredContextOverflowContinuations } from "./agent-loading.js";
+import { ensureAgentLoaded, reconcileStoredConversationContinuations } from "./agent-loading.js";
 import { AgentStorage } from "./agent-storage.js";
 import type {
   AgentClient,
@@ -86,8 +86,11 @@ test("loads archived records for history and active records with the interactive
   }
 });
 
-test("reconciles a context overflow persisted across restart into one fresh continuation", async () => {
-  const root = await mkdtemp(path.join(tmpdir(), "agent-loading-context-overflow-restart-"));
+test.each([
+  ["context overflow", "Prompt is too long"],
+  ["unresolved prior turn", "API Error: 409 Conversation has an unresolved prior request"],
+])("reconciles %s persisted across restart into one fresh continuation", async (_, failureText) => {
+  const root = await mkdtemp(path.join(tmpdir(), "agent-loading-rollover-restart-"));
   const logger = createTestLogger();
   const storage = new AgentStorage(path.join(root, "agents"), logger);
   const baseClient = createTestAgentClients().codex;
@@ -160,7 +163,7 @@ test("reconciles a context overflow persisted across restart into one fresh cont
                   provider: "codex",
                   item: {
                     type: "assistant_message",
-                    text: "Prompt is too long",
+                    text: failureText,
                   },
                 };
               };
@@ -180,7 +183,7 @@ test("reconciles a context overflow persisted across restart into one fresh cont
       idFactory: () => successorId,
     });
 
-    const reconciled = await reconcileStoredContextOverflowContinuations({
+    const reconciled = await reconcileStoredConversationContinuations({
       agentManager: restartedManager,
       agentStorage: storage,
       logger,
@@ -200,7 +203,7 @@ test("reconciles a context overflow persisted across restart into one fresh cont
     );
 
     await expect(
-      reconcileStoredContextOverflowContinuations({
+      reconcileStoredConversationContinuations({
         agentManager: restartedManager,
         agentStorage: storage,
         logger,

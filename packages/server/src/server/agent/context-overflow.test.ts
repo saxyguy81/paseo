@@ -1,7 +1,10 @@
 import { describe, expect, test } from "vitest";
 
 import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
-import { readTerminalContextOverflowFailure } from "./context-overflow.js";
+import {
+  readTerminalContextOverflowFailure,
+  readTerminalConversationRolloverFailure,
+} from "./context-overflow.js";
 
 function rows(...items: AgentTimelineRow["item"][]): AgentTimelineRow[] {
   return items.map((item, index) => ({
@@ -40,5 +43,21 @@ describe("readTerminalContextOverflowFailure", () => {
         rows({ type: "error", message: "Maximum context window exceeded" }),
       ),
     ).toBe("Maximum context window exceeded");
+  });
+});
+
+describe("readTerminalConversationRolloverFailure", () => {
+  test("classifies a terminal unresolved prior turn", () => {
+    expect(
+      readTerminalConversationRolloverFailure(
+        rows({
+          type: "assistant_message",
+          text: "API Error: 409 Conversation has an unresolved prior request",
+        }),
+      ),
+    ).toEqual({
+      kind: "conversation_unresolved",
+      text: "API Error: 409 Conversation has an unresolved prior request",
+    });
   });
 });

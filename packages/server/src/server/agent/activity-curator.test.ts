@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  buildAgentContextOverflowContinuationPrompt,
+  buildAgentFreshSessionContinuationPrompt,
   buildAgentForkContextAttachment,
   curateAgentActivity,
 } from "./activity-curator.js";
@@ -278,7 +278,8 @@ second line'`,
         text: `old-transcript-marker-${index}-${"x".repeat(500)}`,
       }),
     );
-    const result = buildAgentContextOverflowContinuationPrompt({
+    const result = buildAgentFreshSessionContinuationPrompt({
+      failureKind: "context_overflow",
       maxChars: 1_500,
       rows: [
         ...oldRows,
@@ -305,7 +306,8 @@ second line'`,
   });
 
   it("preserves a recent AskUserQuestion answer in the bounded continuation", () => {
-    const result = buildAgentContextOverflowContinuationPrompt({
+    const result = buildAgentFreshSessionContinuationPrompt({
+      failureKind: "context_overflow",
       maxChars: 2_000,
       rows: [
         row(1, { type: "user_message", text: "Choose the implementation and continue." }),
@@ -332,9 +334,27 @@ second line'`,
     expect(result).not.toContain("Prompt is too long");
   });
 
+  it("explains unresolved delivery state without copying the failed error", () => {
+    const result = buildAgentFreshSessionContinuationPrompt({
+      failureKind: "conversation_unresolved",
+      rows: [
+        row(1, { type: "user_message", text: "Finish the review." }),
+        row(2, {
+          type: "assistant_message",
+          text: "API Error: 409 Conversation has an unresolved prior request",
+        }),
+      ],
+    });
+
+    expect(result).toContain("cannot be continued safely");
+    expect(result).toContain("Finish the review.");
+    expect(result).not.toContain("API Error: 409");
+  });
+
   it("refuses automatic continuation when the outstanding request cannot fit", () => {
     expect(
-      buildAgentContextOverflowContinuationPrompt({
+      buildAgentFreshSessionContinuationPrompt({
+        failureKind: "context_overflow",
         maxChars: 500,
         rows: [row(1, { type: "user_message", text: "x".repeat(1_000) })],
       }),

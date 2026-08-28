@@ -81,6 +81,17 @@ describe("canonical timeline turn ID compatibility", () => {
       failureKind: "context_overflow",
     });
   });
+
+  it("preserves the classified unresolved-conversation failure kind", () => {
+    const failure = AgentStreamEventPayloadSchema.parse({
+      type: "turn_failed",
+      provider: "claude",
+      error: "API Error: 409 Conversation has an unresolved prior request",
+      failureKind: "conversation_unresolved",
+    });
+
+    expect(failure.failureKind).toBe("conversation_unresolved");
+  });
 });
 
 describe("legacy daemon send request schema compatibility", () => {

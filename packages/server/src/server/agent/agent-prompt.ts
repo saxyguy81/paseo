@@ -7,6 +7,7 @@ import type {
   AgentRunOptions,
   AgentStreamEvent,
 } from "./agent-sdk-types.js";
+import { isConversationRolloverFailureKind } from "./context-overflow.js";
 import type { AgentManager, ManagedAgent } from "./agent-manager.js";
 import type { AgentStorage } from "./agent-storage.js";
 import { ensureAgentLoaded } from "./agent-loading.js";
@@ -427,6 +428,7 @@ export async function sendPromptToAgent(
         );
         return { disposition: "queued" as const };
       }
+
       const queued = await params.agentStorage.enqueuePendingPrompt(params.agentId, {
         id: promptId,
         prompt: params.prompt,
@@ -457,7 +459,7 @@ export async function sendPromptToAgent(
       clearPendingPermissions: params.clearPendingPermissions,
       runOptions,
       onIteratorSettled: async (settlement) => {
-        if (settlement.failureKind !== "context_overflow") {
+        if (!isConversationRolloverFailureKind(settlement.failureKind)) {
           await drainNextPendingPrompt({
             agentManager: params.agentManager,
             agentStorage: params.agentStorage,

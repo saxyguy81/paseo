@@ -45,7 +45,10 @@ import {
 import { parsePartialJsonObject } from "./partial-json.js";
 import { ClaudeSidechainTracker } from "./sidechain-tracker.js";
 import { ClaudeTaskState } from "./task-state.js";
-import { isContextOverflowFailureText } from "../../context-overflow.js";
+import {
+  isContextOverflowFailureText,
+  isConversationUnresolvedFailureText,
+} from "../../context-overflow.js";
 import {
   ClaudeTaskProtocolSource,
   type ClaudeHookObservationInput,
@@ -548,14 +551,8 @@ interface PendingPostWorkApiRecovery {
  * need a real configuration change and must remain visible to the user.
  */
 export function readRetryableClaudeApiError(message: unknown): string | null {
-  const record = toObjectRecord(message);
-  if (record?.type !== "assistant" || !isClaudeApiErrorMessage(record)) {
-    return null;
-  }
-
-  const assistantMessage = toObjectRecord(record.message);
-  const text = collectClaudeTextContentParts(assistantMessage?.content).join("\n").trim();
-  if (!/^API Error:/i.test(text)) {
+  const text = readClaudeApiErrorText(message);
+  if (!text) {
     return null;
   }
 
@@ -576,6 +573,35 @@ export function readRetryableClaudeApiError(message: unknown): string | null {
     return text;
   }
   return null;
+}
+
+function readClaudeApiErrorText(message: unknown): string | null {
+  const record = toObjectRecord(message);
+  if (record?.type !== "assistant" || !isClaudeApiErrorMessage(record)) {
+    return null;
+  }
+
+  const assistantMessage = toObjectRecord(record.message);
+  const text = collectClaudeTextContentParts(assistantMessage?.content).join("\n").trim();
+  if (!/^API Error:/i.test(text)) {
+    return null;
+  }
+  return text;
+}
+
+/** Returns a terminal ambiguity that requires a fresh native Claude session. */
+export function readClaudeUnresolvedTurnError(message: unknown): string | null {
+  if (typeof message === "string") {
+    const normalized = message.trim();
+    return isConversationUnresolvedFailureText(normalized) ? normalized : null;
+  }
+  const record = toObjectRecord(message);
+  const text =
+    readClaudeApiErrorText(message) ??
+    (record?.type === "result" && Array.isArray(record.errors)
+      ? record.errors.filter((entry): entry is string => typeof entry === "string").join("\n")
+      : null);
+  return isConversationUnresolvedFailureText(text) ? text : null;
 }
 
 /** Returns the provider error text only when Claude rejected the current context as oversized. */
@@ -2184,7 +2210,7 @@ class ClaudeAgentSession implements AgentSession {
   private foregroundHasProviderActivity = false;
   private foregroundApiRecoveryAttempts = 0;
   private pendingPostWorkApiRecovery: PendingPostWorkApiRecovery | null = null;
-  private pendingContextOverflowError: string | null = null;
+  private pendingConversationRolloverError: string | null = null;
   private readonly contextUsage: ClaudeContextUsageState;
   private userMessageIds: string[] = [];
   private readonly emittedUserMessageIds = new Set<string>();
@@ -2326,7 +2352,7 @@ class ClaudeAgentSession implements AgentSession {
     this.foregroundHasProviderActivity = false;
     this.foregroundApiRecoveryAttempts = 0;
     this.pendingPostWorkApiRecovery = null;
-    this.pendingContextOverflowError = null;
+    this.pendingConversationRolloverError = null;
     this.contextUsage.beginTurn();
     this.transitionTurnState("foreground", "foreground turn started");
     this.clearRecentStderr();
@@ -3567,13 +3593,17 @@ class ClaudeAgentSession implements AgentSession {
     const exitCodeMatch = normalized.match(/\bcode\s+(\d+)\b/i);
     const code = exitCodeMatch ? exitCodeMatch[1] : undefined;
     const diagnostic = this.getRecentStderrDiagnostic();
+    let failureKind: "context_overflow" | "conversation_unresolved" | undefined;
+    if (readClaudeContextOverflowError(normalized)) {
+      failureKind = "context_overflow";
+    } else if (isConversationUnresolvedFailureText(normalized)) {
+      failureKind = "conversation_unresolved";
+    }
     return {
       type: "turn_failed",
       provider: "claude",
       error: normalized,
-      ...(readClaudeContextOverflowError(normalized)
-        ? { failureKind: "context_overflow" as const }
-        : {}),
+      ...(failureKind ? { failureKind } : {}),
       ...(code ? { code } : {}),
       ...(diagnostic ? { diagnostic } : {}),
     };
@@ -3697,7 +3727,7 @@ class ClaudeAgentSession implements AgentSession {
     this.foregroundHasProviderActivity = false;
     this.foregroundApiRecoveryAttempts = 0;
     this.pendingPostWorkApiRecovery = null;
-    this.pendingContextOverflowError = null;
+    this.pendingConversationRolloverError = null;
     this.syncTurnState("foreground turn terminal");
   }
 
@@ -3718,14 +3748,14 @@ class ClaudeAgentSession implements AgentSession {
         this.foregroundHasProviderActivity = false;
         this.foregroundApiRecoveryAttempts = 0;
         this.pendingPostWorkApiRecovery = null;
-        this.pendingContextOverflowError = null;
+        this.pendingConversationRolloverError = null;
         this.syncTurnState("foreground turn terminal");
       } else if (this.autonomousTurn) {
         this.autonomousTurn = null;
         this.activeForegroundQuery = null;
         this.activeForegroundInput = null;
         this.activeTurnHasAssistantText = false;
-        this.pendingContextOverflowError = null;
+        this.pendingConversationRolloverError = null;
         this.syncTurnState("autonomous turn terminal");
       }
     }
@@ -3741,7 +3771,7 @@ class ClaudeAgentSession implements AgentSession {
     this.activeForegroundQuery = this.query;
     this.activeForegroundInput = this.input;
     this.activeTurnHasAssistantText = false;
-    this.pendingContextOverflowError = null;
+    this.pendingConversationRolloverError = null;
     this.contextUsage.beginTurn();
     this.notifySubscribers({ type: "turn_started", provider: "claude" });
     this.syncTurnState("autonomous turn started");
@@ -3756,12 +3786,14 @@ class ClaudeAgentSession implements AgentSession {
     this.activeForegroundQuery = null;
     this.activeForegroundInput = null;
     this.activeTurnHasAssistantText = false;
-    this.pendingContextOverflowError = null;
+    this.pendingConversationRolloverError = null;
     this.syncTurnState("autonomous turn completed");
   }
 
   private failActiveTurns(errorMessage: string): void {
-    const failure = this.buildTurnFailedEvent(this.pendingContextOverflowError ?? errorMessage);
+    const failure = this.buildTurnFailedEvent(
+      this.pendingConversationRolloverError ?? errorMessage,
+    );
     this.flushPendingToolCalls();
     if (this.activeForegroundTurnId) {
       this.finishForegroundTurn(failure);
@@ -4139,10 +4171,10 @@ class ClaudeAgentSession implements AgentSession {
     return true;
   }
 
-  private captureContextOverflowError(message: SDKMessage): void {
-    const error = readClaudeContextOverflowError(message);
+  private captureConversationRolloverError(message: SDKMessage): void {
+    const error = readClaudeContextOverflowError(message) ?? readClaudeUnresolvedTurnError(message);
     if (error) {
-      this.pendingContextOverflowError = error;
+      this.pendingConversationRolloverError = error;
     }
   }
 
@@ -4154,7 +4186,7 @@ class ClaudeAgentSession implements AgentSession {
     if (this.shouldSuppressStaleResult(message)) {
       return;
     }
-    this.captureContextOverflowError(message);
+    this.captureConversationRolloverError(message);
     if (this.continueForegroundAfterApiFailureResult(message, sourceQuery)) {
       return;
     }
@@ -4766,7 +4798,7 @@ class ClaudeAgentSession implements AgentSession {
       "errors" in message && Array.isArray(message.errors) && message.errors.length > 0
         ? message.errors.join("\n")
         : "Claude run failed";
-    const errorMessage = this.pendingContextOverflowError ?? resultErrorMessage;
+    const errorMessage = this.pendingConversationRolloverError ?? resultErrorMessage;
     events.push(...this.sidechainTracker.finishAll("failed"));
     events.push(this.buildTurnFailedEvent(errorMessage));
   }

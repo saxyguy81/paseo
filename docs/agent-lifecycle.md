@@ -46,6 +46,33 @@ older cancellation from settling a newer turn. If interruption is rejected or ti
 keeps its active foreground turn and replacement, reload, rewind, and Stop report the failure.
 Accepting new work after an ambiguous interruption would create a split-brain session.
 
+### Single-writer turns and fresh-session rollover
+
+Normal prompts enter one durable FIFO per Paseo agent. A provider may bypass that queue only when it
+explicitly supports steering an in-flight turn; Claude does not. This keeps one local writer attached
+to each native Claude session even when another browser, CLI, or recovered daemon submits a follow-up
+while the current turn is running.
+
+Not every upstream `409` means the same thing. A response saying the conversation currently has an
+active request is a live ownership conflict and may receive one bounded retry on the same native
+session. CCProxy's distinct `Conversation has an unresolved prior request` response means delivery of
+an earlier request is ambiguous. Replaying that session could duplicate side effects, so Paseo never
+retries it in place. Authentication, model-access, quota, and rate-limit failures also remain visible
+instead of being treated as ownership conflicts.
+
+An unresolved prior request and a context overflow both use the same durable rollover transition:
+
+1. Mark the old native session as the read-only predecessor.
+2. Create exactly one fresh native session in the same Paseo conversation family.
+3. Seed it with a bounded handoff containing the latest user request and recent decision state, not a
+   pasted transcript or a request to repeat completed work.
+4. Transfer the durable prompt FIFO to the successor and continue draining it there.
+
+The predecessor label is the transition's idempotency key. Repeated terminal events or a daemon crash
+adopt the already-created successor instead of creating another one. The UI stitches the read-only
+predecessor and writable successor into one searchable conversation history while keeping future
+prompts on the canonical successor.
+
 ## Relationships
 
 Agents can launch other agents via the agent-scoped `create_agent` MCP tool. Agent-scoped creation is always asynchronous and always stamps `paseo.parent-agent-id`, pointing back at the caller. Omit `workspaceId` to use the caller's workspace, or pass an existing workspace ID returned by `create_workspace`. Placement never changes parentage.

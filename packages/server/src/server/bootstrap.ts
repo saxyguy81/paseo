@@ -130,7 +130,7 @@ import type { RequestedSpeechProviders } from "./speech/speech-types.js";
 import { createSpeechService } from "./speech/speech-runtime.js";
 import { AgentManager } from "./agent/agent-manager.js";
 import { AgentStorage } from "./agent/agent-storage.js";
-import { reconcileStoredContextOverflowContinuations } from "./agent/agent-loading.js";
+import { reconcileStoredConversationContinuations } from "./agent/agent-loading.js";
 import { resumePendingAgentPrompts } from "./agent/agent-prompt.js";
 import { attachAgentStoragePersistence } from "./persistence-hooks.js";
 import { createAgentMcpServer } from "./agent/mcp-server.js";
@@ -1659,15 +1659,15 @@ export async function createPaseoDaemon(
             );
             pluginRuntime.bindPaseoSessionHost(wsServer);
             await pluginRuntime.start();
-            const recoveredContextOverflows = await reconcileStoredContextOverflowContinuations({
+            const recoveredConversationRollovers = await reconcileStoredConversationContinuations({
               agentManager,
               agentStorage,
               logger,
             });
-            if (recoveredContextOverflows.length > 0) {
+            if (recoveredConversationRollovers.length > 0) {
               logger.info(
-                { recoveredContextOverflows },
-                "Reconciled persisted context overflow continuations",
+                { recoveredConversationRollovers },
+                "Reconciled persisted conversation continuations",
               );
             }
             await resumePendingAgentPrompts({ agentManager, agentStorage, logger });

@@ -4,6 +4,10 @@ import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
 import { isLikelyExternalToolName } from "@getpaseo/protocol/tool-name-normalization";
 import { buildToolCallDisplayModel } from "@getpaseo/protocol/tool-call-display";
 import { projectTimelineRows } from "./timeline-projection.js";
+import {
+  isContextOverflowFailureText,
+  isConversationUnresolvedFailureText,
+} from "./context-overflow.js";
 
 const DEFAULT_MAX_ITEMS = 0;
 const MAX_TOOL_INPUT_CHARS = 400;
@@ -113,7 +117,9 @@ function formatContextOverflowStateEntry(item: AgentTimelineItem): string | null
   switch (item.type) {
     case "assistant_message": {
       const text = item.text.trim();
-      return text.startsWith("[System Error]")
+      return text.startsWith("[System Error]") ||
+        isContextOverflowFailureText(text) ||
+        isConversationUnresolvedFailureText(text)
         ? null
         : normalizeBoundedText(text, MAX_CONTEXT_STATE_ENTRY_CHARS);
     }
@@ -143,11 +149,12 @@ function formatContextOverflowStateEntry(item: AgentTimelineItem): string | null
 
 /**
  * Build a deliberately small handoff for a fresh native session after the
- * previous session exhausts its context window. The latest user request is
- * preserved verbatim; older conversation history is never copied.
+ * previous one becomes unsafe to continue. The latest user request is preserved
+ * verbatim; older conversation history is never copied.
  */
-export function buildAgentContextOverflowContinuationPrompt(input: {
+export function buildAgentFreshSessionContinuationPrompt(input: {
   rows: readonly AgentTimelineRow[];
+  failureKind: "context_overflow" | "conversation_unresolved";
   maxChars?: number;
 }): string | null {
   const maxChars = input.maxChars ?? DEFAULT_CONTEXT_OVERFLOW_CONTINUATION_MAX_CHARS;
@@ -164,8 +171,12 @@ export function buildAgentContextOverflowContinuationPrompt(input: {
     return null;
   }
   const request = latestUser.text.trim();
+  const reason =
+    input.failureKind === "context_overflow"
+      ? "reached its context limit"
+      : "cannot be continued safely because its prior request has unresolved delivery state";
   const prefix =
-    "<paseo-system>\nThe previous native Claude session reached its context limit. " +
+    `<paseo-system>\nThe previous native Claude session ${reason}. ` +
     "Continue the unfinished work in this fresh session. Do not repeat completed work.\n\n" +
     "Outstanding user request:\n";
   const stateHeader = "\n\nRecent working state:\n";

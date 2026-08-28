@@ -100,15 +100,15 @@ class ContextOverflowSession implements AgentSession {
           },
         });
         void this.client.allowPredecessorOverflow.promise.then(() => {
-          const overflow: AgentStreamEvent = {
+          const failure: AgentStreamEvent = {
             type: "turn_failed",
             provider: this.provider,
             turnId,
-            error: "Prompt is too long",
-            failureKind: "context_overflow",
+            error: this.client.failureText,
+            failureKind: this.client.failureKind,
           };
-          this.emit(overflow);
-          this.emit(overflow);
+          this.emit(failure);
+          this.emit(failure);
           return undefined;
         });
       }, 0);
@@ -203,6 +203,11 @@ class ContextOverflowClient implements AgentClient {
   readonly successorTurnStarted = createDeferredGate();
   readonly allowSuccessorCompletion = createDeferredGate();
 
+  constructor(
+    readonly failureKind: "context_overflow" | "conversation_unresolved",
+    readonly failureText: string,
+  ) {}
+
   async isAvailable(): Promise<boolean> {
     return true;
   }
@@ -230,111 +235,129 @@ class ContextOverflowClient implements AgentClient {
   }
 }
 
-test("DaemonClient observes one clean fresh-session rollover after context overflow", async () => {
-  const cwd = mkdtempSync(path.join(tmpdir(), "paseo-context-overflow-e2e-"));
-  const provider = new ContextOverflowClient();
-  const daemon = await createTestPaseoDaemon({ agentClients: { claude: provider } });
-  const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
-  const oldTranscriptMarker = `old-transcript-marker-${"x".repeat(30_000)}`;
+test.each([
+  {
+    name: "context overflow",
+    failureKind: "context_overflow" as const,
+    failureText: "Prompt is too long",
+  },
+  {
+    name: "an unresolved prior request",
+    failureKind: "conversation_unresolved" as const,
+    failureText: "API Error: 409 Conversation has an unresolved prior request",
+  },
+])(
+  "DaemonClient observes one clean fresh-session rollover after $name",
+  async ({ failureKind, failureText }) => {
+    const cwd = mkdtempSync(path.join(tmpdir(), "paseo-context-overflow-e2e-"));
+    const provider = new ContextOverflowClient(failureKind, failureText);
+    const daemon = await createTestPaseoDaemon({ agentClients: { claude: provider } });
+    const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+    const oldTranscriptMarker = `old-transcript-marker-${"x".repeat(30_000)}`;
 
-  try {
-    await client.connect();
-    await client.fetchAgents({ subscribe: { subscriptionId: "context-overflow-rollover-e2e" } });
-    const predecessor = await client.createAgent({
-      provider: "claude",
-      cwd,
-      title: "Long MR review",
-      model: "claude-opus-5",
-      modeId: "bypassPermissions",
-    });
+    try {
+      await client.connect();
+      await client.fetchAgents({ subscribe: { subscriptionId: "context-overflow-rollover-e2e" } });
+      const predecessor = await client.createAgent({
+        provider: "claude",
+        cwd,
+        title: "Long MR review",
+        model: "claude-opus-5",
+        modeId: "bypassPermissions",
+      });
 
-    await client.sendMessage(predecessor.id, oldTranscriptMarker);
-    await client.waitForAgentUpsert(predecessor.id, (agent) => agent.status === "running", 5_000);
-    await client.sendMessage(
-      predecessor.id,
-      "After rollover, verify the queued follow-up also runs.",
-    );
-    expect(provider.startedPrompts).toHaveLength(1);
-    provider.allowPredecessorOverflow.release();
-    await provider.successorTurnStarted.promise;
+      await client.sendMessage(predecessor.id, oldTranscriptMarker);
+      await client.waitForAgentUpsert(predecessor.id, (agent) => agent.status === "running", 5_000);
+      await client.sendMessage(
+        predecessor.id,
+        "After rollover, verify the queued follow-up also runs.",
+      );
+      expect(provider.startedPrompts).toHaveLength(1);
+      provider.allowPredecessorOverflow.release();
+      await provider.successorTurnStarted.promise;
 
-    let successorId: string | undefined;
-    await vi.waitFor(async () => {
-      const listing = await client.fetchAgents({ filter: { includeArchived: true } });
-      successorId = listing.entries.find(
-        (entry) => entry.agent.labels[CONVERSATION_FAMILY_PREDECESSOR_LABEL] === predecessor.id,
-      )?.agent.id;
-      expect(successorId).toBeTruthy();
-    });
-    const resolvedSuccessorId = successorId!;
+      let successorId: string | undefined;
+      await vi.waitFor(async () => {
+        const listing = await client.fetchAgents({ filter: { includeArchived: true } });
+        successorId = listing.entries.find(
+          (entry) => entry.agent.labels[CONVERSATION_FAMILY_PREDECESSOR_LABEL] === predecessor.id,
+        )?.agent.id;
+        expect(successorId).toBeTruthy();
+      });
+      const resolvedSuccessorId = successorId!;
 
-    const runningSuccessor = await client.waitForAgentUpsert(
-      resolvedSuccessorId,
-      (agent) => agent.status === "running",
-      5_000,
-    );
-    const archivedPredecessor = await client.fetchAgent({ agentId: predecessor.id });
+      const runningSuccessor = await client.waitForAgentUpsert(
+        resolvedSuccessorId,
+        (agent) => agent.status === "running",
+        5_000,
+      );
+      const archivedPredecessor = await client.fetchAgent({ agentId: predecessor.id });
 
-    expect(provider.createdSessionIds).toEqual([
-      "native-context-overflow-predecessor",
-      "native-context-overflow-successor-1",
-    ]);
-    expect(provider.resumedSessionIds).toEqual([]);
-    expect(runningSuccessor.persistence?.sessionId).toBe("native-context-overflow-successor-1");
-    expect(archivedPredecessor?.agent.archivedAt).toBeTruthy();
-    expect(archivedPredecessor?.agent.labels[CONVERSATION_FAMILY_ID_LABEL]).toBe(
-      runningSuccessor.labels[CONVERSATION_FAMILY_ID_LABEL],
-    );
-    expect(archivedPredecessor?.agent.labels[CONVERSATION_FAMILY_CURRENT_LABEL]).toBe(
-      resolvedSuccessorId,
-    );
-    expect(archivedPredecessor?.agent.labels[CONVERSATION_FAMILY_POSITION_LABEL]).toBe("0");
-    expect(runningSuccessor.labels[CONVERSATION_FAMILY_CURRENT_LABEL]).toBe(resolvedSuccessorId);
-    expect(runningSuccessor.labels[CONVERSATION_FAMILY_POSITION_LABEL]).toBe("1");
-    expect(runningSuccessor.labels[CONVERSATION_FAMILY_PREDECESSOR_LABEL]).toBe(predecessor.id);
+      expect(provider.createdSessionIds).toEqual([
+        "native-context-overflow-predecessor",
+        "native-context-overflow-successor-1",
+      ]);
+      expect(provider.resumedSessionIds).toEqual([]);
+      expect(runningSuccessor.persistence?.sessionId).toBe("native-context-overflow-successor-1");
+      expect(archivedPredecessor?.agent.archivedAt).toBeTruthy();
+      expect(archivedPredecessor?.agent.labels[CONVERSATION_FAMILY_ID_LABEL]).toBe(
+        runningSuccessor.labels[CONVERSATION_FAMILY_ID_LABEL],
+      );
+      expect(archivedPredecessor?.agent.labels[CONVERSATION_FAMILY_CURRENT_LABEL]).toBe(
+        resolvedSuccessorId,
+      );
+      expect(archivedPredecessor?.agent.labels[CONVERSATION_FAMILY_POSITION_LABEL]).toBe("0");
+      expect(runningSuccessor.labels[CONVERSATION_FAMILY_CURRENT_LABEL]).toBe(resolvedSuccessorId);
+      expect(runningSuccessor.labels[CONVERSATION_FAMILY_POSITION_LABEL]).toBe("1");
+      expect(runningSuccessor.labels[CONVERSATION_FAMILY_PREDECESSOR_LABEL]).toBe(predecessor.id);
 
-    expect(provider.startedPrompts).toHaveLength(2);
-    const continuation = provider.startedPrompts[1];
-    expect(continuation?.nativeSessionId).toBe("native-context-overflow-successor-1");
-    expect(continuation?.text.length).toBeLessThanOrEqual(24_000);
-    expect(continuation?.text).toContain("Finish the MR review and report any remaining blockers.");
-    expect(continuation?.text).toContain(
-      "The implementation review is complete. The test matrix remains.",
-    );
-    expect(continuation?.text).not.toContain("old-transcript-marker");
+      expect(provider.startedPrompts).toHaveLength(2);
+      const continuation = provider.startedPrompts[1];
+      expect(continuation?.nativeSessionId).toBe("native-context-overflow-successor-1");
+      expect(continuation?.text.length).toBeLessThanOrEqual(24_000);
+      expect(continuation?.text).toContain(
+        "Finish the MR review and report any remaining blockers.",
+      );
+      expect(continuation?.text).toContain(
+        "The implementation review is complete. The test matrix remains.",
+      );
+      expect(continuation?.text).not.toContain("old-transcript-marker");
+      expect(continuation?.text).not.toContain(failureText);
 
-    provider.allowSuccessorCompletion.release();
-    const completedSuccessor = await client.waitForAgentUpsert(
-      resolvedSuccessorId,
-      (agent) => agent.status === "idle",
-      5_000,
-    );
-    expect(completedSuccessor.lastError).toBeUndefined();
+      provider.allowSuccessorCompletion.release();
+      const completedSuccessor = await client.waitForAgentUpsert(
+        resolvedSuccessorId,
+        (agent) => agent.status === "idle",
+        5_000,
+      );
+      expect(completedSuccessor.lastError).toBeUndefined();
 
-    const timeline = await client.fetchAgentTimeline(resolvedSuccessorId, {
-      direction: "tail",
-      limit: 0,
-      projection: "canonical",
-    });
-    expect(timeline.entries.map((entry) => entry.item)).toContainEqual({
-      type: "assistant_message",
-      text: "The rollover review completed cleanly.",
-    });
+      const timeline = await client.fetchAgentTimeline(resolvedSuccessorId, {
+        direction: "tail",
+        limit: 0,
+        projection: "canonical",
+      });
+      expect(timeline.entries.map((entry) => entry.item)).toContainEqual({
+        type: "assistant_message",
+        text: "The rollover review completed cleanly.",
+      });
 
-    await vi.waitFor(() => expect(provider.startedPrompts).toHaveLength(3));
-    expect(provider.startedPrompts[2]).toEqual({
-      nativeSessionId: "native-context-overflow-successor-1",
-      text: "After rollover, verify the queued follow-up also runs.",
-    });
+      await vi.waitFor(() => expect(provider.startedPrompts).toHaveLength(3));
+      expect(provider.startedPrompts[2]).toEqual({
+        nativeSessionId: "native-context-overflow-successor-1",
+        text: "After rollover, verify the queued follow-up also runs.",
+      });
 
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    expect(provider.createdSessionIds).toHaveLength(2);
-    expect(provider.startedPrompts).toHaveLength(3);
-  } finally {
-    provider.allowPredecessorOverflow.release();
-    provider.allowSuccessorCompletion.release();
-    await client.close();
-    await daemon.close();
-    rmSync(cwd, { recursive: true, force: true });
-  }
-}, 30_000);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(provider.createdSessionIds).toHaveLength(2);
+      expect(provider.startedPrompts).toHaveLength(3);
+    } finally {
+      provider.allowPredecessorOverflow.release();
+      provider.allowSuccessorCompletion.release();
+      await client.close();
+      await daemon.close();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+  30_000,
+);

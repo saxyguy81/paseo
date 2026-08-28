@@ -9,6 +9,7 @@ import { asInternals } from "../../../test-utils/class-mocks.js";
 import {
   ClaudeAgentClient,
   readClaudeContextOverflowError,
+  readClaudeUnresolvedTurnError,
   readEventIdentifiers,
   readRetryableClaudeApiError,
 } from "./agent.js";
@@ -233,6 +234,23 @@ test("recognizes only retryable synthetic Claude API failures", () => {
     }),
   ).toBe("API Error: 503 Service Unavailable");
   expect(readRetryableClaudeApiError(apiError("API Error: 401 Invalid API key"))).toBeNull();
+  expect(
+    readRetryableClaudeApiError(
+      apiError("API Error: 409 Conversation has an unresolved prior request"),
+    ),
+  ).toBeNull();
+  expect(
+    readClaudeUnresolvedTurnError(
+      apiError("API Error: 409 Conversation has an unresolved prior request"),
+    ),
+  ).toBe("API Error: 409 Conversation has an unresolved prior request");
+  expect(
+    readClaudeUnresolvedTurnError({
+      type: "result",
+      subtype: "error_during_execution",
+      errors: ["API Error: 409 Conversation has an unresolved prior request"],
+    }),
+  ).toBe("API Error: 409 Conversation has an unresolved prior request");
   expect(readRetryableClaudeApiError(apiError("API Error: 429 Rate limit exceeded"))).toBeNull();
   expect(readRetryableClaudeApiError(apiError("API Error: prompt too long"))).toBeNull();
   expect(
@@ -333,6 +351,81 @@ test("preserves a context overflow assistant error when the terminal result is g
         type: "turn_failed",
         error: "Prompt is too long · automatic compaction failed: selected model unavailable",
         failureKind: "context_overflow",
+      }),
+    ]);
+  } finally {
+    await session.close();
+  }
+});
+
+test("classifies an unresolved prior turn for fresh-session rollover without retrying it", async () => {
+  let step = 0;
+  sdkQueryFactory.mockImplementation(() =>
+    createBaseQueryMock(
+      vi.fn(async () => {
+        if (step === 0) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "system",
+              subtype: "init",
+              session_id: "unresolved-turn-session",
+              permissionMode: "bypassPermissions",
+              model: "claude-opus-5",
+            },
+          };
+        }
+        if (step === 1) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              uuid: "unresolved-turn-error",
+              session_id: "unresolved-turn-session",
+              is_api_error_message: true,
+              message: {
+                role: "assistant",
+                content: [
+                  {
+                    type: "text",
+                    text: "API Error: 409 Conversation has an unresolved prior request",
+                  },
+                ],
+              },
+            },
+          };
+        }
+        if (step === 2) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "result",
+              subtype: "error_during_execution",
+              uuid: "unresolved-turn-result",
+              session_id: "unresolved-turn-session",
+              usage: buildUsage(),
+              errors: ["Claude run failed"],
+              total_cost_usd: 0,
+            },
+          };
+        }
+        return { done: true, value: undefined };
+      }),
+    ),
+  );
+
+  const session = await createSession();
+  try {
+    const events = await collectUntilTerminal(streamSession(session, "continue the review"));
+    expect(sdkQueryFactory).toHaveBeenCalledTimes(1);
+    expect(events.filter((event) => event.type === "turn_failed")).toEqual([
+      expect.objectContaining({
+        type: "turn_failed",
+        error: "API Error: 409 Conversation has an unresolved prior request",
+        failureKind: "conversation_unresolved",
       }),
     ]);
   } finally {
