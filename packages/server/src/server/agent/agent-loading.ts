@@ -1,8 +1,13 @@
 import type { Logger } from "pino";
 
+import {
+  CONVERSATION_FAMILY_CURRENT_LABEL,
+  CONVERSATION_FAMILY_PREDECESSOR_LABEL,
+} from "@getpaseo/protocol/agent-labels";
 import type { AgentProvider } from "./agent-sdk-types.js";
 import type { AgentManager, ManagedAgent } from "./agent-manager.js";
 import type { AgentStorage } from "./agent-storage.js";
+import { isContextOverflowFailureText } from "./context-overflow.js";
 import {
   buildConfigOverrides,
   buildSessionConfig,
@@ -34,6 +39,56 @@ export interface EnsureAgentLoadedDeps {
   validProviders?: Iterable<AgentProvider>;
   broadcastTimeline?: boolean;
   logger: Logger;
+}
+
+export interface ContextOverflowReconciliationResult {
+  predecessorId: string;
+  successorId: string;
+}
+
+/**
+ * Recover context overflows that were recorded before the daemon exited.
+ * Loading the predecessor hydrates its native history so the fresh session
+ * receives a bounded handoff rather than a copy of the exhausted transcript.
+ */
+export async function reconcileStoredContextOverflowContinuations(deps: {
+  agentManager: AgentManager;
+  agentStorage: AgentStorage;
+  logger: Logger;
+}): Promise<ContextOverflowReconciliationResult[]> {
+  const records = await deps.agentStorage.list();
+  const recordById = new Map(records.map((record) => [record.id, record]));
+  const candidates = records.filter((record) => {
+    if (record.archivedAt || record.internal || !isContextOverflowFailureText(record.lastError)) {
+      return false;
+    }
+    const current = record.labels?.[CONVERSATION_FAMILY_CURRENT_LABEL]?.trim();
+    if (!current || current === record.id) {
+      return true;
+    }
+    const successor = recordById.get(current);
+    return successor?.labels?.[CONVERSATION_FAMILY_PREDECESSOR_LABEL] === record.id;
+  });
+
+  const reconciled: ContextOverflowReconciliationResult[] = [];
+  for (const predecessor of candidates) {
+    try {
+      await ensureAgentLoaded(predecessor.id, deps);
+      const successorId = await deps.agentManager.ensureAgentContextOverflowContinuation(
+        predecessor.id,
+        predecessor.lastError ?? undefined,
+      );
+      if (successorId && successorId !== predecessor.id) {
+        reconciled.push({ predecessorId: predecessor.id, successorId });
+      }
+    } catch (error) {
+      deps.logger.error(
+        { err: error, agentId: predecessor.id },
+        "Failed to reconcile persisted context overflow",
+      );
+    }
+  }
+  return reconciled;
 }
 
 export async function ensureUnarchivedAgentLoaded(

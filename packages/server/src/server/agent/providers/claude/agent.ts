@@ -45,6 +45,7 @@ import {
 import { parsePartialJsonObject } from "./partial-json.js";
 import { ClaudeSidechainTracker } from "./sidechain-tracker.js";
 import { ClaudeTaskState } from "./task-state.js";
+import { isContextOverflowFailureText } from "../../context-overflow.js";
 import {
   ClaudeTaskProtocolSource,
   type ClaudeHookObservationInput,
@@ -567,17 +568,11 @@ export function readRetryableClaudeApiError(message: unknown): string | null {
   return null;
 }
 
-function isClaudeContextOverflowText(text: string): boolean {
-  return /(?:\bprompt (?:is )?too long\b|\bcontext window (?:is )?(?:too large|exceeded|overflow)|\bmaximum context (?:length|window)\b|\bcontext length exceeded\b)/i.test(
-    text,
-  );
-}
-
 /** Returns the provider error text only when Claude rejected the current context as oversized. */
 export function readClaudeContextOverflowError(message: unknown): string | null {
   if (typeof message === "string") {
     const normalized = message.trim();
-    return normalized && isClaudeContextOverflowText(normalized) ? normalized : null;
+    return normalized && isContextOverflowFailureText(normalized) ? normalized : null;
   }
 
   const record = toObjectRecord(message);
@@ -585,13 +580,13 @@ export function readClaudeContextOverflowError(message: unknown): string | null 
   if (record.type === "assistant" && record.isApiErrorMessage === true) {
     const assistantMessage = toObjectRecord(record.message);
     const text = collectClaudeTextContentParts(assistantMessage?.content).join("\n").trim();
-    return text && isClaudeContextOverflowText(text) ? text : null;
+    return text && isContextOverflowFailureText(text) ? text : null;
   }
   if (record.type === "result" && Array.isArray(record.errors)) {
     const text = record.errors
       .filter((entry): entry is string => typeof entry === "string")
       .join("\n");
-    return text && isClaudeContextOverflowText(text) ? text : null;
+    return text && isContextOverflowFailureText(text) ? text : null;
   }
   return null;
 }

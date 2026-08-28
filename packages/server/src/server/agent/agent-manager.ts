@@ -88,6 +88,7 @@ import {
   type ProviderSubagentStoreEvent,
 } from "./provider-subagents/store.js";
 import { buildAgentContextOverflowContinuationPrompt } from "./activity-curator.js";
+import { isContextOverflowFailureText } from "./context-overflow.js";
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
@@ -115,22 +116,65 @@ function submittedPromptText(prompt: AgentPromptInput): string {
     .trim();
 }
 
-function isContextOverflowFailureText(value: unknown): boolean {
-  if (typeof value !== "string") {
-    return false;
-  }
-  const normalized = value.toLowerCase();
-  return (
-    normalized.includes("prompt is too long") ||
-    normalized.includes("prompt too long") ||
-    /context (?:window|length).*(?:exceed|overflow|too (?:large|long))/.test(normalized) ||
-    /maximum context (?:window|length)/.test(normalized)
-  );
-}
-
 function parseFamilyPosition(value: string | null | undefined): number {
   const position = Number(value);
   return Number.isInteger(position) && position >= 0 ? position : 0;
+}
+
+function findContextOverflowSuccessor(
+  records: readonly StoredAgentRecord[],
+  predecessorId: string,
+): StoredAgentRecord | undefined {
+  return records.find(
+    (record) => record.labels?.[CONVERSATION_FAMILY_PREDECESSOR_LABEL] === predecessorId,
+  );
+}
+
+function isEligibleContextOverflowPredecessor(
+  predecessor: StoredAgentRecord,
+  agentId: string,
+  latestError: string | null | undefined,
+): boolean {
+  const currentFamilyMember = predecessor.labels?.[CONVERSATION_FAMILY_CURRENT_LABEL]?.trim();
+  return (
+    (!currentFamilyMember || currentFamilyMember === agentId) &&
+    isContextOverflowFailureText(latestError)
+  );
+}
+
+function buildContextOverflowSuccessorMetadata(
+  records: readonly StoredAgentRecord[],
+  predecessor: StoredAgentRecord,
+  successorId: string,
+): { familyName: string; labels: Record<string, string> } {
+  const familyId = predecessor.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim() || randomUUID();
+  const familyMembers = records.filter(
+    (record) =>
+      record.id === predecessor.id || record.labels?.[CONVERSATION_FAMILY_ID_LABEL] === familyId,
+  );
+  const highestPosition = Math.max(
+    parseFamilyPosition(predecessor.labels?.[CONVERSATION_FAMILY_POSITION_LABEL]),
+    ...familyMembers.map((record) =>
+      parseFamilyPosition(record.labels?.[CONVERSATION_FAMILY_POSITION_LABEL]),
+    ),
+  );
+  const familyName =
+    predecessor.labels?.[CONVERSATION_FAMILY_NAME_LABEL]?.trim() ||
+    predecessor.title?.trim() ||
+    "Conversation";
+  const labels = Object.fromEntries(
+    Object.entries(predecessor.labels ?? {}).filter(
+      ([label]) => label !== CONVERSATION_FAMILY_HIDDEN_LABEL && !isOpenAgentTabLabel(label),
+    ),
+  );
+  Object.assign(labels, {
+    [CONVERSATION_FAMILY_ID_LABEL]: familyId,
+    [CONVERSATION_FAMILY_CURRENT_LABEL]: successorId,
+    [CONVERSATION_FAMILY_NAME_LABEL]: familyName,
+    [CONVERSATION_FAMILY_POSITION_LABEL]: String(highestPosition + 1),
+    [CONVERSATION_FAMILY_PREDECESSOR_LABEL]: predecessor.id,
+  });
+  return { familyName, labels };
 }
 
 export class AgentManagerShuttingDownError extends Error {
@@ -1122,12 +1166,18 @@ export class AgentManager {
    * Ensure a context-exhausted agent has one fresh writable continuation.
    * The durable predecessor marker is the idempotency key across daemon restarts.
    */
-  async ensureAgentContextOverflowContinuation(agentId: string): Promise<string | null> {
+  async ensureAgentContextOverflowContinuation(
+    agentId: string,
+    persistedFailureText?: string,
+  ): Promise<string | null> {
     const existing = this.contextOverflowRollovers.get(agentId);
     if (existing) {
       return existing;
     }
-    const rollover = this.ensureAgentContextOverflowContinuationInternal(agentId);
+    const rollover = this.ensureAgentContextOverflowContinuationInternal(
+      agentId,
+      persistedFailureText,
+    );
     this.contextOverflowRollovers.set(agentId, rollover);
     try {
       return await rollover;
@@ -1140,28 +1190,29 @@ export class AgentManager {
 
   private async ensureAgentContextOverflowContinuationInternal(
     agentId: string,
+    persistedFailureText?: string,
   ): Promise<string | null> {
     const registry = this.requireRegistry();
     const records = await registry.list();
-    const priorSuccessor = records.find(
-      (record) => record.labels?.[CONVERSATION_FAMILY_PREDECESSOR_LABEL] === agentId,
-    );
+    const predecessor = records.find((record) => record.id === agentId);
+    if (!predecessor) {
+      return null;
+    }
+    const priorSuccessor = findContextOverflowSuccessor(records, agentId);
+    if (predecessor.archivedAt) {
+      return priorSuccessor?.id ?? null;
+    }
     if (priorSuccessor) {
       await this.repairContextOverflowFamily(agentId, priorSuccessor.id);
       return priorSuccessor.id;
     }
 
-    const predecessor = records.find((record) => record.id === agentId);
-    const latestError = this.agents.get(agentId)?.lastError ?? predecessor?.lastError;
-    if (!predecessor || !isContextOverflowFailureText(latestError)) {
+    const latestError =
+      persistedFailureText ?? this.agents.get(agentId)?.lastError ?? predecessor.lastError;
+    if (!isEligibleContextOverflowPredecessor(predecessor, agentId, latestError)) {
       return null;
     }
-    let rows: readonly AgentTimelineRow[] = [];
-    if (this.agents.has(agentId)) {
-      rows = this.timelineStore.getRows(agentId);
-    } else if (this.durableTimelineStore) {
-      rows = await this.durableTimelineStore.getCommittedRows(agentId);
-    }
+    const rows = await this.getContextOverflowTimelineRows(agentId);
     const prompt = buildAgentContextOverflowContinuationPrompt({ rows });
     if (!prompt) {
       this.logger.warn(
@@ -1171,41 +1222,15 @@ export class AgentManager {
       return null;
     }
 
-    const existingFamilyId = predecessor.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim();
-    const familyId = existingFamilyId || randomUUID();
-    const familyMembers = records.filter(
-      (record) =>
-        record.id === agentId || record.labels?.[CONVERSATION_FAMILY_ID_LABEL] === familyId,
-    );
-    const predecessorPosition = parseFamilyPosition(
-      predecessor.labels?.[CONVERSATION_FAMILY_POSITION_LABEL],
-    );
-    const highestPosition = Math.max(
-      predecessorPosition,
-      ...familyMembers.map((record) =>
-        parseFamilyPosition(record.labels?.[CONVERSATION_FAMILY_POSITION_LABEL]),
-      ),
-    );
     const successorId = this.idFactory();
-    const familyName =
-      predecessor.labels?.[CONVERSATION_FAMILY_NAME_LABEL]?.trim() ||
-      predecessor.title?.trim() ||
-      "Conversation";
-    const successorLabels = Object.fromEntries(
-      Object.entries(predecessor.labels ?? {}).filter(
-        ([label]) => label !== CONVERSATION_FAMILY_HIDDEN_LABEL && !isOpenAgentTabLabel(label),
-      ),
+    const { familyName, labels } = buildContextOverflowSuccessorMetadata(
+      records,
+      predecessor,
+      successorId,
     );
-    Object.assign(successorLabels, {
-      [CONVERSATION_FAMILY_ID_LABEL]: familyId,
-      [CONVERSATION_FAMILY_CURRENT_LABEL]: successorId,
-      [CONVERSATION_FAMILY_NAME_LABEL]: familyName,
-      [CONVERSATION_FAMILY_POSITION_LABEL]: String(highestPosition + 1),
-      [CONVERSATION_FAMILY_PREDECESSOR_LABEL]: agentId,
-    });
 
     const successor = await this.createAgent(buildStoredAgentConfig(predecessor), successorId, {
-      labels: successorLabels,
+      labels,
       initialTitle: familyName,
       workspaceId: predecessor.workspaceId,
       owner: predecessor.owner,
@@ -1216,6 +1241,15 @@ export class AgentManager {
     const continuation = this.consumeContextOverflowContinuation(successor.id, prompt);
     this.trackBackgroundTask(continuation);
     return successor.id;
+  }
+
+  private async getContextOverflowTimelineRows(
+    agentId: string,
+  ): Promise<readonly AgentTimelineRow[]> {
+    if (this.agents.has(agentId)) {
+      return this.timelineStore.getRows(agentId);
+    }
+    return this.durableTimelineStore?.getCommittedRows(agentId) ?? [];
   }
 
   private async repairContextOverflowFamily(

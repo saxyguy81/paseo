@@ -1,11 +1,15 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { expect, test } from "vitest";
+import {
+  CONVERSATION_FAMILY_CURRENT_LABEL,
+  CONVERSATION_FAMILY_PREDECESSOR_LABEL,
+} from "@getpaseo/protocol/agent-labels";
+import { expect, test, vi } from "vitest";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { AgentManager } from "./agent-manager.js";
-import { ensureAgentLoaded } from "./agent-loading.js";
+import { ensureAgentLoaded, reconcileStoredContextOverflowContinuations } from "./agent-loading.js";
 import { AgentStorage } from "./agent-storage.js";
 import type {
   AgentClient,
@@ -14,6 +18,7 @@ import type {
   AgentResumeSessionOptions,
   AgentSession,
   AgentSessionConfig,
+  AgentStreamEvent,
 } from "./agent-sdk-types.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
 
@@ -76,6 +81,137 @@ test("loads archived records for history and active records with the interactive
       manager.closeAgent(activeId).catch(() => undefined),
     ]);
     await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("reconciles a context overflow persisted across restart into one fresh continuation", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "agent-loading-context-overflow-restart-"));
+  const logger = createTestLogger();
+  const storage = new AgentStorage(path.join(root, "agents"), logger);
+  const baseClient = createTestAgentClients().codex;
+  if (!baseClient) {
+    throw new Error("expected Codex test client");
+  }
+
+  const predecessorId = "00000000-0000-4000-8000-000000000401";
+  const successorId = "00000000-0000-4000-8000-000000000402";
+  const setupManager = new AgentManager({
+    clients: { codex: baseClient },
+    registry: storage,
+    logger,
+  });
+
+  try {
+    const predecessor = await setupManager.createAgent(
+      { provider: "codex", cwd: root },
+      predecessorId,
+      { initialTitle: "Interrupted review", workspaceId: "workspace-review" },
+    );
+    await setupManager.closeAgent(predecessor.id);
+    await setupManager.flush();
+
+    const stored = await storage.get(predecessor.id);
+    if (!stored) throw new Error("expected persisted predecessor");
+    await storage.upsert({
+      ...stored,
+      lastStatus: "error",
+      lastError: "Prompt is too long",
+      requiresAttention: true,
+      attentionReason: "error",
+      attentionTimestamp: new Date().toISOString(),
+    });
+
+    let resumeCount = 0;
+    let createCount = 0;
+    const client: AgentClient = {
+      provider: baseClient.provider,
+      capabilities: baseClient.capabilities,
+      createSession: async (config, launchContext) => {
+        createCount += 1;
+        return await baseClient.createSession(config, launchContext);
+      },
+      resumeSession: async (handle, overrides, launchContext, options) => {
+        resumeCount += 1;
+        const session = await baseClient.resumeSession(handle, overrides, launchContext, options);
+        return new Proxy(session, {
+          get(target, property) {
+            if (property === "streamHistory") {
+              return async function* (): AsyncGenerator<AgentStreamEvent> {
+                yield {
+                  type: "timeline",
+                  provider: "codex",
+                  item: {
+                    type: "user_message",
+                    text: "Finish the interrupted review and report the remaining blockers.",
+                  },
+                };
+                yield {
+                  type: "timeline",
+                  provider: "codex",
+                  item: {
+                    type: "assistant_message",
+                    text: "The implementation is complete; the test matrix remains.",
+                  },
+                };
+                yield {
+                  type: "turn_failed",
+                  provider: "codex",
+                  error: "Prompt is too long",
+                  failureKind: "context_overflow",
+                };
+              };
+            }
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      },
+      fetchCatalog: async (options) => await baseClient.fetchCatalog(options),
+      isAvailable: async () => await baseClient.isAvailable(),
+    };
+    const restartedManager = new AgentManager({
+      clients: { codex: client },
+      registry: storage,
+      logger,
+      idFactory: () => successorId,
+    });
+
+    const reconciled = await reconcileStoredContextOverflowContinuations({
+      agentManager: restartedManager,
+      agentStorage: storage,
+      logger,
+    });
+
+    expect(resumeCount).toBe(1);
+    expect(createCount).toBe(1);
+    expect(reconciled).toEqual([{ predecessorId, successorId }]);
+    await vi.waitFor(async () => {
+      expect((await storage.get(predecessorId))?.archivedAt).toBeTruthy();
+    });
+    expect((await storage.get(predecessorId))?.labels[CONVERSATION_FAMILY_CURRENT_LABEL]).toBe(
+      successorId,
+    );
+    expect((await storage.get(successorId))?.labels[CONVERSATION_FAMILY_PREDECESSOR_LABEL]).toBe(
+      predecessorId,
+    );
+
+    await expect(
+      reconcileStoredContextOverflowContinuations({
+        agentManager: restartedManager,
+        agentStorage: storage,
+        logger,
+      }),
+    ).resolves.toEqual([]);
+    expect(resumeCount).toBe(1);
+    expect(createCount).toBe(1);
+
+    await restartedManager.closeAgent(successorId).catch(() => undefined);
+    await restartedManager.flush().catch(() => undefined);
+  } finally {
+    await setupManager.closeAgent(predecessorId).catch(() => undefined);
+    await setupManager.flush().catch(() => undefined);
     await storage.flush().catch(() => undefined);
     await rm(root, { recursive: true, force: true });
   }
