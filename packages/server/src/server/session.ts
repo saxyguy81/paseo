@@ -271,6 +271,7 @@ type ProviderSubagentManagerEvent = Extract<
 const LEGACY_PROVIDER_IDS = new Set(["claude", "codex", "opencode"]);
 const MIN_VERSION_ALL_PROVIDERS = "0.1.45";
 const MIN_VERSION_EXPLICIT_WORKSPACE_RECOVERY = "0.1.105";
+const MAX_LEGACY_TIMELINE_REPLACEMENT_ROWS = 200;
 function errorToFriendlyMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === "string") return error;
@@ -3772,6 +3773,7 @@ export class Session {
         await this.interruptAgentIfRunning(agentId);
         snapshot = await this.agentManager.reloadAgentSession(agentId, undefined, {
           rehydrateFromDisk: true,
+          broadcastProviderSubagentReset: false,
         });
       } else {
         const record = await this.agentStorage.get(agentId);
@@ -3791,11 +3793,15 @@ export class Session {
         snapshot = await ensureAgentLoaded(agentId, {
           agentManager: this.agentManager,
           agentStorage: this.agentStorage,
-          broadcastTimeline: true,
+          broadcastTimeline: false,
           logger: this.sessionLogger,
         });
       }
-      await this.agentManager.hydrateTimelineFromProvider(agentId, { broadcast: true });
+      // Refresh reconstructs authoritative server state. Historical rows are fetched in bounded
+      // pages by current clients after the replacement invalidation; replaying them as live events
+      // can enqueue tens of thousands of WebSocket frames and exhaust the daemon.
+      await this.agentManager.hydrateTimelineFromProvider(agentId, { broadcast: false });
+      this.agentManager.announceTimelineReplacement(agentId);
       await this.agentUpdates.forwardLiveAgent(snapshot);
       const timelineSize = this.agentManager.getTimeline(agentId).length;
       if (requestId) {
@@ -3923,7 +3929,14 @@ export class Session {
     const epoch = timeline.epoch;
 
     if (this.clientCapabilitiesBySource.size === 0 || !this.onMessageToSource) {
-      if (!this.supports(CLIENT_CAPS.timelineReplacementInvalidation)) {
+      if (this.supports(CLIENT_CAPS.timelineReplacementInvalidation)) {
+        if (!this.usesSelectiveTimelineDelivery() || this.viewedTimelineAgentIds.has(agentId)) {
+          this.emit({
+            type: "agent.timeline.replacement",
+            payload: { agentId, epoch },
+          });
+        }
+      } else {
         this.emitReconstructedTimelineRows(agentId, agent.provider, timeline.rows, epoch);
       }
       return;
@@ -3955,7 +3968,9 @@ export class Session {
     epoch: string,
     source?: object,
   ): void {
-    for (const row of rows) {
+    // Legacy clients cannot process replacement invalidations. Keep their compatibility replay
+    // bounded so a large persisted conversation cannot overwhelm the physical WebSocket.
+    for (const row of rows.slice(-MAX_LEGACY_TIMELINE_REPLACEMENT_ROWS)) {
       const event = serializeAgentStreamEvent({
         type: "timeline",
         provider,

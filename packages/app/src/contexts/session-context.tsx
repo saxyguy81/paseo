@@ -56,7 +56,7 @@ import { useToast } from "@/contexts/toast-context";
 import { toErrorMessage } from "@/utils/error-messages";
 import { showProviderNoticeToast } from "@/utils/provider-notice-toast";
 import { applyCheckoutStatusUpdateFromEvent } from "@/git/checkout-status-cache";
-import { useProviderSubagentStore } from "@/subagents/provider-store";
+import { refreshProviderSubagents, useProviderSubagentStore } from "@/subagents/provider-store";
 import { revalidateSessionAfterResume } from "@/contexts/session-resume-revalidation";
 
 function consumeForcedTimelineTailReplacement(
@@ -580,13 +580,17 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
 
     const unsubTimelineReplacement = client.on("agent.timeline.replacement", (message) => {
       if (message.type !== "agent.timeline.replacement") return;
-      void requestTimelineReplacement(
-        {
-          fetchAgentTimeline: (agentId, request) =>
-            getHostRuntimeStore().fetchAgentTimeline(serverId, agentId, request),
-        },
-        message.payload.agentId,
-      ).catch((error: unknown) => {
+      const agentId = message.payload.agentId;
+      void Promise.all([
+        requestTimelineReplacement(
+          {
+            fetchAgentTimeline: (requestedAgentId, request) =>
+              getHostRuntimeStore().fetchAgentTimeline(serverId, requestedAgentId, request),
+          },
+          agentId,
+        ),
+        refreshProviderSubagents(client, serverId, agentId),
+      ]).catch((error: unknown) => {
         console.warn("[Session] timeline replacement refresh failed", { serverId, error });
       });
     });
