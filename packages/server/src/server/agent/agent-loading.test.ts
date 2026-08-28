@@ -117,7 +117,7 @@ test("reconciles a context overflow persisted across restart into one fresh cont
     await storage.upsert({
       ...stored,
       lastStatus: "error",
-      lastError: "Prompt is too long",
+      lastError: null,
       requiresAttention: true,
       attentionReason: "error",
       attentionTimestamp: new Date().toISOString(),
@@ -156,10 +156,12 @@ test("reconciles a context overflow persisted across restart into one fresh cont
                   },
                 };
                 yield {
-                  type: "turn_failed",
+                  type: "timeline",
                   provider: "codex",
-                  error: "Prompt is too long",
-                  failureKind: "context_overflow",
+                  item: {
+                    type: "assistant_message",
+                    text: "Prompt is too long",
+                  },
                 };
               };
             }

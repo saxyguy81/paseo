@@ -7,7 +7,10 @@ import {
 import type { AgentProvider } from "./agent-sdk-types.js";
 import type { AgentManager, ManagedAgent } from "./agent-manager.js";
 import type { AgentStorage } from "./agent-storage.js";
-import { isContextOverflowFailureText } from "./context-overflow.js";
+import {
+  isContextOverflowFailureText,
+  readTerminalContextOverflowFailure,
+} from "./context-overflow.js";
 import {
   buildConfigOverrides,
   buildSessionConfig,
@@ -59,7 +62,11 @@ export async function reconcileStoredContextOverflowContinuations(deps: {
   const records = await deps.agentStorage.list();
   const recordById = new Map(records.map((record) => [record.id, record]));
   const candidates = records.filter((record) => {
-    if (record.archivedAt || record.internal || !isContextOverflowFailureText(record.lastError)) {
+    if (
+      record.archivedAt ||
+      record.internal ||
+      (record.lastStatus !== "error" && !isContextOverflowFailureText(record.lastError))
+    ) {
       return false;
     }
     const current = record.labels?.[CONVERSATION_FAMILY_CURRENT_LABEL]?.trim();
@@ -74,9 +81,12 @@ export async function reconcileStoredContextOverflowContinuations(deps: {
   for (const predecessor of candidates) {
     try {
       await ensureAgentLoaded(predecessor.id, deps);
+      const hydratedFailureText = readTerminalContextOverflowFailure(
+        await deps.agentManager.getTimelineRows(predecessor.id),
+      );
       const successorId = await deps.agentManager.ensureAgentContextOverflowContinuation(
         predecessor.id,
-        predecessor.lastError ?? undefined,
+        hydratedFailureText ?? predecessor.lastError ?? undefined,
       );
       if (successorId && successorId !== predecessor.id) {
         reconciled.push({ predecessorId: predecessor.id, successorId });
