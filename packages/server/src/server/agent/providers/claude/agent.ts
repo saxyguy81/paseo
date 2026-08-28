@@ -539,7 +539,7 @@ interface PendingPostWorkApiRecovery {
  */
 export function readRetryableClaudeApiError(message: unknown): string | null {
   const record = toObjectRecord(message);
-  if (record?.type !== "assistant" || record.isApiErrorMessage !== true) {
+  if (record?.type !== "assistant" || !isClaudeApiErrorMessage(record)) {
     return null;
   }
 
@@ -577,7 +577,7 @@ export function readClaudeContextOverflowError(message: unknown): string | null 
 
   const record = toObjectRecord(message);
   if (!record) return null;
-  if (record.type === "assistant" && record.isApiErrorMessage === true) {
+  if (record.type === "assistant" && isClaudeApiErrorMessage(record)) {
     const assistantMessage = toObjectRecord(record.message);
     const text = collectClaudeTextContentParts(assistantMessage?.content).join("\n").trim();
     return text && isContextOverflowFailureText(text) ? text : null;
@@ -589,6 +589,11 @@ export function readClaudeContextOverflowError(message: unknown): string | null 
     return text && isContextOverflowFailureText(text) ? text : null;
   }
   return null;
+}
+
+/** Claude SDK releases have emitted this marker in both camelCase and wire-format snake_case. */
+function isClaudeApiErrorMessage(record: Record<string, unknown>): boolean {
+  return record.isApiErrorMessage === true || record.is_api_error_message === true;
 }
 
 function isForegroundProviderActivityEvent(event: AgentStreamEvent): boolean {

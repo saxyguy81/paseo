@@ -222,6 +222,16 @@ test("recognizes only retryable synthetic Claude API failures", () => {
   expect(readRetryableClaudeApiError(apiError("API Error: The operation timed out."))).toBe(
     "API Error: The operation timed out.",
   );
+  expect(
+    readRetryableClaudeApiError({
+      type: "assistant",
+      is_api_error_message: true,
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "API Error: 503 Service Unavailable" }],
+      },
+    }),
+  ).toBe("API Error: 503 Service Unavailable");
   expect(readRetryableClaudeApiError(apiError("API Error: 401 Invalid API key"))).toBeNull();
   expect(readRetryableClaudeApiError(apiError("API Error: 429 Rate limit exceeded"))).toBeNull();
   expect(readRetryableClaudeApiError(apiError("API Error: prompt too long"))).toBeNull();
@@ -281,7 +291,8 @@ test("preserves a context overflow assistant error when the terminal result is g
               type: "assistant",
               uuid: "generic-result-overflow-assistant",
               session_id: "generic-result-overflow-session",
-              isApiErrorMessage: true,
+              is_api_error_message: true,
+              error: "invalid_request",
               message: {
                 role: "assistant",
                 content: [
