@@ -5337,6 +5337,7 @@ class ClaudeAgentSession implements AgentSession {
     if (!cwd) return null;
     const configDir =
       this.launchEnv?.CLAUDE_CONFIG_DIR?.trim() ||
+      this.runtimeSettings?.env?.CLAUDE_CONFIG_DIR?.trim() ||
       process.env.CLAUDE_CONFIG_DIR ||
       path.join(os.homedir(), ".claude");
     const candidates = [cwd];
