@@ -63,6 +63,19 @@ durably. If that retry is unsafe or the exact failure repeats, Paseo treats the 
 unresolved and rolls forward. Authentication, model-access, quota, and rate-limit failures remain
 visible instead of being treated as ownership conflicts.
 
+One narrowly bounded exception covers a Claude SDK failure observed after a saved native session has
+been resumed: a structured synthetic `model_not_found` before that resumed runtime has completed any
+successful turn. A fresh canary can still prove that the configured model is available while the
+saved native session remains poisoned and repeatedly emits the misleading model error. Paseo may
+roll that family forward once per native resume boundary. The classified failure kind is persisted
+with the predecessor, and the successor carries a durable attempt marker, so a daemon restart cannot
+infer recovery from transcript prose or turn a genuine entitlement failure into an unbounded chain
+of fresh sessions. The marker is not inherited after a later rollover for another reason. A fresh
+session rejection, a rejection after a successful resumed turn, and every other
+authentication/model/quota/rate-limit error remain visible. Live classification uses the SDK's
+structured `model_not_found` tag; provider text is preserved only for display and is never the
+authority for this rollover after restart.
+
 An unresolved prior request and a context overflow both use the same durable rollover transition:
 
 1. Mark the old native session as the read-only predecessor.

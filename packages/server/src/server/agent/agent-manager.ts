@@ -12,6 +12,7 @@ import {
   CONVERSATION_FAMILY_NAME_LABEL,
   CONVERSATION_FAMILY_POSITION_LABEL,
   CONVERSATION_FAMILY_PREDECESSOR_LABEL,
+  CONVERSATION_FAMILY_RESUME_MODEL_ROLLOVER_LABEL,
   getParentAgentIdFromLabels,
   hasOpenAgentTab,
   isDelegatedAgent,
@@ -140,11 +141,18 @@ function isEligibleConversationPredecessor(
   agentId: string,
   failureKind: ConversationRolloverFailureKind,
   latestError: string | null | undefined,
+  liveFailureKind: ConversationRolloverFailureKind | undefined,
 ): boolean {
   const currentFamilyMember = predecessor.labels?.[CONVERSATION_FAMILY_CURRENT_LABEL]?.trim();
+  const failureIsAuthoritative =
+    failureKind === "resume_model_unavailable"
+      ? liveFailureKind === failureKind || predecessor.lastFailureKind === failureKind
+      : isConversationRolloverFailureText(failureKind, latestError);
   return (
     (!currentFamilyMember || currentFamilyMember === agentId) &&
-    isConversationRolloverFailureText(failureKind, latestError)
+    (failureKind !== "resume_model_unavailable" ||
+      predecessor.labels?.[CONVERSATION_FAMILY_RESUME_MODEL_ROLLOVER_LABEL] !== "true") &&
+    failureIsAuthoritative
   );
 }
 
@@ -152,6 +160,7 @@ function buildConversationSuccessorMetadata(
   records: readonly StoredAgentRecord[],
   predecessor: StoredAgentRecord,
   successorId: string,
+  failureKind: ConversationRolloverFailureKind,
 ): { familyName: string; labels: Record<string, string> } {
   const familyId = predecessor.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim() || randomUUID();
   const familyMembers = records.filter(
@@ -170,7 +179,10 @@ function buildConversationSuccessorMetadata(
     "Conversation";
   const labels = Object.fromEntries(
     Object.entries(predecessor.labels ?? {}).filter(
-      ([label]) => label !== CONVERSATION_FAMILY_HIDDEN_LABEL && !isOpenAgentTabLabel(label),
+      ([label]) =>
+        label !== CONVERSATION_FAMILY_HIDDEN_LABEL &&
+        label !== CONVERSATION_FAMILY_RESUME_MODEL_ROLLOVER_LABEL &&
+        !isOpenAgentTabLabel(label),
     ),
   );
   Object.assign(labels, {
@@ -180,6 +192,9 @@ function buildConversationSuccessorMetadata(
     [CONVERSATION_FAMILY_POSITION_LABEL]: String(highestPosition + 1),
     [CONVERSATION_FAMILY_PREDECESSOR_LABEL]: predecessor.id,
   });
+  if (failureKind === "resume_model_unavailable") {
+    labels[CONVERSATION_FAMILY_RESUME_MODEL_ROLLOVER_LABEL] = "true";
+  }
   return { familyName, labels };
 }
 
@@ -456,6 +471,7 @@ interface ManagedAgentBase {
   activeTurnStartedAt: Date | null;
   lastUsage?: AgentUsage;
   lastError?: string;
+  lastFailureKind?: ConversationRolloverFailureKind;
   attention: AttentionState;
   foregroundTurnWaiters: Set<ForegroundTurnWaiter>;
   finalizedForegroundTurnIds: Set<string>;
@@ -790,7 +806,10 @@ export class AgentManager {
     this.mcpAuthToken = options?.mcpAuthToken ?? null;
     this.configurePaseoTools(options);
     this.appendSystemPrompt = options.appendSystemPrompt ?? "";
-    this.logger = options.logger.child({ module: "agent", component: "agent-manager" });
+    this.logger = options.logger.child({
+      module: "agent",
+      component: "agent-manager",
+    });
     this.rescueTimeouts = {
       reloadSessionCloseMs:
         options.rescueTimeouts?.reloadSessionCloseMs ?? RELOAD_SESSION_CLOSE_TIMEOUT_MS,
@@ -1161,7 +1180,9 @@ export class AgentManager {
   }
 
   async listDraftCommands(config: AgentSessionConfig): Promise<AgentSlashCommand[]> {
-    const normalizedConfig = await this.normalizeConfig(config, { resolveDefaultModel: false });
+    const normalizedConfig = await this.normalizeConfig(config, {
+      resolveDefaultModel: false,
+    });
     const client = this.requireClient(normalizedConfig.provider);
     if (!normalizedConfig.model) {
       return [];
@@ -1198,7 +1219,9 @@ export class AgentManager {
   }
 
   async listDraftFeatures(config: AgentSessionConfig): Promise<AgentFeature[]> {
-    const normalizedConfig = await this.normalizeConfig(config, { resolveDefaultModel: false });
+    const normalizedConfig = await this.normalizeConfig(config, {
+      resolveDefaultModel: false,
+    });
     const client = this.requireClient(normalizedConfig.provider);
     if (!normalizedConfig.model && !client.listFeatures) {
       return [];
@@ -1301,7 +1324,16 @@ export class AgentManager {
 
     const latestError =
       persistedFailureText ?? this.agents.get(agentId)?.lastError ?? predecessor.lastError;
-    if (!isEligibleConversationPredecessor(predecessor, agentId, failureKind, latestError)) {
+    const liveFailureKind = this.agents.get(agentId)?.lastFailureKind;
+    if (
+      !isEligibleConversationPredecessor(
+        predecessor,
+        agentId,
+        failureKind,
+        latestError,
+        liveFailureKind,
+      )
+    ) {
       return null;
     }
     const rows = await this.getConversationRolloverTimelineRows(agentId);
@@ -1322,6 +1354,7 @@ export class AgentManager {
       records,
       predecessor,
       successorId,
+      failureKind,
     );
 
     const successor = await this.createAgent(buildStoredAgentConfig(predecessor), successorId, {
@@ -1529,6 +1562,8 @@ export class AgentManager {
       labels?: Record<string, string>;
       workspaceId?: string;
       owner?: AgentOwner;
+      lastError?: string;
+      lastFailureKind?: ConversationRolloverFailureKind;
     },
     resumeOptions?: AgentResumeSessionOptions,
   ): Promise<ManagedAgent> {
@@ -1548,6 +1583,8 @@ export class AgentManager {
       labels?: Record<string, string>;
       workspaceId?: string;
       owner?: AgentOwner;
+      lastError?: string;
+      lastFailureKind?: ConversationRolloverFailureKind;
     },
     resumeOptions?: AgentResumeSessionOptions,
   ): Promise<ManagedAgent> {
@@ -1610,7 +1647,9 @@ export class AgentManager {
     const resolvedAgentId = validateAgentId(this.idFactory(), "importProviderSession");
     this.requireEnabledProvider(input.provider);
 
-    const client = await this.requireAvailableClient({ provider: input.provider });
+    const client = await this.requireAvailableClient({
+      provider: input.provider,
+    });
     if (!client.importSession) {
       throw new Error(`Provider '${input.provider}' does not support importing sessions`);
     }
@@ -1671,7 +1710,10 @@ export class AgentManager {
   reloadAgentSession(
     agentId: string,
     overrides?: Partial<AgentSessionConfig>,
-    options?: { rehydrateFromDisk?: boolean; broadcastProviderSubagentReset?: boolean },
+    options?: {
+      rehydrateFromDisk?: boolean;
+      broadcastProviderSubagentReset?: boolean;
+    },
   ): Promise<ManagedAgent> {
     return this.trackAgentRegistrationOperation(
       this.reloadAgentSessionInternal(agentId, overrides, options),
@@ -1681,7 +1723,10 @@ export class AgentManager {
   private async reloadAgentSessionInternal(
     agentId: string,
     overrides?: Partial<AgentSessionConfig>,
-    options?: { rehydrateFromDisk?: boolean; broadcastProviderSubagentReset?: boolean },
+    options?: {
+      rehydrateFromDisk?: boolean;
+      broadcastProviderSubagentReset?: boolean;
+    },
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     let existing = this.requireSessionAgent(agentId);
@@ -1693,6 +1738,7 @@ export class AgentManager {
     const preservedHistoryPrimed = existing.historyPrimed;
     const preservedLastUsage = existing.lastUsage;
     const preservedLastError = existing.lastError;
+    const preservedLastFailureKind = existing.lastFailureKind;
     const preservedAttention = existing.attention;
     const handle = existing.persistence;
     const provider = handle?.provider ?? existing.provider;
@@ -1746,6 +1792,7 @@ export class AgentManager {
         historyPrimed: rehydrateFromDisk ? false : preservedHistoryPrimed,
         lastUsage: preservedLastUsage,
         lastError: preservedLastError,
+        lastFailureKind: preservedLastFailureKind,
         attention: preservedAttention,
       });
     } finally {
@@ -1964,7 +2011,10 @@ export class AgentManager {
   private async markRecordArchived(record: StoredAgentRecord): Promise<ArchivedStoredAgentRecord> {
     const registry = this.requireRegistry();
     const archivedAt = new Date().toISOString();
-    const archivedRecord = buildArchivedAgentRecord(record, { archivedAt, updatedAt: archivedAt });
+    const archivedRecord = buildArchivedAgentRecord(record, {
+      archivedAt,
+      updatedAt: archivedAt,
+    });
 
     await registry.upsert(archivedRecord);
 
@@ -2028,6 +2078,7 @@ export class AgentManager {
         lastUserMessageAt: record.lastUserMessageAt ? new Date(record.lastUserMessageAt) : null,
         lastUsage: undefined,
         lastError: record.lastError ?? undefined,
+        lastFailureKind: record.lastFailureKind ?? undefined,
         attention: { requiresAttention: false },
         internal: record.internal,
         labels: record.labels,
@@ -2106,7 +2157,10 @@ export class AgentManager {
 
     await agent.session.setFeature(featureId, value);
     await this.drainSessionEvents(agentId);
-    agent.config.featureValues = { ...agent.config.featureValues, [featureId]: value };
+    agent.config.featureValues = {
+      ...agent.config.featureValues,
+      [featureId]: value,
+    };
     this.touchUpdatedAt(agent);
     this.emitState(agent);
   }
@@ -2147,7 +2201,9 @@ export class AgentManager {
       return { record, live: true };
     }
 
-    const nextRecord = await this.writeStoredMetadata(agentId, { labels: patch });
+    const nextRecord = await this.writeStoredMetadata(agentId, {
+      labels: patch,
+    });
     return { record: nextRecord, live: false };
   }
 
@@ -2433,7 +2489,9 @@ export class AgentManager {
         });
         return;
       }
-      this.dispatchStream(agent.id, event, { timestamp: new Date().toISOString() });
+      this.dispatchStream(agent.id, event, {
+        timestamp: new Date().toISOString(),
+      });
     };
     void (async () => {
       try {
@@ -2550,6 +2608,7 @@ export class AgentManager {
     const agent = existingAgent;
     const isReplacement = agent.pendingReplacement;
     agent.lastError = undefined;
+    agent.lastFailureKind = undefined;
 
     const pendingRun = this.runs.createPendingRun(agentId);
 
@@ -2687,7 +2746,10 @@ export class AgentManager {
     const persistenceHandle =
       mutableAgent.session.describePersistence() ??
       (mutableAgent.runtimeInfo?.sessionId
-        ? { provider: mutableAgent.provider, sessionId: mutableAgent.runtimeInfo.sessionId }
+        ? {
+            provider: mutableAgent.provider,
+            sessionId: mutableAgent.runtimeInfo.sessionId,
+          }
         : null);
     if (persistenceHandle) {
       mutableAgent.persistence = attachPersistenceCwd(persistenceHandle, mutableAgent.cwd);
@@ -3057,7 +3119,9 @@ export class AgentManager {
       const bufferedResolution = agent.bufferedPermissionResolutions.get(requestId);
       if (bufferedResolution) {
         agent.bufferedPermissionResolutions.delete(requestId);
-        this.dispatchStream(agent.id, bufferedResolution, { timestamp: new Date().toISOString() });
+        this.dispatchStream(agent.id, bufferedResolution, {
+          timestamp: new Date().toISOString(),
+        });
       }
 
       return result;
@@ -3218,7 +3282,10 @@ export class AgentManager {
         { agentId, provider: agent.provider, messageId, mode },
         "agent.rewind.start",
       );
-      await invokeRewindCapability(agent.session, { messageId: providerMessageId, mode });
+      await invokeRewindCapability(agent.session, {
+        messageId: providerMessageId,
+        mode,
+      });
       if (mode !== "files") {
         await this.hydrateTimelineFromProvider(agentId, {
           force: true,
@@ -3502,6 +3569,7 @@ export class AgentManager {
       historyPrimed?: boolean;
       lastUsage?: AgentUsage;
       lastError?: string;
+      lastFailureKind?: ConversationRolloverFailureKind;
       attention?: AttentionState;
       initialTitle?: string | null;
       publishWhenReady?: boolean;
@@ -3654,6 +3722,7 @@ export class AgentManager {
           historyPrimed?: boolean;
           lastUsage?: AgentUsage;
           lastError?: string;
+          lastFailureKind?: ConversationRolloverFailureKind;
           attention?: AttentionState;
           persistence?: AgentPersistenceHandle;
           workspaceId?: string;
@@ -3695,6 +3764,7 @@ export class AgentManager {
       lastUserMessageAt: options?.lastUserMessageAt ?? null,
       lastUsage: options?.lastUsage,
       lastError: options?.lastError,
+      lastFailureKind: options?.lastFailureKind,
       attention: resolveInitialAttention(options?.attention),
       internal: config.internal ?? false,
       labels: options?.labels ?? {},
@@ -4032,7 +4102,9 @@ export class AgentManager {
     this.agentStreamCoalescer.flushAndDiscard(agent.id);
     await this.deleteCommittedTimeline(agent.id);
     this.timelineStore.delete(agent.id);
-    this.timelineStore.initialize(agent.id, { timestamp: new Date().toISOString() });
+    this.timelineStore.initialize(agent.id, {
+      timestamp: new Date().toISOString(),
+    });
     agent.historyPrimed = true;
 
     for (const event of this.providerSubagents.deleteParent(agent.id)) {
@@ -4080,7 +4152,10 @@ export class AgentManager {
         const event = limitAgentStreamEventContent(rawEvent);
         if (event.type === "provider_subagent") {
           const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
-          const managerEvent: AgentManagerEvent = { type: "provider_subagent", event: update };
+          const managerEvent: AgentManagerEvent = {
+            type: "provider_subagent",
+            event: update,
+          };
           if (deferredBroadcast) {
             providerSubagentEvents.push(managerEvent);
           } else if (broadcast) {
@@ -4192,7 +4267,10 @@ export class AgentManager {
       );
     }
 
-    const flags: StreamEventFlags = { shouldDispatchEvent: true, shouldNotifyWaiters: true };
+    const flags: StreamEventFlags = {
+      shouldDispatchEvent: true,
+      shouldNotifyWaiters: true,
+    };
 
     const dispatchPromise = this.dispatchStreamEventByType({
       agent,
@@ -4216,7 +4294,9 @@ export class AgentManager {
       }
 
       if (flags.shouldDispatchEvent) {
-        this.dispatchStream(agent.id, event, { timestamp: new Date().toISOString() });
+        this.dispatchStream(agent.id, event, {
+          timestamp: new Date().toISOString(),
+        });
       }
     }
 
@@ -4339,7 +4419,10 @@ export class AgentManager {
         agent.currentModeId = event.currentModeId;
         agent.availableModes = event.availableModes;
         if (agent.runtimeInfo) {
-          agent.runtimeInfo = { ...agent.runtimeInfo, modeId: event.currentModeId };
+          agent.runtimeInfo = {
+            ...agent.runtimeInfo,
+            modeId: event.currentModeId,
+          };
         }
         flags.shouldDispatchEvent = false;
         this.emitState(agent);
@@ -4348,7 +4431,10 @@ export class AgentManager {
         agent.runtimeInfo = event.runtimeInfo;
         if (!agent.persistence && event.runtimeInfo.sessionId) {
           agent.persistence = attachPersistenceCwd(
-            { provider: agent.provider, sessionId: event.runtimeInfo.sessionId },
+            {
+              provider: agent.provider,
+              sessionId: event.runtimeInfo.sessionId,
+            },
             agent.cwd,
           );
         }
@@ -4398,7 +4484,12 @@ export class AgentManager {
         });
         return undefined;
       case "turn_started":
-        this.onStreamTurnStarted({ agent, eventTurnId, isForegroundEvent, flags });
+        this.onStreamTurnStarted({
+          agent,
+          eventTurnId,
+          isForegroundEvent,
+          flags,
+        });
         return undefined;
       case "permission_requested":
         this.onStreamPermissionRequested(agent, event);
@@ -4494,6 +4585,7 @@ export class AgentManager {
     // data accumulated during streaming isn't lost when the provider omits
     // it from the completion event.
     agent.lastError = undefined;
+    agent.lastFailureKind = undefined;
     if (
       !isForegroundEvent &&
       !agent.activeForegroundTurnId &&
@@ -4535,6 +4627,9 @@ export class AgentManager {
       agent.lifecycle = "error";
     }
     agent.lastError = event.error;
+    agent.lastFailureKind = isConversationRolloverFailureKind(event.failureKind)
+      ? event.failureKind
+      : undefined;
     await this.appendSystemErrorTimelineMessage(
       agent,
       event.provider,
@@ -4577,6 +4672,7 @@ export class AgentManager {
       agent.lifecycle = "idle";
     }
     agent.lastError = undefined;
+    agent.lastFailureKind = undefined;
     this.resolvePendingPermissionsForAgent(agent, event.provider, options, "Interrupted");
     if (!isForegroundEvent && !agent.activeForegroundTurnId) {
       this.emitState(agent);
@@ -4705,7 +4801,11 @@ export class AgentManager {
     agent: ActiveManagedAgent,
     prompt: AgentPromptInput,
     clientMessageId: string,
-    options?: { messageId?: string; providerMessageId?: string; turnId?: string },
+    options?: {
+      messageId?: string;
+      providerMessageId?: string;
+      turnId?: string;
+    },
   ): void {
     if (this.timelineStore.getSubmittedUserMessage(agent.id, clientMessageId)) {
       return;
@@ -5224,7 +5324,9 @@ export class AgentManager {
       client.capabilities.supportsNativePaseoTools &&
       this.paseoToolCatalogFactory
     ) {
-      context.paseoTools = await this.paseoToolCatalogFactory({ callerAgentId: agentId });
+      context.paseoTools = await this.paseoToolCatalogFactory({
+        callerAgentId: agentId,
+      });
     }
     return context;
   }
@@ -5241,9 +5343,9 @@ export class AgentManager {
     if (!client) {
       const configuredProviders = this.getConfiguredProviderIds();
       throw new Error(
-        `Unknown provider '${options.provider}'. Configured providers: ${formatProviderList(
-          configuredProviders,
-        )}.`,
+        `Unknown provider '${
+          options.provider
+        }'. Configured providers: ${formatProviderList(configuredProviders)}.`,
       );
     }
 

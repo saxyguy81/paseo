@@ -382,7 +382,7 @@ export type AgentStreamEvent =
       type: "turn_failed";
       provider: AgentProvider;
       error: string;
-      failureKind?: "context_overflow" | "conversation_unresolved";
+      failureKind?: "context_overflow" | "conversation_unresolved" | "resume_model_unavailable";
       code?: string;
       diagnostic?: string;
       turnId?: string;

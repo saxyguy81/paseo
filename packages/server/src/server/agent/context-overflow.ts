@@ -1,6 +1,9 @@
 import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
 
-export type ConversationRolloverFailureKind = "context_overflow" | "conversation_unresolved";
+export type ConversationRolloverFailureKind =
+  | "context_overflow"
+  | "conversation_unresolved"
+  | "resume_model_unavailable";
 
 /** Return true only for provider failures that mean the current context is exhausted. */
 export function isContextOverflowFailureText(value: unknown): value is string {
@@ -21,19 +24,37 @@ export function isConversationUnresolvedFailureText(value: unknown): value is st
   );
 }
 
+/**
+ * Recognize the canonical text persisted after Claude's structured
+ * `model_not_found` SDK error. Live classification uses the structured tag;
+ * this predicate exists only so a terminal failure survives daemon hydration.
+ */
+export function isResumeModelUnavailableFailureText(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^There(?:'|’)s an issue with the selected model \(.+\)\. It may not exist or you may not have access to it\. Run --model to pick a different model\.$/i.test(
+      value.trim(),
+    )
+  );
+}
+
 export function isConversationRolloverFailureKind(
   value: unknown,
 ): value is ConversationRolloverFailureKind {
-  return value === "context_overflow" || value === "conversation_unresolved";
+  return (
+    value === "context_overflow" ||
+    value === "conversation_unresolved" ||
+    value === "resume_model_unavailable"
+  );
 }
 
 export function isConversationRolloverFailureText(
   kind: ConversationRolloverFailureKind,
   value: unknown,
 ): value is string {
-  return kind === "context_overflow"
-    ? isContextOverflowFailureText(value)
-    : isConversationUnresolvedFailureText(value);
+  if (kind === "context_overflow") return isContextOverflowFailureText(value);
+  if (kind === "conversation_unresolved") return isConversationUnresolvedFailureText(value);
+  return isResumeModelUnavailableFailureText(value);
 }
 
 export interface TerminalConversationRolloverFailure {
@@ -71,6 +92,9 @@ export function readTerminalConversationRolloverFailure(
   }
   if (isConversationUnresolvedFailureText(text)) {
     return { kind: "conversation_unresolved", text };
+  }
+  if (isResumeModelUnavailableFailureText(text)) {
+    return { kind: "resume_model_unavailable", text };
   }
   return null;
 }

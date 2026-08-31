@@ -10,6 +10,7 @@ import { asInternals } from "../../../test-utils/class-mocks.js";
 import {
   ClaudeAgentClient,
   readClaudeContextOverflowError,
+  readClaudeResumeModelUnavailableError,
   readClaudeUnresolvedTurnError,
   readEventIdentifiers,
   readRetryableClaudeApiError,
@@ -268,6 +269,41 @@ test("recognizes only retryable synthetic Claude API failures", () => {
   ).toBeNull();
 });
 
+test("recognizes resumed-session model rejection from the structured SDK tag only", () => {
+  const text =
+    "There's an issue with the selected model (claude-opus-5). It may not exist or you may not have access to it. Run --model to pick a different model.";
+  expect(
+    readClaudeResumeModelUnavailableError({
+      type: "assistant",
+      error: "model_not_found",
+      isApiErrorMessage: true,
+      message: { role: "assistant", content: [{ type: "text", text }] },
+    }),
+  ).toBe(text);
+  expect(
+    readClaudeResumeModelUnavailableError({
+      type: "assistant",
+      error: "rate_limit",
+      isApiErrorMessage: true,
+      message: { role: "assistant", content: [{ type: "text", text }] },
+    }),
+  ).toBeNull();
+  expect(
+    readClaudeResumeModelUnavailableError({
+      type: "assistant",
+      error: "model_not_found",
+      isApiErrorMessage: true,
+      message: { role: "assistant", content: [] },
+    }),
+  ).toBe("Claude rejected the selected model for this resumed native session.");
+  expect(
+    readClaudeResumeModelUnavailableError({
+      type: "assistant",
+      message: { role: "assistant", content: [{ type: "text", text }] },
+    }),
+  ).toBeNull();
+});
+
 test("classifies Claude context overflow without treating it as a same-session retry", () => {
   const apiError = (text: string) => ({
     type: "assistant",
@@ -440,6 +476,175 @@ test("classifies an unresolved prior turn for fresh-session rollover without ret
   }
 });
 
+test.each([
+  { name: "resumed", resumed: true, expectedKind: "resume_model_unavailable" },
+  { name: "fresh", resumed: false, expectedKind: undefined },
+])(
+  "$name session handles a structured model_not_found without masking genuine fresh-session access failures",
+  async ({ resumed, expectedKind }) => {
+    const text =
+      "There's an issue with the selected model (claude-opus-5). It may not exist or you may not have access to it. Run --model to pick a different model.";
+    let step = 0;
+    sdkQueryFactory.mockImplementation(() =>
+      createBaseQueryMock(
+        vi.fn(async () => {
+          if (step === 0) {
+            step += 1;
+            return {
+              done: false,
+              value: {
+                type: "system",
+                subtype: "init",
+                session_id: "model-unavailable-session",
+                permissionMode: "bypassPermissions",
+                model: "claude-opus-5",
+              },
+            };
+          }
+          if (step === 1) {
+            step += 1;
+            return {
+              done: false,
+              value: {
+                type: "assistant",
+                uuid: "model-unavailable-error",
+                session_id: "model-unavailable-session",
+                error: "model_not_found",
+                isApiErrorMessage: true,
+                message: {
+                  role: "assistant",
+                  content: [{ type: "text", text }],
+                },
+              },
+            };
+          }
+          if (step === 2) {
+            step += 1;
+            return {
+              done: false,
+              value: {
+                type: "result",
+                subtype: "error_during_execution",
+                uuid: "model-unavailable-result",
+                session_id: "model-unavailable-session",
+                usage: buildUsage(),
+                errors: ["Claude run failed"],
+                total_cost_usd: 0,
+              },
+            };
+          }
+          return { done: true, value: undefined };
+        }),
+      ),
+    );
+
+    const session = resumed
+      ? await createResumedSession("persisted-model-unavailable-session")
+      : await createSession();
+    try {
+      const events = await collectUntilTerminal(streamSession(session, "continue the review"));
+      const failure = events.find((event) => event.type === "turn_failed");
+      expect(failure).toMatchObject({
+        type: "turn_failed",
+        error: resumed ? text : "Claude run failed",
+      });
+      expect(failure?.failureKind).toBe(expectedKind);
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "timeline",
+          item: expect.objectContaining({ type: "assistant_message", text }),
+        }),
+      );
+    } finally {
+      await session.close();
+    }
+  },
+);
+
+test("a successful post-resume turn disables model-not-found rollover for later turns", async () => {
+  const text =
+    "There's an issue with the selected model (claude-opus-5). It may not exist or you may not have access to it. Run --model to pick a different model.";
+  let step = 0;
+  sdkQueryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    const prompts = prompt[Symbol.asyncIterator]();
+    return createBaseQueryMock(
+      vi.fn(async () => {
+        const sequence = [
+          {
+            type: "system",
+            subtype: "init",
+            session_id: "post-resume-success-session",
+            permissionMode: "bypassPermissions",
+            model: "claude-opus-5",
+          },
+          {
+            type: "assistant",
+            uuid: "post-resume-success-assistant",
+            session_id: "post-resume-success-session",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "First turn complete" }],
+            },
+          },
+          {
+            type: "result",
+            subtype: "success",
+            uuid: "post-resume-success-result",
+            session_id: "post-resume-success-session",
+            usage: buildUsage(),
+            result: "First turn complete",
+            total_cost_usd: 0,
+          },
+          {
+            type: "assistant",
+            uuid: "post-resume-later-model-error",
+            session_id: "post-resume-success-session",
+            error: "model_not_found",
+            isApiErrorMessage: true,
+            message: { role: "assistant", content: [{ type: "text", text }] },
+          },
+          {
+            type: "result",
+            subtype: "error_during_execution",
+            uuid: "post-resume-later-model-result",
+            session_id: "post-resume-success-session",
+            usage: buildUsage(),
+            errors: ["Claude run failed"],
+            total_cost_usd: 0,
+          },
+        ];
+        if (step === 1 || step === 3) {
+          const nextPrompt = await prompts.next();
+          if (nextPrompt.done) return { done: true, value: undefined };
+        }
+        const value = sequence[step++];
+        return value ? { done: false, value } : { done: true, value: undefined };
+      }),
+    );
+  });
+
+  const session = await createResumedSession("persisted-post-resume-success-session");
+  try {
+    const first = await collectUntilTerminal(streamSession(session, "first turn"));
+    expect(first.at(-1)?.type).toBe("turn_completed");
+    const second = await collectUntilTerminal(streamSession(session, "second turn"));
+    const failure = second.find((event) => event.type === "turn_failed");
+    expect(failure).toMatchObject({
+      type: "turn_failed",
+      error: "Claude run failed",
+    });
+    expect(failure?.failureKind).toBeUndefined();
+    expect(second).toContainEqual(
+      expect.objectContaining({
+        type: "timeline",
+        item: expect.objectContaining({ type: "assistant_message", text }),
+      }),
+    );
+  } finally {
+    await session.close();
+  }
+});
+
 test("keeps context overflow classified after an AskUserQuestion response", async () => {
   let canUseTool:
     | ((
@@ -476,7 +681,12 @@ test("keeps context overflow classified after an AskUserQuestion response", asyn
                   {
                     question: "Which implementation should I use?",
                     header: "Choice",
-                    options: [{ label: "Bounded rollover", description: "Use a new session" }],
+                    options: [
+                      {
+                        label: "Bounded rollover",
+                        description: "Use a new session",
+                      },
+                    ],
                     multiSelect: false,
                   },
                 ],
@@ -732,7 +942,10 @@ test("retries continuation matching once, then requires a fresh native session",
               value: {
                 type: "assistant",
                 isApiErrorMessage: true,
-                message: { role: "assistant", content: [{ type: "text", text: errorText }] },
+                message: {
+                  role: "assistant",
+                  content: [{ type: "text", text: errorText }],
+                },
               },
             };
           }
@@ -753,7 +966,10 @@ test("retries continuation matching once, then requires a fresh native session",
             value: {
               type: "assistant",
               isApiErrorMessage: true,
-              message: { role: "assistant", content: [{ type: "text", text: errorText }] },
+              message: {
+                role: "assistant",
+                content: [{ type: "text", text: errorText }],
+              },
             },
           };
         }
@@ -850,7 +1066,10 @@ test("does not reuse a recovered continuation error for a later unrelated failur
             done: false,
             value: {
               type: "assistant",
-              message: { role: "assistant", content: "the retry recovered and did work" },
+              message: {
+                role: "assistant",
+                content: "the retry recovered and did work",
+              },
             },
           };
         }
@@ -942,7 +1161,10 @@ test("continues once on the same query after a transient post-work API failure",
             value: {
               type: "assistant",
               uuid: "post-work-assistant",
-              message: { role: "assistant", content: "I changed the implementation." },
+              message: {
+                role: "assistant",
+                content: "I changed the implementation.",
+              },
             },
           };
         }
@@ -956,7 +1178,12 @@ test("continues once on the same query after a transient post-work API failure",
               isApiErrorMessage: true,
               message: {
                 role: "assistant",
-                content: [{ type: "text", text: "API Error: The operation timed out." }],
+                content: [
+                  {
+                    type: "text",
+                    text: "API Error: The operation timed out.",
+                  },
+                ],
               },
             },
           };
@@ -983,7 +1210,10 @@ test("continues once on the same query after a transient post-work API failure",
             value: {
               type: "assistant",
               uuid: "post-work-recovered-assistant",
-              message: { role: "assistant", content: "I finished the remaining work." },
+              message: {
+                role: "assistant",
+                content: "I finished the remaining work.",
+              },
             },
           };
         }
@@ -1071,7 +1301,10 @@ test("stops after one post-work continuation when the transient API failure repe
             value: {
               type: "assistant",
               uuid: "repeat-work",
-              message: { role: "assistant", content: "I completed one step." },
+              message: {
+                role: "assistant",
+                content: "I completed one step.",
+              },
             },
           };
         }
@@ -1086,7 +1319,12 @@ test("stops after one post-work continuation when the transient API failure repe
               isApiErrorMessage: true,
               message: {
                 role: "assistant",
-                content: [{ type: "text", text: "API Error: The operation timed out." }],
+                content: [
+                  {
+                    type: "text",
+                    text: "API Error: The operation timed out.",
+                  },
+                ],
               },
             },
           };
@@ -1183,7 +1421,10 @@ test("preserves a post-work continuation error when its durable recovery claim f
             value: {
               type: "assistant",
               uuid: "post-work-progress",
-              message: { role: "assistant", content: "I completed one step." },
+              message: {
+                role: "assistant",
+                content: "I completed one step.",
+              },
             },
           };
         }
@@ -1195,7 +1436,10 @@ test("preserves a post-work continuation error when its durable recovery claim f
               type: "assistant",
               uuid: errorUuid,
               isApiErrorMessage: true,
-              message: { role: "assistant", content: [{ type: "text", text: errorText }] },
+              message: {
+                role: "assistant",
+                content: [{ type: "text", text: errorText }],
+              },
             },
           };
         }
@@ -1266,7 +1510,14 @@ test("does not continue a post-work API failure while a tool call is still open"
               uuid: "open-tool-assistant",
               message: {
                 role: "assistant",
-                content: [{ type: "tool_use", id: "tool-still-open", name: "Bash", input: {} }],
+                content: [
+                  {
+                    type: "tool_use",
+                    id: "tool-still-open",
+                    name: "Bash",
+                    input: {},
+                  },
+                ],
               },
             },
           };
@@ -1281,7 +1532,12 @@ test("does not continue a post-work API failure while a tool call is still open"
               isApiErrorMessage: true,
               message: {
                 role: "assistant",
-                content: [{ type: "text", text: "API Error: The operation timed out." }],
+                content: [
+                  {
+                    type: "text",
+                    text: "API Error: The operation timed out.",
+                  },
+                ],
               },
             },
           };
@@ -1377,7 +1633,12 @@ test("does not continue a post-work API failure while permission is pending", as
                 isApiErrorMessage: true,
                 message: {
                   role: "assistant",
-                  content: [{ type: "text", text: "API Error: The operation timed out." }],
+                  content: [
+                    {
+                      type: "text",
+                      text: "API Error: The operation timed out.",
+                    },
+                  ],
                 },
               },
             };
@@ -1474,7 +1735,12 @@ test("does not continue a post-work API failure while a sidechain is active", as
               isApiErrorMessage: true,
               message: {
                 role: "assistant",
-                content: [{ type: "text", text: "API Error: The operation timed out." }],
+                content: [
+                  {
+                    type: "text",
+                    text: "API Error: The operation timed out.",
+                  },
+                ],
               },
             },
           };
@@ -1547,7 +1813,10 @@ test("does not duplicate a claimed post-work continuation after session recreati
             value: {
               type: "assistant",
               uuid: `durable-work-${thisQuery}`,
-              message: { role: "assistant", content: "I completed one step." },
+              message: {
+                role: "assistant",
+                content: "I completed one step.",
+              },
             },
           };
         }
@@ -1561,7 +1830,12 @@ test("does not duplicate a claimed post-work continuation after session recreati
               isApiErrorMessage: true,
               message: {
                 role: "assistant",
-                content: [{ type: "text", text: "API Error: The operation timed out." }],
+                content: [
+                  {
+                    type: "text",
+                    text: "API Error: The operation timed out.",
+                  },
+                ],
               },
             },
           };
@@ -1588,7 +1862,10 @@ test("does not duplicate a claimed post-work continuation after session recreati
             value: {
               type: "assistant",
               uuid: "durable-recovered-assistant",
-              message: { role: "assistant", content: "Finished after recovery." },
+              message: {
+                role: "assistant",
+                content: "Finished after recovery.",
+              },
             },
           };
         }
@@ -2624,6 +2901,48 @@ test("reuses one autonomous run for unbound stream_event bursts with no foregrou
   await session.close();
 });
 
+test("an autonomous success disables model-not-found rollover for a resumed session", async () => {
+  const session = await createResumedSession("persisted-autonomous-success-session");
+  const internal: {
+    turnState: "idle" | "foreground" | "autonomous";
+    routeSdkMessageFromPump: (
+      message: Record<string, unknown>,
+      activeQuery: QueryMock,
+    ) => Promise<void>;
+    autonomousTurn: { id: string } | null;
+    resumeModelUnavailableRolloverEligible: boolean;
+  } = asInternals(session);
+  const queryMock = createBaseQueryMock(vi.fn(async () => ({ done: true, value: undefined })));
+
+  expect(internal.resumeModelUnavailableRolloverEligible).toBe(true);
+  internal.turnState = "idle";
+  await internal.routeSdkMessageFromPump(
+    {
+      type: "stream_event",
+      event: {
+        type: "content_block_delta",
+        delta: { type: "text_delta", text: "Recovered autonomously." },
+      },
+    },
+    queryMock,
+  );
+  expect(internal.autonomousTurn).not.toBeNull();
+
+  await internal.routeSdkMessageFromPump(
+    {
+      type: "result",
+      subtype: "success",
+      usage: buildUsage(),
+      total_cost_usd: 0,
+    },
+    queryMock,
+  );
+  expect(internal.autonomousTurn).toBeNull();
+  expect(internal.resumeModelUnavailableRolloverEligible).toBe(false);
+
+  await session.close();
+});
+
 test("tracks run lifecycle transitions for success, error, and interrupt", async () => {
   const session = await createSession();
   let streamCase: "success" | "error" | "interrupt" = "success";
@@ -2799,7 +3118,11 @@ test("assembles assistant timeline when message_delta arrives before message_sta
               type: "stream_event",
               event: {
                 type: "message_start",
-                message: { id: "message-1", role: "assistant", model: "opus" },
+                message: {
+                  id: "message-1",
+                  role: "assistant",
+                  model: "opus",
+                },
               },
             },
           };

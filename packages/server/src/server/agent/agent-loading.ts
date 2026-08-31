@@ -69,7 +69,8 @@ export async function reconcileStoredConversationContinuations(deps: {
       record.internal ||
       (record.lastStatus !== "error" &&
         !isContextOverflowFailureText(record.lastError) &&
-        !isConversationUnresolvedFailureText(record.lastError))
+        !isConversationUnresolvedFailureText(record.lastError) &&
+        record.lastFailureKind !== "resume_model_unavailable")
     ) {
       return false;
     }
@@ -88,16 +89,32 @@ export async function reconcileStoredConversationContinuations(deps: {
       const hydratedFailure = readTerminalConversationRolloverFailure(
         await deps.agentManager.getTimelineRows(predecessor.id),
       );
+      const corroboratedHydratedFailure =
+        hydratedFailure?.kind !== "resume_model_unavailable" ||
+        predecessor.lastFailureKind === "resume_model_unavailable"
+          ? hydratedFailure
+          : null;
       let storedFailure: TerminalConversationRolloverFailure | null = null;
       if (isContextOverflowFailureText(predecessor.lastError)) {
-        storedFailure = { kind: "context_overflow", text: predecessor.lastError };
+        storedFailure = {
+          kind: "context_overflow",
+          text: predecessor.lastError,
+        };
       } else if (isConversationUnresolvedFailureText(predecessor.lastError)) {
         storedFailure = {
           kind: "conversation_unresolved",
           text: predecessor.lastError,
         };
+      } else if (
+        predecessor.lastFailureKind === "resume_model_unavailable" &&
+        typeof predecessor.lastError === "string"
+      ) {
+        storedFailure = {
+          kind: "resume_model_unavailable",
+          text: predecessor.lastError,
+        };
       }
-      const failure = hydratedFailure ?? storedFailure;
+      const failure = corroboratedHydratedFailure ?? storedFailure;
       if (!failure) continue;
       const successorId = await deps.agentManager.ensureAgentFailureContinuation(
         predecessor.id,
@@ -215,7 +232,10 @@ export async function ensureAgentLoaded(
     return deps.agentManager.getAgent(agentId) ?? snapshot;
   })();
 
-  const pending: PendingAgentInitialization = { promise: initPromise, options: pendingOptions };
+  const pending: PendingAgentInitialization = {
+    promise: initPromise,
+    options: pendingOptions,
+  };
   pendingAgentInitializations.set(agentId, pending);
 
   try {

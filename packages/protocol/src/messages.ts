@@ -745,7 +745,9 @@ export const AgentStreamEventPayloadSchema = z.discriminatedUnion("type", [
     provider: AgentProviderSchema,
     turnId: z.string().optional(),
     error: z.string(),
-    failureKind: z.enum(["context_overflow", "conversation_unresolved"]).optional(),
+    failureKind: z
+      .enum(["context_overflow", "conversation_unresolved", "resume_model_unavailable"])
+      .optional(),
     code: z.string().optional(),
     diagnostic: z.string().optional(),
   }),

@@ -74,4 +74,15 @@ describe("readTerminalConversationRolloverFailure", () => {
       text: "API Error: 503 Continuation matching is temporarily unavailable. This is a server-side issue, usually temporary.",
     });
   });
+
+  test("rehydrates a terminal resumed-session model rejection as its own failure kind", () => {
+    const text =
+      "There's an issue with the selected model (claude-opus-5). It may not exist or you may not have access to it. Run --model to pick a different model.";
+    expect(
+      readTerminalConversationRolloverFailure(rows({ type: "assistant_message", text })),
+    ).toEqual({
+      kind: "resume_model_unavailable",
+      text,
+    });
+  });
 });

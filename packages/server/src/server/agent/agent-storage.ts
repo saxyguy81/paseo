@@ -20,7 +20,13 @@ const SERIALIZABLE_CONFIG_SCHEMA = z
     toolPolicy: z
       .object({
         preapproved: z.array(
-          z.object({ kind: z.literal("mcp"), server: z.string(), tool: z.string() }).strict(),
+          z
+            .object({
+              kind: z.literal("mcp"),
+              server: z.string(),
+              tool: z.string(),
+            })
+            .strict(),
         ),
       })
       .strict()
@@ -84,6 +90,10 @@ const STORED_AGENT_SCHEMA = z.object({
   features: z.array(AgentFeatureSchema).optional(),
   persistence: PERSISTENCE_HANDLE_SCHEMA,
   lastError: z.string().nullable().optional(),
+  lastFailureKind: z
+    .enum(["context_overflow", "conversation_unresolved", "resume_model_unavailable"])
+    .nullable()
+    .optional(),
   requiresAttention: z.boolean().optional(),
   attentionReason: z.enum(["finished", "error", "permission"]).nullable().optional(),
   attentionTimestamp: z.string().nullable().optional(),

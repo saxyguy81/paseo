@@ -46,6 +46,7 @@ import { parsePartialJsonObject } from "./partial-json.js";
 import { ClaudeSidechainTracker } from "./sidechain-tracker.js";
 import { ClaudeTaskState } from "./task-state.js";
 import {
+  type ConversationRolloverFailureKind,
   isContextOverflowFailureText,
   isConversationUnresolvedFailureText,
 } from "../../context-overflow.js";
@@ -380,7 +381,10 @@ function toStableClaudeUserMessageUuid(stableMessageId?: string): SDKUserMessage
   if (UUID_PATTERN.test(stableId)) return stableId as SDKUserMessage["uuid"];
 
   const digest = createHash("sha256").update(stableId).digest("hex");
-  return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-5${digest.slice(13, 16)}-a${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
+  return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-5${digest.slice(
+    13,
+    16,
+  )}-a${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
 }
 
 interface SlashCommandInvocation {
@@ -587,6 +591,27 @@ function readClaudeApiErrorText(message: unknown): string | null {
     return null;
   }
   return text;
+}
+
+/**
+ * Read Claude's structured synthetic model rejection. The text is retained for
+ * the timeline, but it is never used to decide whether a live message belongs
+ * to this failure class.
+ */
+export function readClaudeResumeModelUnavailableError(message: unknown): string | null {
+  const record = toObjectRecord(message);
+  if (
+    record?.type !== "assistant" ||
+    record.error !== "model_not_found" ||
+    !isClaudeApiErrorMessage(record)
+  ) {
+    return null;
+  }
+  const assistantMessage = toObjectRecord(record.message);
+  return (
+    collectClaudeTextContentParts(assistantMessage?.content).join("\n").trim() ||
+    "Claude rejected the selected model for this resumed native session."
+  );
 }
 
 /** Returns a terminal ambiguity that requires a fresh native Claude session. */
@@ -1061,7 +1086,9 @@ function assertClaudeAutoModeEligible(mode: PermissionMode, env: NodeJS.ProcessE
     return;
   }
   throw new Error(
-    `Claude Auto mode requires the Anthropic API and is not supported when Claude Code uses ${transport}. Select another permission mode or unset the ${transport === "Bedrock" ? "CLAUDE_CODE_USE_BEDROCK" : "CLAUDE_CODE_USE_VERTEX"} environment variable.`,
+    `Claude Auto mode requires the Anthropic API and is not supported when Claude Code uses ${transport}. Select another permission mode or unset the ${
+      transport === "Bedrock" ? "CLAUDE_CODE_USE_BEDROCK" : "CLAUDE_CODE_USE_VERTEX"
+    } environment variable.`,
   );
 }
 
@@ -1411,7 +1438,11 @@ class TimelineAssembler {
       !isClaudeTranscriptNoiseText(nextAssistantText)
     ) {
       state.emittedAssistantLength = state.assistantText.length;
-      items.push({ type: "assistant_message", text: nextAssistantText, messageId: state.id });
+      items.push({
+        type: "assistant_message",
+        text: nextAssistantText,
+        messageId: state.id,
+      });
     }
 
     const nextReasoningText = state.reasoningText.slice(state.emittedReasoningLength);
@@ -1690,7 +1721,10 @@ export class ClaudeAgentClient implements AgentClient {
       getClaudeModelsWithSettings(this.logger, this.configDir, claudeCodeVersion),
     );
     const modes = detectIneligibleAutoModeTransport(
-      createProviderEnv({ baseEnv: process.env, runtimeSettings: this.runtimeSettings }),
+      createProviderEnv({
+        baseEnv: process.env,
+        runtimeSettings: this.runtimeSettings,
+      }),
     )
       ? DEFAULT_MODES.filter((mode) => mode.id !== "auto")
       : DEFAULT_MODES;
@@ -2210,7 +2244,12 @@ class ClaudeAgentSession implements AgentSession {
   private foregroundHasProviderActivity = false;
   private foregroundApiRecoveryAttempts = 0;
   private pendingPostWorkApiRecovery: PendingPostWorkApiRecovery | null = null;
-  private pendingConversationRolloverError: string | null = null;
+  private pendingConversationRolloverFailure: {
+    kind: ConversationRolloverFailureKind;
+    error: string;
+  } | null = null;
+  /** True only until a resumed runtime completes its first successful turn. */
+  private resumeModelUnavailableRolloverEligible: boolean;
   private readonly contextUsage: ClaudeContextUsageState;
   private userMessageIds: string[] = [];
   private readonly emittedUserMessageIds = new Set<string>();
@@ -2234,6 +2273,7 @@ class ClaudeAgentSession implements AgentSession {
       findClaudeModel(this.config.model)?.contextWindowMaxTokens,
     );
     const handle = options.handle;
+    this.resumeModelUnavailableRolloverEligible = Boolean(handle);
 
     if (handle) {
       if (!handle.sessionId) {
@@ -2352,7 +2392,7 @@ class ClaudeAgentSession implements AgentSession {
     this.foregroundHasProviderActivity = false;
     this.foregroundApiRecoveryAttempts = 0;
     this.pendingPostWorkApiRecovery = null;
-    this.pendingConversationRolloverError = null;
+    this.pendingConversationRolloverFailure = null;
     this.contextUsage.beginTurn();
     this.transitionTurnState("foreground", "foreground turn started");
     this.clearRecentStderr();
@@ -3365,13 +3405,25 @@ class ClaudeAgentSession implements AgentSession {
         : undefined;
     assertClaudeThinkingOptionSupported(this.config.model, thinkingOptionId);
     if (thinkingOptionId === CLAUDE_DISABLED_THINKING_OPTION_ID) {
-      return { thinking: { type: "disabled" }, effort: undefined, ultracode: false };
+      return {
+        thinking: { type: "disabled" },
+        effort: undefined,
+        ultracode: false,
+      };
     }
     if (thinkingOptionId === CLAUDE_ULTRACODE_THINKING_OPTION_ID) {
-      return { thinking: { type: "adaptive" }, effort: "xhigh", ultracode: true };
+      return {
+        thinking: { type: "adaptive" },
+        effort: "xhigh",
+        ultracode: true,
+      };
     }
     if (thinkingOptionId && isClaudeThinkingEffort(thinkingOptionId)) {
-      return { thinking: { type: "adaptive" }, effort: thinkingOptionId, ultracode: false };
+      return {
+        thinking: { type: "adaptive" },
+        effort: thinkingOptionId,
+        ultracode: false,
+      };
     }
     return { thinking: undefined, effort: undefined, ultracode: false };
   }
@@ -3397,7 +3449,9 @@ class ClaudeAgentSession implements AgentSession {
       this.config.providerOptions,
       this.config.toolPolicy,
     );
-    const settingsOptions = this.buildSettingsOptions(providerOptions, { ultracode });
+    const settingsOptions = this.buildSettingsOptions(providerOptions, {
+      ultracode,
+    });
     const sdkEnv = this.buildSdkEnv();
     assertClaudeAutoModeEligible(this.currentMode, sdkEnv);
 
@@ -3539,7 +3593,10 @@ class ClaudeAgentSession implements AgentSession {
             });
           }
         } else {
-          content.push({ type: "text", text: renderPromptAttachmentAsText(chunk) });
+          content.push({
+            type: "text",
+            text: renderPromptAttachmentAsText(chunk),
+          });
         }
       }
     } else {
@@ -3588,15 +3645,16 @@ class ClaudeAgentSession implements AgentSession {
 
   private buildTurnFailedEvent(
     errorMessage: string,
+    capturedKind?: ConversationRolloverFailureKind,
   ): Extract<AgentStreamEvent, { type: "turn_failed" }> {
     const normalized = errorMessage.trim() || "Claude run failed";
     const exitCodeMatch = normalized.match(/\bcode\s+(\d+)\b/i);
     const code = exitCodeMatch ? exitCodeMatch[1] : undefined;
     const diagnostic = this.getRecentStderrDiagnostic();
-    let failureKind: "context_overflow" | "conversation_unresolved" | undefined;
-    if (readClaudeContextOverflowError(normalized)) {
+    let failureKind: ConversationRolloverFailureKind | undefined = capturedKind;
+    if (!failureKind && readClaudeContextOverflowError(normalized)) {
       failureKind = "context_overflow";
-    } else if (isConversationUnresolvedFailureText(normalized)) {
+    } else if (!failureKind && isConversationUnresolvedFailureText(normalized)) {
       failureKind = "conversation_unresolved";
     }
     return {
@@ -3719,6 +3777,9 @@ class ClaudeAgentSession implements AgentSession {
       this.flushPendingToolCalls();
     }
     this.notifySubscribers(event);
+    if (event.type === "turn_completed") {
+      this.resumeModelUnavailableRolloverEligible = false;
+    }
     this.activeForegroundTurnId = null;
     this.activeForegroundQuery = null;
     this.activeForegroundInput = null;
@@ -3727,7 +3788,7 @@ class ClaudeAgentSession implements AgentSession {
     this.foregroundHasProviderActivity = false;
     this.foregroundApiRecoveryAttempts = 0;
     this.pendingPostWorkApiRecovery = null;
-    this.pendingConversationRolloverError = null;
+    this.pendingConversationRolloverFailure = null;
     this.syncTurnState("foreground turn terminal");
   }
 
@@ -3739,6 +3800,9 @@ class ClaudeAgentSession implements AgentSession {
     }
 
     if (terminalSeen) {
+      if (events.some((event) => event.type === "turn_completed")) {
+        this.resumeModelUnavailableRolloverEligible = false;
+      }
       if (this.activeForegroundTurnId) {
         this.activeForegroundTurnId = null;
         this.activeForegroundQuery = null;
@@ -3748,14 +3812,14 @@ class ClaudeAgentSession implements AgentSession {
         this.foregroundHasProviderActivity = false;
         this.foregroundApiRecoveryAttempts = 0;
         this.pendingPostWorkApiRecovery = null;
-        this.pendingConversationRolloverError = null;
+        this.pendingConversationRolloverFailure = null;
         this.syncTurnState("foreground turn terminal");
       } else if (this.autonomousTurn) {
         this.autonomousTurn = null;
         this.activeForegroundQuery = null;
         this.activeForegroundInput = null;
         this.activeTurnHasAssistantText = false;
-        this.pendingConversationRolloverError = null;
+        this.pendingConversationRolloverFailure = null;
         this.syncTurnState("autonomous turn terminal");
       }
     }
@@ -3771,7 +3835,7 @@ class ClaudeAgentSession implements AgentSession {
     this.activeForegroundQuery = this.query;
     this.activeForegroundInput = this.input;
     this.activeTurnHasAssistantText = false;
-    this.pendingConversationRolloverError = null;
+    this.pendingConversationRolloverFailure = null;
     this.contextUsage.beginTurn();
     this.notifySubscribers({ type: "turn_started", provider: "claude" });
     this.syncTurnState("autonomous turn started");
@@ -3782,18 +3846,18 @@ class ClaudeAgentSession implements AgentSession {
       return;
     }
     this.notifySubscribers({ type: "turn_completed", provider: "claude" });
+    this.resumeModelUnavailableRolloverEligible = false;
     this.autonomousTurn = null;
     this.activeForegroundQuery = null;
     this.activeForegroundInput = null;
     this.activeTurnHasAssistantText = false;
-    this.pendingConversationRolloverError = null;
+    this.pendingConversationRolloverFailure = null;
     this.syncTurnState("autonomous turn completed");
   }
 
   private failActiveTurns(errorMessage: string): void {
-    const failure = this.buildTurnFailedEvent(
-      this.pendingConversationRolloverError ?? errorMessage,
-    );
+    const captured = this.pendingConversationRolloverFailure;
+    const failure = this.buildTurnFailedEvent(captured?.error ?? errorMessage, captured?.kind);
     this.flushPendingToolCalls();
     if (this.activeForegroundTurnId) {
       this.finishForegroundTurn(failure);
@@ -3835,7 +3899,9 @@ class ClaudeAgentSession implements AgentSession {
     this.input = null;
     this.dispatchEvents([
       this.buildTurnFailedEvent(
-        `Claude stopped unexpectedly (${signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`}). Any background shells, monitors or other work it had running were terminated with it.`,
+        `Claude stopped unexpectedly (${
+          signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`
+        }). Any background shells, monitors or other work it had running were terminated with it.`,
       ),
     ]);
   }
@@ -3843,7 +3909,11 @@ class ClaudeAgentSession implements AgentSession {
   private failRunningRuntimeTasks(): void {
     this.dispatchEvents(
       foldSubagentObservations(this.taskProtocolSource.failRunningTasks()).map(
-        (event): AgentStreamEvent => ({ type: "provider_subagent", provider: "claude", event }),
+        (event): AgentStreamEvent => ({
+          type: "provider_subagent",
+          provider: "claude",
+          event,
+        }),
       ),
     );
   }
@@ -4170,7 +4240,10 @@ class ClaudeAgentSession implements AgentSession {
 
     this.clearCapturedConversationRolloverError(pending.errorMessage);
     this.logger.warn(
-      { error: pending.errorMessage, attempt: this.foregroundApiRecoveryAttempts },
+      {
+        error: pending.errorMessage,
+        attempt: this.foregroundApiRecoveryAttempts,
+      },
       "Continuing Claude turn on the same native session after a post-work API failure",
     );
     pending.input.push(this.toSdkUserMessage(CLAUDE_POST_WORK_API_RECOVERY_PROMPT));
@@ -4178,15 +4251,36 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   private captureConversationRolloverError(message: SDKMessage): void {
-    const error = readClaudeContextOverflowError(message) ?? readClaudeUnresolvedTurnError(message);
-    if (error) {
-      this.pendingConversationRolloverError = error;
+    const contextOverflow = readClaudeContextOverflowError(message);
+    if (contextOverflow) {
+      this.pendingConversationRolloverFailure = {
+        kind: "context_overflow",
+        error: contextOverflow,
+      };
+      return;
+    }
+    const unresolved = readClaudeUnresolvedTurnError(message);
+    if (unresolved) {
+      this.pendingConversationRolloverFailure = {
+        kind: "conversation_unresolved",
+        error: unresolved,
+      };
+      return;
+    }
+    if (this.resumeModelUnavailableRolloverEligible) {
+      const modelUnavailable = readClaudeResumeModelUnavailableError(message);
+      if (modelUnavailable) {
+        this.pendingConversationRolloverFailure = {
+          kind: "resume_model_unavailable",
+          error: modelUnavailable,
+        };
+      }
     }
   }
 
   private clearCapturedConversationRolloverError(errorMessage: string): void {
-    if (this.pendingConversationRolloverError === errorMessage) {
-      this.pendingConversationRolloverError = null;
+    if (this.pendingConversationRolloverFailure?.error === errorMessage) {
+      this.pendingConversationRolloverFailure = null;
     }
   }
 
@@ -4526,7 +4620,13 @@ class ClaudeAgentSession implements AgentSession {
         message,
         canonicalSubagentId ?? parentToolUseId,
       ),
-    ).map((event): AgentStreamEvent => ({ type: "provider_subagent", provider: "claude", event }));
+    ).map(
+      (event): AgentStreamEvent => ({
+        type: "provider_subagent",
+        provider: "claude",
+        event,
+      }),
+    );
     const routedId = canonicalSubagentId ?? parentToolUseId;
     return [...runtimeEvents, ...this.sidechainTracker.handleMessage(message, routedId)];
   }
@@ -4810,9 +4910,10 @@ class ClaudeAgentSession implements AgentSession {
       "errors" in message && Array.isArray(message.errors) && message.errors.length > 0
         ? message.errors.join("\n")
         : "Claude run failed";
-    const errorMessage = this.pendingConversationRolloverError ?? resultErrorMessage;
+    const captured = this.pendingConversationRolloverFailure;
+    const errorMessage = captured?.error ?? resultErrorMessage;
     events.push(...this.sidechainTracker.finishAll("failed"));
-    events.push(this.buildTurnFailedEvent(errorMessage));
+    events.push(this.buildTurnFailedEvent(errorMessage, captured?.kind));
   }
 
   private createClaudeSessionChangedNotice(
@@ -5029,7 +5130,10 @@ class ClaudeAgentSession implements AgentSession {
           type: "permission_resolved",
           provider: "claude",
           requestId,
-          resolution: { behavior: "deny", message: "Permission request canceled" },
+          resolution: {
+            behavior: "deny",
+            message: "Permission request canceled",
+          },
         });
         reject(new Error("Permission request aborted"));
       };
@@ -5117,7 +5221,11 @@ class ClaudeAgentSession implements AgentSession {
         for (const event of foldSubagentObservations(
           this.taskProtocolSource.observeHook(input as ClaudeHookObservationInput),
         )) {
-          this.notifySubscribers({ type: "provider_subagent", provider: "claude", event });
+          this.notifySubscribers({
+            type: "provider_subagent",
+            provider: "claude",
+            event,
+          });
         }
       } catch (error) {
         this.logger.debug({ err: error }, "Failed to read subagent effort from hook");
@@ -5360,7 +5468,10 @@ class ClaudeAgentSession implements AgentSession {
     }
     const existingHistoryPaths = [...historyPaths]
       .filter((historyPath) => fs.existsSync(historyPath))
-      .map((historyPath) => ({ historyPath, mtimeMs: fs.statSync(historyPath).mtimeMs }))
+      .map((historyPath) => ({
+        historyPath,
+        mtimeMs: fs.statSync(historyPath).mtimeMs,
+      }))
       .sort((left, right) => right.mtimeMs - left.mtimeMs);
     if (existingHistoryPaths[0]) {
       return existingHistoryPaths[0].historyPath;
@@ -6093,7 +6204,9 @@ function readClaudeReplayParentFacts(parentEntries: ClaudeHistoryEntry[]): Claud
       const block = toObjectRecord(value);
       if (block?.type !== "tool_result" || typeof block.tool_use_id !== "string") continue;
       if (!toolCalls.has(block.tool_use_id)) continue;
-      outcomesByToolCallId.set(block.tool_use_id, { failed: block.is_error === true });
+      outcomesByToolCallId.set(block.tool_use_id, {
+        failed: block.is_error === true,
+      });
     }
   }
 
@@ -6128,7 +6241,9 @@ function readClaudeSidechainHistory(historyPath: string): ClaudeSidechainHistory
   };
   const workflowDirectory = path.join(sessionDirectory, "workflows");
   if (fs.existsSync(workflowDirectory)) {
-    for (const entry of fs.readdirSync(workflowDirectory, { withFileTypes: true })) {
+    for (const entry of fs.readdirSync(workflowDirectory, {
+      withFileTypes: true,
+    })) {
       if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
       try {
         history.workflowContents.push(
@@ -6238,7 +6353,10 @@ function readClaudeHistoricalSubagentToolResults(
       if (block?.type !== "tool_result" || typeof block.tool_use_id !== "string") continue;
       const match = /agentId:\s*([\w-]+)/.exec(JSON.stringify(block.content));
       if (!match?.[1]) continue;
-      results.set(match[1], { toolCallId: block.tool_use_id, failed: block.is_error === true });
+      results.set(match[1], {
+        toolCallId: block.tool_use_id,
+        failed: block.is_error === true,
+      });
     }
   }
   return results;

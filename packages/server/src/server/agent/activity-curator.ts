@@ -154,7 +154,7 @@ function formatContextOverflowStateEntry(item: AgentTimelineItem): string | null
  */
 export function buildAgentFreshSessionContinuationPrompt(input: {
   rows: readonly AgentTimelineRow[];
-  failureKind: "context_overflow" | "conversation_unresolved";
+  failureKind: "context_overflow" | "conversation_unresolved" | "resume_model_unavailable";
   maxChars?: number;
 }): string | null {
   const maxChars = input.maxChars ?? DEFAULT_CONTEXT_OVERFLOW_CONTINUATION_MAX_CHARS;
@@ -171,10 +171,13 @@ export function buildAgentFreshSessionContinuationPrompt(input: {
     return null;
   }
   const request = latestUser.text.trim();
-  const reason =
-    input.failureKind === "context_overflow"
-      ? "reached its context limit"
-      : "cannot be continued safely because its prior request has unresolved delivery state";
+  let reason =
+    "cannot be resumed safely because Claude rejected the saved native session before doing new work";
+  if (input.failureKind === "context_overflow") {
+    reason = "reached its context limit";
+  } else if (input.failureKind === "conversation_unresolved") {
+    reason = "cannot be continued safely because its prior request has unresolved delivery state";
+  }
   const prefix =
     `<paseo-system>\nThe previous native Claude session ${reason}. ` +
     "Continue the unfinished work in this fresh session. Do not repeat completed work.\n\n" +

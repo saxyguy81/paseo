@@ -113,6 +113,8 @@ export function extractTimestamps(record: StoredAgentRecord): {
   labels?: Record<string, string>;
   workspaceId?: string;
   owner?: StoredAgentRecord["owner"];
+  lastError?: string;
+  lastFailureKind?: NonNullable<StoredAgentRecord["lastFailureKind"]>;
 } {
   return {
     createdAt: new Date(record.createdAt),
@@ -121,6 +123,8 @@ export function extractTimestamps(record: StoredAgentRecord): {
     labels: record.labels,
     workspaceId: record.workspaceId,
     owner: record.owner,
+    lastError: record.lastError ?? undefined,
+    lastFailureKind: record.lastFailureKind ?? undefined,
   };
 }
 

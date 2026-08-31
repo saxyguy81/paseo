@@ -92,6 +92,16 @@ describe("canonical timeline turn ID compatibility", () => {
 
     expect(failure.failureKind).toBe("conversation_unresolved");
   });
+
+  it("accepts resumed-session model rollover failures", () => {
+    const failure = AgentStreamEventPayloadSchema.parse({
+      type: "turn_failed",
+      provider: "claude",
+      error: "selected model unavailable on resumed session",
+      failureKind: "resume_model_unavailable",
+    });
+    expect(failure.failureKind).toBe("resume_model_unavailable");
+  });
 });
 
 describe("legacy daemon send request schema compatibility", () => {

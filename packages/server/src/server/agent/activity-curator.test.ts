@@ -216,7 +216,9 @@ second line'`,
       { type: "assistant_message", text: "After second child." },
     ];
 
-    const result = curateAgentActivity(timeline, { labelAssistantMessages: true });
+    const result = curateAgentActivity(timeline, {
+      labelAssistantMessages: true,
+    });
 
     expect(result.split("\n")).toEqual([
       "[Assistant] Before first child.",
@@ -283,14 +285,25 @@ second line'`,
       maxChars: 1_500,
       rows: [
         ...oldRows,
-        row(101, { type: "user_message", text: "Finish the MR review and report blockers." }),
-        row(102, { type: "assistant_message", text: "I finished the diff and started tests." }),
+        row(101, {
+          type: "user_message",
+          text: "Finish the MR review and report blockers.",
+        }),
+        row(102, {
+          type: "assistant_message",
+          text: "I finished the diff and started tests.",
+        }),
         row(
           103,
           toolCallItem({
             callId: "test-1",
             name: "Bash",
-            detail: { type: "shell", command: "npm test", output: "one failure", exitCode: 1 },
+            detail: {
+              type: "shell",
+              command: "npm test",
+              output: "one failure",
+              exitCode: 1,
+            },
           }),
         ),
       ],
@@ -310,7 +323,10 @@ second line'`,
       failureKind: "context_overflow",
       maxChars: 2_000,
       rows: [
-        row(1, { type: "user_message", text: "Choose the implementation and continue." }),
+        row(1, {
+          type: "user_message",
+          text: "Choose the implementation and continue.",
+        }),
         row(
           2,
           toolCallItem({
@@ -321,11 +337,16 @@ second line'`,
               input: {
                 questions: [{ question: "Which implementation?", header: "Choice" }],
               },
-              output: { answers: { "Which implementation?": "Bounded rollover" } },
+              output: {
+                answers: { "Which implementation?": "Bounded rollover" },
+              },
             },
           }),
         ),
-        row(3, { type: "assistant_message", text: "[System Error] Prompt is too long" }),
+        row(3, {
+          type: "assistant_message",
+          text: "[System Error] Prompt is too long",
+        }),
       ],
     });
 
@@ -351,6 +372,23 @@ second line'`,
     expect(result).not.toContain("API Error: 409");
   });
 
+  it("explains resumed-session rejection without calling a healthy model unavailable", () => {
+    const result = buildAgentFreshSessionContinuationPrompt({
+      failureKind: "resume_model_unavailable",
+      rows: [
+        row(1, { type: "user_message", text: "Finish the review." }),
+        row(2, {
+          type: "assistant_message",
+          text: "Selected model claude-opus-5 is unavailable for this resumed request.",
+        }),
+      ],
+    });
+
+    expect(result).toContain("saved native session");
+    expect(result).toContain("Finish the review.");
+    expect(result).not.toContain("selected model");
+  });
+
   it("refuses automatic continuation when the outstanding request cannot fit", () => {
     expect(
       buildAgentFreshSessionContinuationPrompt({
@@ -367,7 +405,11 @@ second line'`,
       cwd: "/repo",
       boundaryMessageId: "assistant-1",
       rows: [
-        row(1, { type: "user_message", text: "Ship the thing", messageId: "user-1" }),
+        row(1, {
+          type: "user_message",
+          text: "Ship the thing",
+          messageId: "user-1",
+        }),
         row(2, { type: "reasoning", text: "private chain of thought" }),
         row(
           3,
@@ -497,8 +539,15 @@ second line'`,
         cursor: { epoch: "timeline-1", seq: 2 },
       },
       rows: [
-        row(1, { type: "user_message", text: "Try the task", messageId: "user-1" }),
-        row(2, { type: "assistant_message", text: "[System Error] provider failed" }),
+        row(1, {
+          type: "user_message",
+          text: "Try the task",
+          messageId: "user-1",
+        }),
+        row(2, {
+          type: "assistant_message",
+          text: "[System Error] provider failed",
+        }),
         row(3, {
           type: "assistant_message",
           text: "This belongs to a later turn.",
@@ -529,7 +578,13 @@ second line'`,
     expect(() =>
       buildAgentForkContextAttachment({
         boundaryMessageId: "missing",
-        rows: [row(1, { type: "assistant_message", text: "Done.", messageId: "assistant-1" })],
+        rows: [
+          row(1, {
+            type: "assistant_message",
+            text: "Done.",
+            messageId: "assistant-1",
+          }),
+        ],
       }),
     ).toThrow("Selected assistant message is no longer available.");
   });
