@@ -5335,7 +5335,10 @@ class ClaudeAgentSession implements AgentSession {
   private resolveHistoryPath(sessionId: string): string | null {
     const cwd = this.config.cwd;
     if (!cwd) return null;
-    const configDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
+    const configDir =
+      this.launchEnv?.CLAUDE_CONFIG_DIR?.trim() ||
+      process.env.CLAUDE_CONFIG_DIR ||
+      path.join(os.homedir(), ".claude");
     const candidates = [cwd];
     try {
       const realCwd = fs.realpathSync(cwd);

@@ -270,6 +270,48 @@ describe("ClaudeAgentSession history replay regression", () => {
     expect(timelineText).toContain(HISTORY_ASSISTANT_MARKER);
   });
 
+  test("loads persisted history from the provider launch environment", async () => {
+    const daemonConfigDir = path.join(tempRoot, "daemon-default-config");
+    mkdirSync(daemonConfigDir, { recursive: true });
+    process.env.CLAUDE_CONFIG_DIR = daemonConfigDir;
+
+    const client = new ClaudeAgentClient({
+      logger: createTestLogger(),
+      queryFactory,
+      resolveBinary: async () => "/test/claude/bin",
+    });
+    const handle: AgentPersistenceHandle = {
+      provider: "claude",
+      sessionId: "history-session",
+      nativeHandle: "history-session",
+      metadata: {
+        provider: "claude",
+        cwd,
+      },
+    };
+
+    const session = await client.resumeSession(
+      handle,
+      { cwd },
+      {
+        env: { CLAUDE_CONFIG_DIR: configDir },
+      },
+    );
+    const historyEvents: AgentStreamEvent[] = [];
+
+    try {
+      for await (const event of session.streamHistory()) {
+        historyEvents.push(event);
+      }
+    } finally {
+      await session.close();
+    }
+
+    const timelineText = collectTimelineText(historyEvents);
+    expect(timelineText).toContain(HISTORY_USER_MARKER);
+    expect(timelineText).toContain(HISTORY_ASSISTANT_MARKER);
+  });
+
   test("replays persisted sidechains as provider subagent timelines", async () => {
     const client = new ClaudeAgentClient({
       logger: createTestLogger(),
