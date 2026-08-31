@@ -269,6 +269,80 @@ test("recognizes only retryable synthetic Claude API failures", () => {
   ).toBeNull();
 });
 
+test("recognizes the current markerless synthetic Claude error envelope without trusting prose", () => {
+  const currentSyntheticError = (
+    text: string,
+    options?: { error?: string; model?: string; content?: "string" | "blocks" },
+  ) => ({
+    type: "assistant",
+    ...(options?.error === undefined ? {} : { error: options.error }),
+    message: {
+      role: "assistant",
+      model: options?.model ?? "<synthetic>",
+      content: options?.content === "blocks" ? [{ type: "text", text }] : text,
+    },
+  });
+  const unresolved = "API Error: 409 Conversation has an unresolved prior request";
+  const continuation = "API Error: 503 Continuation matching is temporarily unavailable";
+  const modelUnavailable =
+    "There's an issue with the selected model (claude-opus-5). It may not exist or you may not have access to it. Run --model to pick a different model.";
+
+  expect(
+    readClaudeUnresolvedTurnError(currentSyntheticError(unresolved, { error: "unknown" })),
+  ).toBe(unresolved);
+  expect(
+    readClaudeUnresolvedTurnError(
+      currentSyntheticError(unresolved, { error: "unknown", content: "blocks" }),
+    ),
+  ).toBe(unresolved);
+  expect(
+    readRetryableClaudeApiError(currentSyntheticError(continuation, { error: "unknown" })),
+  ).toBe(continuation);
+  expect(
+    readRetryableClaudeApiError(
+      currentSyntheticError("API Error: 500 Internal Server Error", { error: "unknown" }),
+    ),
+  ).toBe("API Error: 500 Internal Server Error");
+  expect(
+    readRetryableClaudeApiError(
+      currentSyntheticError("API Error: 401 Invalid API key", { error: "unknown" }),
+    ),
+  ).toBeNull();
+  expect(
+    readRetryableClaudeApiError(
+      currentSyntheticError("API Error: 429 Rate limit exceeded", { error: "unknown" }),
+    ),
+  ).toBeNull();
+  expect(
+    readClaudeContextOverflowError(
+      currentSyntheticError("API Error: prompt too long", { error: "unknown" }),
+    ),
+  ).toBe("API Error: prompt too long");
+  expect(
+    readClaudeResumeModelUnavailableError(
+      currentSyntheticError(modelUnavailable, { error: "model_not_found" }),
+    ),
+  ).toBe(modelUnavailable);
+  expect(
+    readClaudeResumeModelUnavailableError(
+      currentSyntheticError(modelUnavailable, { error: "unknown" }),
+    ),
+  ).toBeNull();
+
+  expect(
+    readClaudeUnresolvedTurnError(
+      currentSyntheticError(unresolved, { error: "unknown", model: "claude-opus-5" }),
+    ),
+  ).toBeNull();
+  expect(readClaudeUnresolvedTurnError(currentSyntheticError(unresolved))).toBeNull();
+  expect(
+    readClaudeUnresolvedTurnError({
+      type: "assistant",
+      message: { role: "assistant", model: "claude-opus-5", content: unresolved },
+    }),
+  ).toBeNull();
+});
+
 test("recognizes resumed-session model rejection from the structured SDK tag only", () => {
   const text =
     "There's an issue with the selected model (claude-opus-5). It may not exist or you may not have access to it. Run --model to pick a different model.";
@@ -425,11 +499,12 @@ test("classifies an unresolved prior turn for fresh-session rollover without ret
             done: false,
             value: {
               type: "assistant",
+              error: "unknown",
               uuid: "unresolved-turn-error",
               session_id: "unresolved-turn-session",
-              is_api_error_message: true,
               message: {
                 role: "assistant",
+                model: "<synthetic>",
                 content: [
                   {
                     type: "text",
@@ -941,9 +1016,10 @@ test("retries continuation matching once, then requires a fresh native session",
               done: false,
               value: {
                 type: "assistant",
-                isApiErrorMessage: true,
+                error: "unknown",
                 message: {
                   role: "assistant",
+                  model: "<synthetic>",
                   content: [{ type: "text", text: errorText }],
                 },
               },
@@ -965,9 +1041,10 @@ test("retries continuation matching once, then requires a fresh native session",
             done: false,
             value: {
               type: "assistant",
-              isApiErrorMessage: true,
+              error: "unknown",
               message: {
                 role: "assistant",
+                model: "<synthetic>",
                 content: [{ type: "text", text: errorText }],
               },
             },

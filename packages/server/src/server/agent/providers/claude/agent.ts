@@ -652,9 +652,18 @@ export function readClaudeContextOverflowError(message: unknown): string | null 
   return null;
 }
 
-/** Claude SDK releases have emitted this marker in both camelCase and wire-format snake_case. */
+/**
+ * Claude SDK releases identify synthetic API errors with either a boolean marker or the
+ * conjunction of a top-level error tag and the `<synthetic>` model placeholder.
+ */
 function isClaudeApiErrorMessage(record: Record<string, unknown>): boolean {
-  return record.isApiErrorMessage === true || record.is_api_error_message === true;
+  if (record.isApiErrorMessage === true || record.is_api_error_message === true) {
+    return true;
+  }
+  if (typeof record.error !== "string") {
+    return false;
+  }
+  return toObjectRecord(record.message)?.model === "<synthetic>";
 }
 
 function isForegroundProviderActivityEvent(event: AgentStreamEvent): boolean {
