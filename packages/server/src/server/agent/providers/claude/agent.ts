@@ -82,7 +82,7 @@ import { renderPromptAttachmentAsText } from "../../prompt-attachments.js";
 import { claudeQuery, type ClaudeOptions, type ClaudeQueryFactory } from "./query.js";
 import { realClaudeRewindSdk, revertClaudeConversation, revertClaudeFiles } from "./rewind.js";
 import { normalizeProviderReplayTimestamp } from "../../provider-history-timestamps.js";
-import { claudeProjectDirSync } from "./project-dir.js";
+import { claudeProjectDirFromInputSync, claudeProjectDirSync } from "./project-dir.js";
 import { THINKING_APPLIES_NEXT_TURN_NOTICE } from "../../provider-notices.js";
 import {
   isProviderImageMarkdown,
@@ -5349,14 +5349,21 @@ class ClaudeAgentSession implements AgentSession {
     } catch {
       // Fall back to the configured cwd when the path has already disappeared.
     }
+    const historyPaths = new Set<string>();
     for (const candidate of candidates) {
-      const historyPath = path.join(
-        claudeProjectDirSync(candidate, { configDir }),
-        `${sessionId}.jsonl`,
+      historyPaths.add(
+        path.join(claudeProjectDirFromInputSync(candidate, { configDir }), `${sessionId}.jsonl`),
       );
-      if (fs.existsSync(historyPath)) {
-        return historyPath;
-      }
+      historyPaths.add(
+        path.join(claudeProjectDirSync(candidate, { configDir }), `${sessionId}.jsonl`),
+      );
+    }
+    const existingHistoryPaths = [...historyPaths]
+      .filter((historyPath) => fs.existsSync(historyPath))
+      .map((historyPath) => ({ historyPath, mtimeMs: fs.statSync(historyPath).mtimeMs }))
+      .sort((left, right) => right.mtimeMs - left.mtimeMs);
+    if (existingHistoryPaths[0]) {
+      return existingHistoryPaths[0].historyPath;
     }
     return path.join(claudeProjectDirSync(cwd, { configDir }), `${sessionId}.jsonl`);
   }

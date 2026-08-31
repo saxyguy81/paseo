@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -336,6 +336,73 @@ describe("ClaudeAgentSession history replay regression", () => {
     };
 
     const session = await client.resumeSession(handle, { cwd });
+    const historyEvents: AgentStreamEvent[] = [];
+
+    try {
+      for await (const event of session.streamHistory()) {
+        historyEvents.push(event);
+      }
+    } finally {
+      await session.close();
+    }
+
+    const timelineText = collectTimelineText(historyEvents);
+    expect(timelineText).toContain(HISTORY_USER_MARKER);
+    expect(timelineText).toContain(HISTORY_ASSISTANT_MARKER);
+  });
+
+  test("loads persisted history from a recorded cwd after that path becomes a symlink", async () => {
+    const realProjects = path.join(tempRoot, "WorkProjects");
+    const recordedProjects = path.join(tempRoot, "Projects");
+    const realCwd = path.join(realProjects, "relocated-repo");
+    const recordedCwd = path.join(recordedProjects, "relocated-repo");
+    mkdirSync(realCwd, { recursive: true });
+    symlinkSync(realProjects, recordedProjects, "dir");
+
+    const sessionId = "relocated-history-session";
+    const recordedProjectDir = path.join(
+      configDir,
+      "projects",
+      recordedCwd.replace(/[^a-zA-Z0-9]/g, "-"),
+    );
+    mkdirSync(recordedProjectDir, { recursive: true });
+    writeFileSync(
+      path.join(recordedProjectDir, `${sessionId}.jsonl`),
+      [
+        JSON.stringify({
+          type: "user",
+          uuid: "relocated-user-uuid",
+          sessionId,
+          cwd: recordedCwd,
+          message: { role: "user", content: HISTORY_USER_MARKER },
+        }),
+        JSON.stringify({
+          type: "assistant",
+          sessionId,
+          cwd: recordedCwd,
+          message: { role: "assistant", content: HISTORY_ASSISTANT_MARKER },
+        }),
+      ].join("\n"),
+      "utf8",
+    );
+
+    const client = new ClaudeAgentClient({
+      logger: createTestLogger(),
+      runtimeSettings: {
+        env: { CLAUDE_CONFIG_DIR: configDir },
+      },
+      queryFactory,
+      resolveBinary: async () => "/test/claude/bin",
+    });
+    const session = await client.resumeSession(
+      {
+        provider: "claude",
+        sessionId,
+        nativeHandle: sessionId,
+        metadata: { provider: "claude", cwd: recordedCwd },
+      },
+      { cwd: recordedCwd },
+    );
     const historyEvents: AgentStreamEvent[] = [];
 
     try {
