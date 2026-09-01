@@ -144,16 +144,15 @@ function isEligibleConversationPredecessor(
   liveFailureKind: ConversationRolloverFailureKind | undefined,
 ): boolean {
   const currentFamilyMember = predecessor.labels?.[CONVERSATION_FAMILY_CURRENT_LABEL]?.trim();
+  // The Claude provider is the sole authority for resume_model_unavailable. It
+  // only emits that durable kind after a resumed session or a completed turn
+  // proves the model was usable, so each new family generation may recover
+  // once without turning a genuine fresh-session access failure into a loop.
   const failureIsAuthoritative =
     failureKind === "resume_model_unavailable"
       ? liveFailureKind === failureKind || predecessor.lastFailureKind === failureKind
       : isConversationRolloverFailureText(failureKind, latestError);
-  return (
-    (!currentFamilyMember || currentFamilyMember === agentId) &&
-    (failureKind !== "resume_model_unavailable" ||
-      predecessor.labels?.[CONVERSATION_FAMILY_RESUME_MODEL_ROLLOVER_LABEL] !== "true") &&
-    failureIsAuthoritative
-  );
+  return (!currentFamilyMember || currentFamilyMember === agentId) && failureIsAuthoritative;
 }
 
 function buildConversationSuccessorMetadata(
@@ -1356,6 +1355,20 @@ export class AgentManager {
       successorId,
       failureKind,
     );
+    const successorPosition = parseFamilyPosition(labels[CONVERSATION_FAMILY_POSITION_LABEL]);
+    if (successorPosition >= 2) {
+      this.logger.warn(
+        {
+          agentId,
+          successorId,
+          familyId: labels[CONVERSATION_FAMILY_ID_LABEL],
+          familyName,
+          failureKind,
+          successorPosition,
+        },
+        "Conversation family required a repeated recovery rollover",
+      );
+    }
 
     const successor = await this.createAgent(buildStoredAgentConfig(predecessor), successorId, {
       labels,

@@ -389,6 +389,24 @@ second line'`,
     expect(result).not.toContain("selected model");
   });
 
+  it("does not nest a previous internal handoff as the outstanding user request", () => {
+    const result = buildAgentFreshSessionContinuationPrompt({
+      failureKind: "resume_model_unavailable",
+      rows: [
+        row(1, { type: "user_message", text: "Finish the review." }),
+        row(2, {
+          type: "user_message",
+          text: "<paseo-system>\nContinue the previous handoff.\n</paseo-system>",
+        }),
+        row(3, { type: "assistant_message", text: "Repository state is preserved." }),
+      ],
+    });
+
+    expect(result).toContain("Outstanding user request:\nFinish the review.");
+    expect(result?.match(/<paseo-system>/g)).toHaveLength(1);
+    expect(result).not.toContain("Continue the previous handoff.");
+  });
+
   it("refuses automatic continuation when the outstanding request cannot fit", () => {
     expect(
       buildAgentFreshSessionContinuationPrompt({

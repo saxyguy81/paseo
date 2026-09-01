@@ -8583,6 +8583,7 @@ test.each([
   async ({ failureKind, failureText }) => {
     const workdir = mkdtempSync(join(tmpdir(), "agent-manager-context-overflow-"));
     const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const durableTimelineStore = new RecordingTimelineStore();
     const oldAgentId = "00000000-0000-4000-8000-000000000201";
     const successorAgentId = "00000000-0000-4000-8000-000000000202";
     const createdSessions: TestAgentSession[] = [];
@@ -8705,12 +8706,16 @@ test.each([
     }
 
     class OverflowClient extends TestAgentClient {
+      constructor(private readonly overflowFirstSession = true) {
+        super();
+      }
+
       override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
         const index = createdSessions.length;
         const session = new OverflowSession(
           config,
           index === 0 ? "old-full-native-session" : "fresh-native-session",
-          index === 0,
+          this.overflowFirstSession && index === 0,
         );
         createdSessions.push(session);
         return session;
@@ -8722,6 +8727,7 @@ test.each([
     const manager = new AgentManager({
       clients: { codex: client },
       registry: storage,
+      durableTimelineStore,
       logger,
       idFactory: () => ids.shift() ?? randomUUID(),
     });
@@ -8810,10 +8816,12 @@ test.each([
       },
     });
 
-    const restartClient = new OverflowClient();
+    const restartClient = new OverflowClient(false);
+    const restartStorage = new AgentStorage(join(workdir, "agents"), logger);
     const restartedManager = new AgentManager({
       clients: { codex: restartClient },
-      registry: new AgentStorage(join(workdir, "agents"), logger),
+      registry: restartStorage,
+      durableTimelineStore,
       logger,
     });
     await expect(
@@ -8821,7 +8829,7 @@ test.each([
     ).resolves.toBe(successorAgentId);
     expect(restartClient.createdConfigs).toHaveLength(0);
     expect(restartClient.resumeOverrides).toHaveLength(0);
-    const repairedStorage = new AgentStorage(join(workdir, "agents"), logger);
+    const repairedStorage = restartStorage;
     expect((await repairedStorage.get(oldAgentId))?.archivedAt).toBeTruthy();
     expect((await repairedStorage.get(oldAgentId))?.labels[CONVERSATION_FAMILY_CURRENT_LABEL]).toBe(
       successorAgentId,
@@ -8830,11 +8838,44 @@ test.each([
       (await repairedStorage.get(successorAgentId))?.labels[CONVERSATION_FAMILY_CURRENT_LABEL],
     ).toBe(successorAgentId);
     if (failureKind === "resume_model_unavailable") {
+      const secondGeneration = (await repairedStorage.get(successorAgentId))!;
+      await repairedStorage.upsert({
+        ...secondGeneration,
+        lastStatus: "error",
+        lastError: failureText,
+        lastFailureKind: failureKind,
+        requiresAttention: true,
+        attentionReason: "error",
+        attentionTimestamp: new Date().toISOString(),
+      });
+
+      const secondSuccessorId = await restartedManager.ensureAgentFailureContinuation(
+        successorAgentId,
+        failureKind,
+        failureText,
+      );
+      expect(secondSuccessorId).toBeTruthy();
+      expect(secondSuccessorId).not.toBe(successorAgentId);
+      await vi.waitFor(async () => {
+        expect((await repairedStorage.get(successorAgentId))?.archivedAt).toBeTruthy();
+      });
+
+      const secondRolloverRecords = await repairedStorage.list();
+      expect(secondRolloverRecords).toHaveLength(3);
+      expect(
+        secondRolloverRecords.find((record) => record.id === secondSuccessorId)?.labels[
+          CONVERSATION_FAMILY_POSITION_LABEL
+        ],
+      ).toBe("2");
+      for (const record of secondRolloverRecords) {
+        expect(record.labels[CONVERSATION_FAMILY_CURRENT_LABEL]).toBe(secondSuccessorId);
+      }
       await expect(
         restartedManager.ensureAgentFailureContinuation(successorAgentId, failureKind, failureText),
-      ).resolves.toBeNull();
-      expect(restartClient.createdConfigs).toHaveLength(0);
+      ).resolves.toBe(secondSuccessorId);
+      expect(createdSessions).toHaveLength(3);
       expect(restartClient.resumeOverrides).toHaveLength(0);
+      await restartedManager.closeAgent(secondSuccessorId!).catch(() => undefined);
     }
   },
 );

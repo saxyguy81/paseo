@@ -8,6 +8,7 @@ import {
   isContextOverflowFailureText,
   isConversationUnresolvedFailureText,
 } from "./context-overflow.js";
+import { isSystemInjectedEnvelope } from "./agent-prompt.js";
 
 const DEFAULT_MAX_ITEMS = 0;
 const MAX_TOOL_INPUT_CHARS = 400;
@@ -160,7 +161,10 @@ export function buildAgentFreshSessionContinuationPrompt(input: {
   const maxChars = input.maxChars ?? DEFAULT_CONTEXT_OVERFLOW_CONTINUATION_MAX_CHARS;
   const projected = projectTimelineRows({ rows: input.rows, mode: "projected" });
   const latestUserIndex = projected.findLastIndex(
-    (entry) => entry.item.type === "user_message" && entry.item.text.trim().length > 0,
+    (entry) =>
+      entry.item.type === "user_message" &&
+      entry.item.text.trim().length > 0 &&
+      !isSystemInjectedEnvelope(entry.item.text),
   );
   if (latestUserIndex < 0) {
     return null;
