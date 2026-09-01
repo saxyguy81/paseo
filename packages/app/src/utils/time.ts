@@ -145,6 +145,63 @@ export function formatMessageTimestamp(date: Date, now: Date = new Date()): stri
   return `${dateLabel}, ${time}`;
 }
 
+export interface TurnCompletionTime {
+  label: string;
+  resolution: RelativeTimeResolution;
+}
+
+function localCalendarDay(date: Date): number {
+  return Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) / DAY_MS;
+}
+
+/**
+ * Format an assistant turn's completion time for the persistent footer.
+ * The label favors relative prose while it remains useful, then becomes an
+ * unambiguous local date and time.
+ */
+export function describeTurnCompletionTime(date: Date, now: Date = new Date()): TurnCompletionTime {
+  const elapsedMs = now.getTime() - date.getTime();
+  if (!Number.isFinite(elapsedMs)) return { label: "", resolution: "static" };
+  if (elapsedMs < MINUTE_MS) return { label: "just now", resolution: "minute" };
+
+  const calendarDays = localCalendarDay(now) - localCalendarDay(date);
+  if (calendarDays === 1) {
+    return { label: `yesterday ${getTimeFormatter().format(date)}`, resolution: "day" };
+  }
+  if (calendarDays > 1 && calendarDays < 6) {
+    const weekday = date.toLocaleDateString(undefined, { weekday: "long" });
+    return { label: `last ${weekday}`, resolution: "day" };
+  }
+
+  const relative = new Intl.RelativeTimeFormat(undefined, { numeric: "always" });
+  if (elapsedMs < HOUR_MS) {
+    return {
+      label: relative.format(-Math.floor(elapsedMs / MINUTE_MS), "minute"),
+      resolution: "minute",
+    };
+  }
+  if (elapsedMs < DAY_MS) {
+    return {
+      label: relative.format(-Math.floor(elapsedMs / HOUR_MS), "hour"),
+      resolution: "hour",
+    };
+  }
+
+  const dateLabel = date.toLocaleDateString(undefined, {
+    year: "2-digit",
+    month: "numeric",
+    day: "numeric",
+  });
+  return {
+    label: `${dateLabel} ${getTimeFormatter().format(date)}`,
+    resolution: "static",
+  };
+}
+
+export function formatTurnCompletionTime(date: Date, now: Date = new Date()): string {
+  return describeTurnCompletionTime(date, now).label;
+}
+
 /**
  * Format a duration as a compact human-readable string.
  * - 0-60s: whole seconds ("47s")
