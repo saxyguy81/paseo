@@ -108,6 +108,8 @@ import { recordRenderProfileReasons } from "@/utils/render-profiler";
 import { useRetainedPanelActive } from "@/components/retained-panel";
 import { useStreamHistoryWindow } from "./use-stream-history-window";
 import { PluginTimelineItemView } from "@/plugins/timeline";
+import { buildTurnActivityGroups, type TurnActivityGroup } from "./turn-activity-groups";
+import { TurnActivityGroupView } from "./turn-activity-group";
 
 function renderLiveAuxiliaryNode(input: {
   pendingPermissions: ReactNode;
@@ -354,6 +356,9 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
     const [expandedToolCallGroupIds, setExpandedToolCallGroupIds] = useState<Set<string>>(
       new Set(),
     );
+    const [expandedTurnActivityGroupIds, setExpandedTurnActivityGroupIds] = useState<Set<string>>(
+      new Set(),
+    );
     const [pendingExternalJumpItemId, setPendingExternalJumpItemId] = useState<string | null>(null);
 
     // Get serverId (fallback to agent's serverId if not provided)
@@ -418,6 +423,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
       setIsNearBottom(true);
       setExpandedInlineToolCallIds(new Set());
       setExpandedToolCallGroupIds(new Set());
+      setExpandedTurnActivityGroupIds(new Set());
     }, [agentId]);
 
     const handleInlinePathPress = useStableEvent(
@@ -589,6 +595,10 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
         streamRenderStrategy,
       ],
     );
+    const turnActivityGroups = useMemo(
+      () => buildTurnActivityGroups(streamLayout.history),
+      [streamLayout.history],
+    );
     const handleTimelineHistoryLoadError = useCallback(() => {
       toast?.error(t("agentStream.historyLoadFailed"));
     }, [t, toast]);
@@ -619,26 +629,46 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
           viewportRef.current?.scrollToBottom(reason);
         },
         scrollToMessage(itemId) {
+          const activityGroup = turnActivityGroups.byItemId.get(itemId)?.group;
+          const targetItemId = activityGroup?.hostItemId ?? itemId;
+          if (activityGroup) {
+            setExpandedTurnActivityGroupIds((previous) => {
+              if (previous.has(activityGroup.id)) return previous;
+              const next = new Set(previous);
+              next.add(activityGroup.id);
+              return next;
+            });
+          }
           if (revealLoadedHistory(itemId)) {
             setPendingExternalJumpItemId(itemId);
             return;
           }
-          viewportRef.current?.scrollToMessage?.(itemId);
+          requestAnimationFrame(() => viewportRef.current?.scrollToMessage?.(targetItemId));
         },
         prepareForViewportChange() {
           viewportRef.current?.prepareForViewportChange();
         },
       }),
-      [revealLoadedHistory],
+      [revealLoadedHistory, turnActivityGroups.byItemId],
     );
 
     useEffect(() => {
       if (!pendingExternalJumpItemId || !visibleHistoryItemIds.has(pendingExternalJumpItemId)) {
         return;
       }
-      viewportRef.current?.scrollToMessage?.(pendingExternalJumpItemId);
+      const activityGroup = turnActivityGroups.byItemId.get(pendingExternalJumpItemId)?.group;
+      if (activityGroup) {
+        setExpandedTurnActivityGroupIds((previous) => {
+          if (previous.has(activityGroup.id)) return previous;
+          const next = new Set(previous);
+          next.add(activityGroup.id);
+          return next;
+        });
+      }
+      const targetItemId = activityGroup?.hostItemId ?? pendingExternalJumpItemId;
+      requestAnimationFrame(() => viewportRef.current?.scrollToMessage?.(targetItemId));
       setPendingExternalJumpItemId(null);
-    }, [pendingExternalJumpItemId, visibleHistoryItemIds]);
+    }, [pendingExternalJumpItemId, turnActivityGroups.byItemId, visibleHistoryItemIds]);
 
     const scrollToBottom = useCallback(() => {
       if (!isTimelineDetached) {
@@ -675,6 +705,18 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
 
     const setToolCallGroupExpanded = useCallback((groupId: string, expanded: boolean) => {
       setExpandedToolCallGroupIds((previous) => {
+        const next = new Set(previous);
+        if (expanded) {
+          next.add(groupId);
+        } else {
+          next.delete(groupId);
+        }
+        return next;
+      });
+    }, []);
+
+    const setTurnActivityGroupExpanded = useCallback((groupId: string, expanded: boolean) => {
+      setExpandedTurnActivityGroupIds((previous) => {
         const next = new Set(previous);
         if (expanded) {
           next.add(groupId);
@@ -907,8 +949,48 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
 
     const bottomTurnFooterHost = streamLayout.auxiliaryTurnFooter;
 
+    const renderTurnActivityGroup = useCallback(
+      (group: TurnActivityGroup) => {
+        const expanded = expandedTurnActivityGroupIds.has(group.id);
+        const lastMember = group.members.at(-1);
+        if (!lastMember) {
+          return null;
+        }
+        return (
+          <StreamItemWrapper itemId={group.hostItemId} gapBelow={lastMember.gapBelow}>
+            <TurnActivityGroupView
+              groupId={group.id}
+              itemCount={group.members.length}
+              expanded={expanded}
+              onExpandedChange={setTurnActivityGroupExpanded}
+            >
+              {group.members.map((member, index) => {
+                const content = renderStreamItemContent(member);
+                if (!content) return null;
+                return (
+                  <TurnActivityGroupMember
+                    key={member.item.id}
+                    gapBelow={index === group.members.length - 1 ? 0 : member.gapBelow}
+                  >
+                    {content}
+                  </TurnActivityGroupMember>
+                );
+              })}
+            </TurnActivityGroupView>
+          </StreamItemWrapper>
+        );
+      },
+      [expandedTurnActivityGroupIds, renderStreamItemContent, setTurnActivityGroupExpanded],
+    );
+
     const renderStreamItem = useCallback(
       (layoutItem: StreamLayoutItem) => {
+        const activityMembership = turnActivityGroups.byItemId.get(layoutItem.item.id);
+        if (activityMembership) {
+          return activityMembership.isHost
+            ? renderTurnActivityGroup(activityMembership.group)
+            : null;
+        }
         const content = renderStreamItemContent(layoutItem);
         return renderStreamItemWithTurnFooter({
           content,
@@ -926,8 +1008,10 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
         readOnly,
         readOnlyItemIds,
         renderStreamItemContent,
+        renderTurnActivityGroup,
         streamRenderStrategy,
         supportsAgentForkContextCursor,
+        turnActivityGroups.byItemId,
       ],
     );
 
@@ -1076,13 +1160,22 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
     const streamScrollEnabled =
       !streamRenderStrategy.shouldDisableParentScrollOnInlineDetailsExpansion() ||
       expandedInlineToolCallIds.size === 0;
+    const historyDisplayStateById = useMemo(() => {
+      const displayStateById = new Set(expandedToolCallGroupIds);
+      for (const group of turnActivityGroups.groups) {
+        if (expandedTurnActivityGroupIds.has(group.id)) {
+          displayStateById.add(group.hostItemId);
+        }
+      }
+      return displayStateById;
+    }, [expandedToolCallGroupIds, expandedTurnActivityGroupIds, turnActivityGroups.groups]);
     const historyRowRevision = useMemo(
       () => ({
         contentById: projectedToolCalls.historyGroupUpdatesByHostId,
-        displayStateById: expandedToolCallGroupIds,
+        displayStateById: historyDisplayStateById,
         globalDisplayState: isMobile,
       }),
-      [expandedToolCallGroupIds, isMobile, projectedToolCalls.historyGroupUpdatesByHostId],
+      [historyDisplayStateById, isMobile, projectedToolCalls.historyGroupUpdatesByHostId],
     );
 
     return (
@@ -1782,6 +1875,14 @@ function StreamItemWrapper({ gapBelow, children }: StreamItemWrapperProps) {
     [gapBelow],
   );
   return <View style={wrapperStyle}>{children}</View>;
+}
+
+function TurnActivityGroupMember({
+  gapBelow,
+  children,
+}: Pick<StreamItemWrapperProps, "gapBelow" | "children">) {
+  const memberStyle = useMemo(() => ({ marginBottom: gapBelow }), [gapBelow]);
+  return <View style={memberStyle}>{children}</View>;
 }
 
 function ConversationFamilyBoundary({ message }: { message: string }) {

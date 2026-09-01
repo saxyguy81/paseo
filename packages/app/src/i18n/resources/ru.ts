@@ -200,6 +200,10 @@ export const ru: TranslationResources = {
     },
   },
   agentStream: {
+    activityGroup: {
+      show: "Показать работу · {{count}}",
+      hide: "Скрыть работу · {{count}}",
+    },
     family: {
       fullHistory: "Полная история · сеансов: {{count}}",
       loadFailed: "Не удалось загрузить часть истории",

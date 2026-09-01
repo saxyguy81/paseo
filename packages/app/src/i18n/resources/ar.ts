@@ -200,6 +200,10 @@ export const ar: TranslationResources = {
     },
   },
   agentStream: {
+    activityGroup: {
+      show: "إظهار العمل · {{count}}",
+      hide: "إخفاء العمل · {{count}}",
+    },
     family: {
       fullHistory: "السجل الكامل · {{count}} جلسات",
       loadFailed: "تعذّر تحميل جزء من السجل",

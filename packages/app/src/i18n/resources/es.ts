@@ -200,6 +200,10 @@ export const es: TranslationResources = {
     },
   },
   agentStream: {
+    activityGroup: {
+      show: "Mostrar trabajo · {{count}}",
+      hide: "Ocultar trabajo · {{count}}",
+    },
     family: {
       fullHistory: "Historial completo · {{count}} sesiones",
       loadFailed: "No se pudo cargar parte del historial",

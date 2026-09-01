@@ -200,6 +200,10 @@ export const zhCN: TranslationResources = {
     },
   },
   agentStream: {
+    activityGroup: {
+      show: "显示工作 · {{count}}",
+      hide: "隐藏工作 · {{count}}",
+    },
     family: {
       fullHistory: "完整历史记录 · {{count}} 个会话",
       loadFailed: "部分历史记录无法加载",

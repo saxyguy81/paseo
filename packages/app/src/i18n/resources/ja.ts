@@ -200,6 +200,10 @@ export const ja: TranslationResources = {
     },
   },
   agentStream: {
+    activityGroup: {
+      show: "作業を表示 · {{count}}",
+      hide: "作業を非表示 · {{count}}",
+    },
     family: {
       fullHistory: "全履歴 · {{count}} セッション",
       loadFailed: "一部の履歴を読み込めませんでした",

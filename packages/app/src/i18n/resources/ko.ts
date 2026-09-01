@@ -200,6 +200,10 @@ export const ko: TranslationResources = {
     },
   },
   agentStream: {
+    activityGroup: {
+      show: "작업 보기 · {{count}}",
+      hide: "작업 숨기기 · {{count}}",
+    },
     family: {
       fullHistory: "전체 기록 · 세션 {{count}}개",
       loadFailed: "일부 기록을 불러오지 못했습니다",

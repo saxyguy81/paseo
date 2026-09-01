@@ -200,6 +200,10 @@ export const en = {
     empty: "Start chatting with this agent...",
     scrollToBottom: "Scroll to bottom",
     historyLoadFailed: "Couldn't load agent history",
+    activityGroup: {
+      show: "Show work · {{count}}",
+      hide: "Hide work · {{count}}",
+    },
     family: {
       fullHistory: "Full history · {{count}} sessions",
       loadFailed: "Some history could not be loaded",

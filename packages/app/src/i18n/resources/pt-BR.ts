@@ -200,6 +200,10 @@ export const ptBR: TranslationResources = {
     },
   },
   agentStream: {
+    activityGroup: {
+      show: "Mostrar trabalho · {{count}}",
+      hide: "Ocultar trabalho · {{count}}",
+    },
     family: {
       fullHistory: "Histórico completo · {{count}} sessões",
       loadFailed: "Não foi possível carregar parte do histórico",
