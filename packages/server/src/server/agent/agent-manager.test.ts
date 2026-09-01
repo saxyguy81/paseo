@@ -8880,6 +8880,111 @@ test.each([
   },
 );
 
+test("a repeated rollover consumes the failed queued prompt and transfers only the remaining FIFO", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-repeated-queued-rollover-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const generationTwoId = "00000000-0000-4000-8000-000000000211";
+  const generationThreeId = "00000000-0000-4000-8000-000000000212";
+  const startedPrompts: AgentPromptInput[] = [];
+  const failureText =
+    "There's an issue with the selected model (claude-opus-5). It may not exist or you may not have access to it.";
+
+  class GenerationTwoSession extends TestAgentSession {
+    override async startTurn(prompt: AgentPromptInput): Promise<{ turnId: string }> {
+      startedPrompts.push(prompt);
+      const turnId = `generation-two-turn-${startedPrompts.length}`;
+      setTimeout(() => {
+        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        if (prompt === "queued request that fails") {
+          this.pushEvent({
+            type: "turn_failed",
+            provider: this.provider,
+            turnId,
+            error: failureText,
+            failureKind: "resume_model_unavailable",
+          });
+          return;
+        }
+        this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+      }, 0);
+      return { turnId };
+    }
+  }
+
+  class RepeatedRolloverClient extends TestAgentClient {
+    private createCount = 0;
+
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      this.createCount += 1;
+      if (this.createCount === 1) return new GenerationTwoSession(config);
+      return new (class extends TestAgentSession {
+        override async startTurn(prompt: AgentPromptInput): Promise<{ turnId: string }> {
+          startedPrompts.push(prompt);
+          return super.startTurn(prompt);
+        }
+      })(config);
+    }
+  }
+
+  const client = new RepeatedRolloverClient();
+  const ids = [generationTwoId, generationThreeId];
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    idFactory: () => ids.shift() ?? randomUUID(),
+  });
+
+  try {
+    const generationTwo = await manager.createAgent(
+      { provider: "codex", cwd: workdir, model: "gpt-5.4" },
+      undefined,
+      {
+        initialTitle: "Repeated rollover",
+        labels: {
+          [CONVERSATION_FAMILY_ID_LABEL]: "repeated-rollover-family",
+          [CONVERSATION_FAMILY_CURRENT_LABEL]: generationTwoId,
+          [CONVERSATION_FAMILY_NAME_LABEL]: "Repeated rollover",
+          [CONVERSATION_FAMILY_POSITION_LABEL]: "2",
+        },
+        workspaceId: undefined,
+      },
+    );
+    await manager.runAgent(generationTwo.id, "establish a completed turn");
+    await manager.appendTimelineItem(generationTwo.id, {
+      type: "user_message",
+      text: "queued request that fails",
+    });
+    await storage.enqueuePendingPrompt(generationTwo.id, {
+      id: "queued-failure",
+      prompt: "queued request that fails",
+    });
+    await storage.enqueuePendingPrompt(generationTwo.id, {
+      id: "queued-after-failure",
+      prompt: "queued request after recovery",
+    });
+
+    await manager.drainStoredPendingPrompts(generationTwo.id);
+    await vi.waitFor(async () => {
+      expect((await storage.get(generationTwoId))?.archivedAt).toBeTruthy();
+      expect(await storage.listPendingPrompts(generationThreeId)).toEqual([]);
+    });
+
+    expect(await storage.listPendingPrompts(generationTwoId)).toEqual([]);
+    expect(startedPrompts[0]).toBe("establish a completed turn");
+    expect(startedPrompts[1]).toBe("queued request that fails");
+    expect(typeof startedPrompts[2]).toBe("string");
+    expect(startedPrompts[2]).toContain("queued request that fails");
+    expect(startedPrompts[3]).toBe("queued request after recovery");
+    expect((await storage.get(generationThreeId))?.labels[CONVERSATION_FAMILY_POSITION_LABEL]).toBe(
+      "3",
+    );
+  } finally {
+    await manager.closeAgent(generationThreeId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("turn_failed surfaces provider code and diagnostic in system error message", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-turn-failed-detail-"));
   const storagePath = join(workdir, "agents");

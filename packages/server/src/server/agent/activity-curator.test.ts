@@ -407,6 +407,20 @@ second line'`,
     expect(result).not.toContain("Continue the previous handoff.");
   });
 
+  it("refuses continuation when the timeline contains only an internal handoff", () => {
+    const result = buildAgentFreshSessionContinuationPrompt({
+      failureKind: "resume_model_unavailable",
+      rows: [
+        row(1, {
+          type: "user_message",
+          text: "<paseo-system>\nContinue the previous handoff.\n</paseo-system>",
+        }),
+      ],
+    });
+
+    expect(result).toBeNull();
+  });
+
   it("refuses automatic continuation when the outstanding request cannot fit", () => {
     expect(
       buildAgentFreshSessionContinuationPrompt({
