@@ -61,6 +61,20 @@ describe("readTerminalConversationRolloverFailure", () => {
     });
   });
 
+  test("classifies a terminal active-request ambiguity as an unresolved conversation", () => {
+    expect(
+      readTerminalConversationRolloverFailure(
+        rows({
+          type: "assistant_message",
+          text: "API Error: 409 Conversation already has an active request",
+        }),
+      ),
+    ).toEqual({
+      kind: "conversation_unresolved",
+      text: "API Error: 409 Conversation already has an active request",
+    });
+  });
+
   test("classifies repeated continuation-matching unavailability as an unresolved conversation", () => {
     expect(
       readTerminalConversationRolloverFailure(

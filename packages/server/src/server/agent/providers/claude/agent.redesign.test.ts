@@ -220,6 +220,11 @@ test("recognizes only retryable synthetic Claude API failures", () => {
       apiError("API Error: 409 Conversation already has an active request"),
     ),
   ).toBe("API Error: 409 Conversation already has an active request");
+  expect(
+    readClaudeUnresolvedTurnError(
+      apiError("API Error: 409 Conversation already has an active request"),
+    ),
+  ).toBe("API Error: 409 Conversation already has an active request");
   expect(readRetryableClaudeApiError(apiError("API Error: connection error (ECONNRESET)"))).toBe(
     "API Error: connection error (ECONNRESET)",
   );
@@ -283,6 +288,7 @@ test("recognizes the current markerless synthetic Claude error envelope without 
     },
   });
   const unresolved = "API Error: 409 Conversation has an unresolved prior request";
+  const active = "API Error: 409 Conversation already has an active request";
   const continuation = "API Error: 503 Continuation matching is temporarily unavailable";
   const modelUnavailable =
     "There's an issue with the selected model (claude-opus-5). It may not exist or you may not have access to it. Run --model to pick a different model.";
@@ -290,6 +296,9 @@ test("recognizes the current markerless synthetic Claude error envelope without 
   expect(
     readClaudeUnresolvedTurnError(currentSyntheticError(unresolved, { error: "unknown" })),
   ).toBe(unresolved);
+  expect(readClaudeUnresolvedTurnError(currentSyntheticError(active, { error: "unknown" }))).toBe(
+    active,
+  );
   expect(
     readClaudeUnresolvedTurnError(
       currentSyntheticError(unresolved, { error: "unknown", content: "blocks" }),
@@ -300,17 +309,23 @@ test("recognizes the current markerless synthetic Claude error envelope without 
   ).toBe(continuation);
   expect(
     readRetryableClaudeApiError(
-      currentSyntheticError("API Error: 500 Internal Server Error", { error: "unknown" }),
+      currentSyntheticError("API Error: 500 Internal Server Error", {
+        error: "unknown",
+      }),
     ),
   ).toBe("API Error: 500 Internal Server Error");
   expect(
     readRetryableClaudeApiError(
-      currentSyntheticError("API Error: 401 Invalid API key", { error: "unknown" }),
+      currentSyntheticError("API Error: 401 Invalid API key", {
+        error: "unknown",
+      }),
     ),
   ).toBeNull();
   expect(
     readRetryableClaudeApiError(
-      currentSyntheticError("API Error: 429 Rate limit exceeded", { error: "unknown" }),
+      currentSyntheticError("API Error: 429 Rate limit exceeded", {
+        error: "unknown",
+      }),
     ),
   ).toBeNull();
   expect(
@@ -331,14 +346,21 @@ test("recognizes the current markerless synthetic Claude error envelope without 
 
   expect(
     readClaudeUnresolvedTurnError(
-      currentSyntheticError(unresolved, { error: "unknown", model: "claude-opus-5" }),
+      currentSyntheticError(unresolved, {
+        error: "unknown",
+        model: "claude-opus-5",
+      }),
     ),
   ).toBeNull();
   expect(readClaudeUnresolvedTurnError(currentSyntheticError(unresolved))).toBeNull();
   expect(
     readClaudeUnresolvedTurnError({
       type: "assistant",
-      message: { role: "assistant", model: "claude-opus-5", content: unresolved },
+      message: {
+        role: "assistant",
+        model: "claude-opus-5",
+        content: unresolved,
+      },
     }),
   ).toBeNull();
 });
@@ -1343,6 +1365,162 @@ test("continues once on the same query after a transient post-work API failure",
     await session.close();
     restoreEnvValue("CLAUDE_CONFIG_DIR", previousConfigDir);
     rmSync(recoveryConfigDir, { recursive: true, force: true });
+  }
+});
+
+test("classifies a post-work active-request error when Claude ends without a result", async () => {
+  let step = 0;
+  sdkQueryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    const iterator = prompt[Symbol.asyncIterator]();
+    return createBaseQueryMock(
+      vi.fn(async () => {
+        if (step === 0) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "system",
+              subtype: "init",
+              session_id: "post-work-active-request-eof-session",
+              permissionMode: "default",
+              model: "opus",
+            },
+          };
+        }
+        if (step === 1) {
+          step += 1;
+          await iterator.next();
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              uuid: "post-work-progress-before-active-request",
+              message: {
+                role: "assistant",
+                content: "I completed several review steps.",
+              },
+            },
+          };
+        }
+        if (step === 2) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              uuid: "post-work-active-request-error",
+              error: "unknown",
+              isApiErrorMessage: true,
+              message: {
+                role: "assistant",
+                model: "<synthetic>",
+                content: [
+                  {
+                    type: "text",
+                    text: "API Error: 409 Conversation already has an active request",
+                  },
+                ],
+              },
+            },
+          };
+        }
+        return { done: true, value: undefined };
+      }),
+    );
+  });
+
+  const session = await createSession();
+  try {
+    const events = await collectUntilTerminal(streamSession(session, "review the changes"));
+
+    expect(events.filter((event) => event.type === "turn_failed")).toEqual([
+      expect.objectContaining({
+        type: "turn_failed",
+        error: "API Error: 409 Conversation already has an active request",
+        failureKind: "conversation_unresolved",
+      }),
+    ]);
+    expect(events.some((event) => event.type === "turn_completed")).toBe(false);
+  } finally {
+    await session.close();
+  }
+});
+
+test("classifies a post-work active-request error when Claude throws without a result", async () => {
+  let step = 0;
+  sdkQueryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    const iterator = prompt[Symbol.asyncIterator]();
+    return createBaseQueryMock(
+      vi.fn(async () => {
+        if (step === 0) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "system",
+              subtype: "init",
+              session_id: "post-work-active-request-throw-session",
+              permissionMode: "default",
+              model: "opus",
+            },
+          };
+        }
+        if (step === 1) {
+          step += 1;
+          await iterator.next();
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              uuid: "post-work-progress-before-active-request-throw",
+              message: {
+                role: "assistant",
+                content: "I completed several review steps.",
+              },
+            },
+          };
+        }
+        if (step === 2) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              uuid: "post-work-active-request-error-before-throw",
+              error: "unknown",
+              isApiErrorMessage: true,
+              message: {
+                role: "assistant",
+                model: "<synthetic>",
+                content: [
+                  {
+                    type: "text",
+                    text: "API Error: 409 Conversation already has an active request",
+                  },
+                ],
+              },
+            },
+          };
+        }
+        throw new Error("transport closed after synthetic API error");
+      }),
+    );
+  });
+
+  const session = await createSession();
+  try {
+    const events = await collectUntilTerminal(streamSession(session, "review the changes"));
+
+    expect(events.filter((event) => event.type === "turn_failed")).toEqual([
+      expect.objectContaining({
+        type: "turn_failed",
+        error: "API Error: 409 Conversation already has an active request",
+        failureKind: "conversation_unresolved",
+      }),
+    ]);
+    expect(events.some((event) => event.type === "turn_completed")).toBe(false);
+  } finally {
+    await session.close();
   }
 });
 

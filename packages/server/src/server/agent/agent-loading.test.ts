@@ -102,6 +102,11 @@ test.each([
     "conversation_unresolved" as const,
   ],
   [
+    "active-request ambiguity",
+    "API Error: 409 Conversation already has an active request",
+    "conversation_unresolved" as const,
+  ],
+  [
     "resumed-session model rejection",
     "There's an issue with the selected model (claude-opus-5). It may not exist or you may not have access to it. Run --model to pick a different model.",
     "resume_model_unavailable" as const,

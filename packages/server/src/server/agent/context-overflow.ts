@@ -20,6 +20,7 @@ export function isConversationUnresolvedFailureText(value: unknown): value is st
   return (
     typeof value === "string" &&
     (/^API Error:\s*409\s+Conversation has an unresolved prior request\b/i.test(value.trim()) ||
+      /^API Error:\s*409\s+Conversation already has an active request\b/i.test(value.trim()) ||
       /^API Error:\s*503\s+Continuation matching is temporarily unavailable\b/i.test(value.trim()))
   );
 }
