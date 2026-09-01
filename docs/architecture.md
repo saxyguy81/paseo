@@ -103,7 +103,7 @@ host's client; plugin subprocesses use the same facade over a host-owned IPC tra
 Cross-platform React Native app that connects to one or more daemons.
 
 - Expo Router navigation (`/h/[serverId]/workspace/[workspaceId]`, `/h/[serverId]/agent/[agentId]`, etc.). The `workspaceId` URL segment is an opaque workspace id, not a directly meaningful filesystem path.
-- `HostRuntimeController` manages saved host connections, reconnection, and per-host runtime state
+- `HostRuntimeController` manages saved host connections, reconnection, and per-host runtime state. Direct TCP and relay connections use the ordinary client transport; desktop socket, pipe, and SSH connections cross one Electron-owned transport boundary. SSH only tunnels to an already-running daemon.
 - `runtime/replica-cache` is typed storage behind the directory and timeline owners. It never observes or mutates `SessionStore`.
 - `runtime/directory-sync` owns directory cache selection and network reconciliation. On demand it paints accepted rows for one host, then passes the persisted per-entity cursor through `project.list`, `fetch_workspaces`, and `fetch_agents`; the daemon returns each entity's latest projection when its sequence is newer, plus tombstones.
 - `workspace-labels` owns one sequenced catalog replica per connected host, the deterministic cross-host projection that surfaces spanning hosts use (the filter page, the manager), and the per-host resolution a workspace row's chips use. Two hosts may give one name different colors, so a row resolves against its own host's catalog and a merged answer would be wrong there. Catalogs never synchronize between hosts; assignment creates a missing definition only on the target host. On the daemon, catalog and assignment rewrites share a journaled commit boundary. Startup recovery completes that commit before workspace or catalog publication.
@@ -162,7 +162,7 @@ Communicates with the daemon via the same WebSocket protocol as the app.
 
 Enables remote access when the daemon is behind a firewall.
 
-- Curve25519 ECDH key exchange + XSalsa20-Poly1305 (NaCl `box`) encryption
+- Curve25519 establishes the relay-session secret; NaCl `box` protects each payload with XSalsa20-Poly1305
 - The relay is zero-knowledge — it routes encrypted bytes and cannot read content
 - Client and daemon channels with identical API (`createClientChannel`, `createDaemonChannel`)
 - Pairing via QR code transfers the daemon's public key to the client

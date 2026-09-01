@@ -20,6 +20,11 @@ function storedSendBehavior(storage: Storage): SendBehavior | undefined {
   return raw === undefined ? undefined : JSON.parse(raw).sendBehavior;
 }
 
+function storedContentFontSize(storage: Storage): number | undefined {
+  const raw = storage.entries.get(APP_SETTINGS_KEY);
+  return raw === undefined ? undefined : JSON.parse(raw).contentFontSize;
+}
+
 /** An in-memory storage whose write to `failingKey` always throws, as a full disk would. */
 function createFailingWriteStorage(failingKey: string): Storage {
   const storage = createInMemoryKeyValueStorage();
@@ -83,6 +88,51 @@ describe("migrateAppSettings", () => {
       "steer-default",
       "durable-queue-default",
     ]);
+  });
+
+  it("migrates every mobile 15px content preference to 16px", async () => {
+    const storage = createInMemoryKeyValueStorage();
+    const settings = { ...settingsWith("steer"), contentFontSize: 15 };
+
+    const result = await migrateAppSettings(settings, storage, undefined, { native: true });
+
+    expect(result.contentFontSize).toBe(16);
+    expect(storedContentFontSize(storage)).toBe(16);
+    expect(appliedIds(storage)).toEqual([
+      "steer-default",
+      "durable-queue-default",
+      "mobile-content-16",
+    ]);
+  });
+
+  it("leaves a 15px web content preference unchanged", async () => {
+    const storage = createInMemoryKeyValueStorage();
+    const settings = { ...settingsWith("steer"), contentFontSize: 15 };
+
+    const result = await migrateAppSettings(settings, storage, undefined, { native: false });
+
+    expect(result.contentFontSize).toBe(15);
+    expect(storedContentFontSize(storage)).toBe(15);
+    expect(appliedIds(storage)).toEqual(["steer-default", "durable-queue-default"]);
+  });
+
+  it("lets a mobile user choose 15px after the default migration ran", async () => {
+    const storage = createInMemoryKeyValueStorage();
+    await migrateAppSettings(
+      { ...settingsWith("steer"), contentFontSize: 15 },
+      storage,
+      undefined,
+      { native: true },
+    );
+
+    const result = await migrateAppSettings(
+      { ...settingsWith("steer"), contentFontSize: 15 },
+      storage,
+      undefined,
+      { native: true },
+    );
+
+    expect(result.contentFontSize).toBe(15);
   });
 
   it("stays unmarked when the settings write fails, so a later launch retries", async () => {

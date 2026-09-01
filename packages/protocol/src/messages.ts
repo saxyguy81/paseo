@@ -93,6 +93,20 @@ export {
 // Mutable daemon config schemas (shared between server store and client)
 // ---------------------------------------------------------------------------
 
+export const DAEMON_PERMISSIONS = [
+  "daemon.read",
+  "daemon.manage",
+  "tunnel.manage",
+  "access.manage",
+  "workspace.read",
+  "workspace.write",
+  "workspace.manage",
+  "automation.manage",
+  "hub.execute",
+] as const;
+export const DaemonPermissionSchema = z.enum(DAEMON_PERMISSIONS);
+export type DaemonPermission = z.infer<typeof DaemonPermissionSchema>;
+
 const MutableDaemonProviderModelSchema = z
   .object({
     id: z.string().min(1),
@@ -1398,6 +1412,7 @@ export const HubManagementDaemonConnectRequestSchema = z.object({
   requestId: z.string(),
   hubUrl: z.string(),
   token: z.string(),
+  permissions: z.array(DaemonPermissionSchema).default([]),
 });
 export const HubManagementDaemonGetStatusRequestSchema = z.object({
   type: z.literal("hub.management.daemon.get_status.request"),
@@ -1407,6 +1422,12 @@ export const HubManagementDaemonDisconnectRequestSchema = z.object({
   type: z.literal("hub.management.daemon.disconnect.request"),
   requestId: z.string(),
   force: z.boolean().optional(),
+});
+export const HubManagementDaemonPermissionsUpdateRequestSchema = z.object({
+  type: z.literal("hub.management.daemon.permissions.update.request"),
+  requestId: z.string(),
+  grant: z.array(DaemonPermissionSchema).default([]),
+  revoke: z.array(DaemonPermissionSchema).default([]),
 });
 
 export const DiagnosticsRequestSchema = z.object({
@@ -1441,6 +1462,27 @@ export const PluginDirectoryInspectRequestSchema = z.object({
   type: z.literal("plugin.directory.inspect.request"),
   requestId: z.string(),
   path: z.string().min(1),
+});
+
+export const PluginSourceInstallRequestSchema = z.object({
+  type: z.literal("plugin.source.install.request"),
+  requestId: z.string(),
+  source: z.string().min(1),
+  id: PluginIdSchema.optional(),
+  ref: z.string().min(1).optional(),
+  pluginPath: z.string().min(1).optional(),
+});
+
+export const PluginSourceStatusRequestSchema = z.object({
+  type: z.literal("plugin.source.status.request"),
+  requestId: z.string(),
+  pluginId: PluginIdSchema.optional(),
+});
+
+export const PluginSourceUpdateRequestSchema = z.object({
+  type: z.literal("plugin.source.update.request"),
+  requestId: z.string(),
+  pluginId: PluginIdSchema.optional(),
 });
 
 function pluginIdRequest<const Type extends string>(type: Type) {
@@ -2995,12 +3037,16 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   HubManagementDaemonConnectRequestSchema,
   HubManagementDaemonGetStatusRequestSchema,
   HubManagementDaemonDisconnectRequestSchema,
+  HubManagementDaemonPermissionsUpdateRequestSchema,
   DiagnosticsRequestSchema,
   PluginCatalogGetRequestSchema,
   PluginListRequestSchema,
   PluginLogsGetRequestSchema,
   PluginDirectoryInstallRequestSchema,
   PluginDirectoryInspectRequestSchema,
+  PluginSourceInstallRequestSchema,
+  PluginSourceStatusRequestSchema,
+  PluginSourceUpdateRequestSchema,
   PluginReloadRequestSchema,
   PluginEnableRequestSchema,
   PluginDisableRequestSchema,
@@ -3306,6 +3352,8 @@ export const ServerInfoStatusPayloadSchema = z
     serverId: z.string().trim().min(1),
     hostname: ServerInfoHostnameSchema.optional(),
     version: ServerInfoVersionSchema.optional(),
+    // COMPAT(sessionPermissions): optional while clients support older daemons.
+    permissions: z.array(DaemonPermissionSchema).optional(),
     // COMPAT(desktopManaged): added in v0.1.X, remove optional parsing after 2027-01-16.
     desktopManaged: z.boolean().optional(),
     capabilities: ServerCapabilitiesFromUnknownSchema.optional(),
@@ -3353,6 +3401,8 @@ export const ServerInfoStatusPayloadSchema = z
         pluginManagement: z.boolean().optional(),
         // COMPAT(pluginLogs): added in v0.4.0, remove gate after 2027-08-16.
         pluginLogs: z.boolean().optional(),
+        // COMPAT(pluginGitManagement): added in v0.7.0, remove gate after 2027-08-26.
+        pluginGitManagement: z.boolean().optional(),
         // COMPAT(pluginThemes): added in v0.5.0, remove gate after 2027-08-20.
         // A daemon that predates this flag keeps `addTheme` in the server bundle it compiles,
         // so a theme plugin cannot start there at all.
@@ -4578,7 +4628,7 @@ export const HubRelationshipStatusSchema = z.object({
   ]),
   daemonId: z.string().nullable(),
   hubOrigin: z.string().nullable(),
-  scopes: z.array(z.string()),
+  permissions: z.array(DaemonPermissionSchema),
   connectedAt: z.string().nullable(),
   lastError: z.string().nullable(),
 });
@@ -4597,6 +4647,10 @@ export const HubManagementDaemonDisconnectResponseSchema = z.object({
     status: HubRelationshipStatusSchema,
     warning: z.string().optional(),
   }),
+});
+export const HubManagementDaemonPermissionsUpdateResponseSchema = z.object({
+  type: z.literal("hub.management.daemon.permissions.update.response"),
+  payload: z.object({ requestId: z.string(), status: HubRelationshipStatusSchema }),
 });
 
 export const DaemonGetPairingOfferResponseSchema = z.object({
@@ -6119,6 +6173,10 @@ export const PluginListItemSchema = z.object({
   path: z.string(),
   enabled: z.boolean(),
   status: PluginStatusSchema,
+  source: z.enum(["directory", "git"]).optional(),
+  remote: z.string().optional(),
+  ref: z.string().optional(),
+  commit: z.string().optional(),
   error: z.string().optional(),
 });
 export type PluginListItem = z.infer<typeof PluginListItemSchema>;
@@ -6153,6 +6211,43 @@ export const PluginDirectoryInstallResponseSchema = z.object({
 export const PluginDirectoryInspectResponseSchema = z.object({
   type: z.literal("plugin.directory.inspect.response"),
   payload: z.object({ requestId: z.string(), id: PluginIdSchema }),
+});
+
+export const PluginSourceInstallResponseSchema = z.object({
+  type: z.literal("plugin.source.install.response"),
+  payload: z.object({ requestId: z.string(), plugin: PluginListItemSchema }),
+});
+
+export const PluginSourceStatusItemSchema = z.object({
+  id: PluginIdSchema,
+  source: z.enum(["directory", "git"]),
+  path: z.string(),
+  remote: z.string().optional(),
+  ref: z.string().optional(),
+  currentCommit: z.string().optional(),
+  latestCommit: z.string().optional(),
+  commitsBehind: z.number().int().nonnegative().optional(),
+  updateAvailable: z.boolean().optional(),
+});
+export type PluginSourceStatusItem = z.infer<typeof PluginSourceStatusItemSchema>;
+
+export const PluginSourceStatusResponseSchema = z.object({
+  type: z.literal("plugin.source.status.response"),
+  payload: z.object({ requestId: z.string(), plugins: z.array(PluginSourceStatusItemSchema) }),
+});
+
+export const PluginSourceUpdateItemSchema = z.object({
+  id: PluginIdSchema,
+  previousCommit: z.string(),
+  currentCommit: z.string(),
+  commits: z.number().int().nonnegative(),
+  updated: z.boolean(),
+});
+export type PluginSourceUpdateItem = z.infer<typeof PluginSourceUpdateItemSchema>;
+
+export const PluginSourceUpdateResponseSchema = z.object({
+  type: z.literal("plugin.source.update.response"),
+  payload: z.object({ requestId: z.string(), plugins: z.array(PluginSourceUpdateItemSchema) }),
 });
 
 function pluginActionResponse<const Type extends string>(type: Type) {
@@ -6219,6 +6314,9 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   PluginLogsGetResponseSchema,
   PluginDirectoryInstallResponseSchema,
   PluginDirectoryInspectResponseSchema,
+  PluginSourceInstallResponseSchema,
+  PluginSourceStatusResponseSchema,
+  PluginSourceUpdateResponseSchema,
   PluginReloadResponseSchema,
   PluginEnableResponseSchema,
   PluginDisableResponseSchema,
@@ -6297,6 +6395,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   HubManagementDaemonConnectResponseSchema,
   HubManagementDaemonGetStatusResponseSchema,
   HubManagementDaemonDisconnectResponseSchema,
+  HubManagementDaemonPermissionsUpdateResponseSchema,
   DiagnosticsResponseSchema,
   GetDaemonConfigResponseMessageSchema,
   SetDaemonConfigResponseMessageSchema,
@@ -6871,7 +6970,7 @@ export const WSPongMessageSchema = z.object({
 export const WSHelloMessageSchema = z.object({
   type: z.literal("hello"),
   clientId: z.string().min(1),
-  clientType: z.enum(["mobile", "browser", "cli", "mcp"]),
+  clientType: z.enum(["mobile", "browser", "cli", "mcp", "hub"]),
   protocolVersion: z.number().int(),
   appVersion: z.string().optional(),
   capabilities: z

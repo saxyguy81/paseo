@@ -321,6 +321,7 @@ function searchableText(item: StreamItem, includeToolActivity: boolean): string 
     case "todo_list":
     case "activity_log":
     case "compaction":
+    case "plugin":
       return includeToolActivity ? JSON.stringify(item) : null;
   }
 }

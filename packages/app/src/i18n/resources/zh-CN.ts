@@ -360,7 +360,6 @@ export const zhCN: TranslationResources = {
         added: "已添加",
         started: "已开始",
         completed: "已完成",
-        reopened: "已重新打开",
       },
     },
     compaction: {
@@ -431,6 +430,7 @@ export const zhCN: TranslationResources = {
     },
     fileActions: {
       openFile: "打开文件",
+      openIn: "在 {{target}} 中打开",
       openToSide: "在侧边打开",
       copyPath: "复制路径",
       copyRelativePath: "复制相对路径",
@@ -1555,6 +1555,10 @@ export const zhCN: TranslationResources = {
         title: "直接连接",
         description: "本地网络或 VPN。",
       },
+      remoteSsh: {
+        title: "远程 SSH",
+        description: "通过桌面 SSH 客户端连接。",
+      },
       scanQr: {
         title: "扫描二维码",
         description: "加密 relay 连接。",
@@ -1603,6 +1607,23 @@ export const zhCN: TranslationResources = {
         tlsError: "TLS 错误。只有 daemon 前方有 TLS terminator 时，直接连接才使用 SSL。",
         unableToConnect: "无法连接。请检查 host/port，并确认 daemon 可达。",
         details: "详情：{{detail}}",
+      },
+    },
+    remoteSsh: {
+      title: "远程 SSH",
+      helper: "连接到远程主机上运行的 Paseo 守护进程。",
+      fields: {
+        target: "SSH 主机",
+      },
+      actions: {
+        cancel: "取消",
+        connect: "连接",
+        connecting: "正在连接...",
+      },
+      errors: {
+        targetRequired: "SSH 主机为必填项",
+        invalidTarget: "请输入有效的 ssh:// 主机",
+        failedToConnect: "无法通过 SSH 连接。{{detail}}",
       },
     },
     link: {
@@ -2232,6 +2253,7 @@ export const zhCN: TranslationResources = {
       badges: {
         relay: "Relay",
         local: "本地",
+        remoteSsh: "远程 SSH",
       },
       connections: {
         title: "连接",

@@ -53,7 +53,7 @@ import {
   type ComposerKeyPressEvent,
   type MessageInputRef,
 } from "./input/input";
-import type { ImageAttachment, MessagePayload } from "./types";
+import type { ImageAttachment, MessagePayload, TextReplacement } from "./types";
 import { ICON_SIZE, type Theme } from "@/styles/theme";
 import type { DraftCommandConfig } from "@/hooks/use-agent-commands-query";
 import { encodeImages } from "@/utils/encode-images";
@@ -124,7 +124,7 @@ import { droppedItemsToPickedFiles } from "@/composer/attachments/drop";
 import { getFileTypeLabel } from "@/attachments/file-types";
 import { Combobox, ComboboxItem, type ComboboxOption } from "@/components/ui/combobox";
 import { AttachmentLabel, AttachmentPill, AttachmentThumbnail } from "@/components/attachment-pill";
-import { AttachmentLightbox } from "@/components/attachment-lightbox";
+import { AttachmentLightbox, type ImageLightboxSource } from "@/components/attachment-lightbox";
 import { openExternalUrl } from "@/utils/open-external-url";
 import { useIsDictationReady } from "@/hooks/use-is-dictation-ready";
 import { useForgeSearchQuery } from "@/git/use-forge-search-query";
@@ -931,7 +931,7 @@ interface ComposerProps {
   blurOnSubmit?: boolean;
   value: string;
   onChangeText: (text: string) => void;
-  textReplacementKey: string;
+  textReplacement: TextReplacement;
   attachments: UserComposerAttachment[];
   attachmentScopeKeys?: readonly string[];
   onOpenWorkspaceAttachment?: (attachment: WorkspaceComposerAttachment) => void;
@@ -1153,7 +1153,7 @@ function ComposerContentImpl({
   blurOnSubmit = false,
   value,
   onChangeText,
-  textReplacementKey,
+  textReplacement,
   attachments,
   attachmentScopeKeys = EMPTY_ATTACHMENT_SCOPE_KEYS,
   onOpenWorkspaceAttachment,
@@ -2155,6 +2155,10 @@ function ComposerContentImpl({
   const handleLightboxClose = useCallback(() => {
     setLightboxMetadata(null);
   }, []);
+  const lightboxSource = useMemo<ImageLightboxSource | null>(
+    () => (lightboxMetadata ? { type: "attachment", metadata: lightboxMetadata } : null),
+    [lightboxMetadata],
+  );
 
   const handleGithubPickerOpenChange = useCallback(
     (open: boolean) => {
@@ -2277,7 +2281,7 @@ function ComposerContentImpl({
         isMessageInputFocused={isMessageInputFocused}
       />
       <Animated.View style={composerContainerStyle}>
-        <AttachmentLightbox metadata={lightboxMetadata} onClose={handleLightboxClose} />
+        <AttachmentLightbox source={lightboxSource} onClose={handleLightboxClose} />
         {/* Input area */}
         <View style={inputAreaContainerStyle}>
           <View style={styles.inputAreaContent}>
@@ -2342,7 +2346,7 @@ function ComposerContentImpl({
                   attachmentSlot={attachmentTray}
                   inputMode={inputMode}
                   readOnly={readOnly}
-                  textReplacementKey={textReplacementKey}
+                  textReplacement={textReplacement}
                   submitLabel={submitLabel}
                 />
               </RenderProfile>
@@ -2378,6 +2382,9 @@ function ComposerContentImpl({
 const animatedStaticStyles = RNStyleSheet.create({
   container: {
     flexDirection: "column",
+    // KeyboardDock reduces the available column height with bottom padding.
+    // Keep the composer's constraint chain shrinkable down to its scrolling input.
+    flexShrink: 1,
     position: "relative",
   },
 });
@@ -2388,6 +2395,7 @@ const styles = StyleSheet.create((theme: Theme) => ({
     backgroundColor: theme.colors.border,
   },
   inputAreaContainer: {
+    flexShrink: 1,
     position: "relative",
     minHeight: FOOTER_HEIGHT,
     marginHorizontal: "auto",
@@ -2401,11 +2409,13 @@ const styles = StyleSheet.create((theme: Theme) => ({
     opacity: 0.6,
   },
   inputAreaContent: {
+    flexShrink: 1,
     width: "100%",
     maxWidth: MAX_CONTENT_WIDTH,
     gap: theme.spacing[3],
   },
   messageInputContainer: {
+    flexShrink: 1,
     position: "relative",
     width: "100%",
     gap: theme.spacing[3],
