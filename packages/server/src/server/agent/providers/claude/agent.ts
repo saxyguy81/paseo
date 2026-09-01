@@ -2262,8 +2262,13 @@ class ClaudeAgentSession implements AgentSession {
     kind: ConversationRolloverFailureKind;
     error: string;
   } | null = null;
-  /** True only until a resumed runtime completes its first successful turn. */
-  private resumeModelUnavailableRolloverEligible: boolean;
+  /**
+   * True once this native conversation is known to be a continuation. Fresh
+   * first-turn model failures stay visible as access errors. A resumed handle
+   * or any successful turn proves that a later model_not_found can instead be
+   * stale native-session state, so the family manager may roll it over once.
+   */
+  private modelUnavailableRolloverEligible: boolean;
   private readonly contextUsage: ClaudeContextUsageState;
   private userMessageIds: string[] = [];
   private readonly emittedUserMessageIds = new Set<string>();
@@ -2287,7 +2292,7 @@ class ClaudeAgentSession implements AgentSession {
       findClaudeModel(this.config.model)?.contextWindowMaxTokens,
     );
     const handle = options.handle;
-    this.resumeModelUnavailableRolloverEligible = Boolean(handle);
+    this.modelUnavailableRolloverEligible = Boolean(handle);
 
     if (handle) {
       if (!handle.sessionId) {
@@ -2601,9 +2606,16 @@ class ClaudeAgentSession implements AgentSession {
   async setModel(modelId: string | null): Promise<void> {
     const normalizedModelId =
       typeof modelId === "string" && modelId.trim().length > 0 ? modelId.trim() : null;
+    const previousModelId = this.config.model?.trim() || null;
     const activeQuery = await this.ensureQuery();
     await activeQuery.setModel(normalizedModelId ?? undefined);
     this.config.model = normalizedModelId ?? undefined;
+    if (normalizedModelId !== previousModelId) {
+      // A model selected after the native conversation was established may be
+      // genuinely inaccessible. Require one successful turn on the new model
+      // before treating a later model_not_found as stale conversation state.
+      this.modelUnavailableRolloverEligible = false;
+    }
     this.reconcileThinkingOptionForModel(normalizedModelId);
     if (!claudeModelSupportsFastMode(this.config.model) && this.config.featureValues?.fast_mode) {
       await this.applyFastModeFeature(false, activeQuery);
@@ -3792,7 +3804,7 @@ class ClaudeAgentSession implements AgentSession {
     }
     this.notifySubscribers(event);
     if (event.type === "turn_completed") {
-      this.resumeModelUnavailableRolloverEligible = false;
+      this.modelUnavailableRolloverEligible = true;
     }
     this.activeForegroundTurnId = null;
     this.activeForegroundQuery = null;
@@ -3815,7 +3827,7 @@ class ClaudeAgentSession implements AgentSession {
 
     if (terminalSeen) {
       if (events.some((event) => event.type === "turn_completed")) {
-        this.resumeModelUnavailableRolloverEligible = false;
+        this.modelUnavailableRolloverEligible = true;
       }
       if (this.activeForegroundTurnId) {
         this.activeForegroundTurnId = null;
@@ -3860,7 +3872,7 @@ class ClaudeAgentSession implements AgentSession {
       return;
     }
     this.notifySubscribers({ type: "turn_completed", provider: "claude" });
-    this.resumeModelUnavailableRolloverEligible = false;
+    this.modelUnavailableRolloverEligible = true;
     this.autonomousTurn = null;
     this.activeForegroundQuery = null;
     this.activeForegroundInput = null;
@@ -4281,7 +4293,7 @@ class ClaudeAgentSession implements AgentSession {
       };
       return;
     }
-    if (this.resumeModelUnavailableRolloverEligible) {
+    if (this.modelUnavailableRolloverEligible) {
       const modelUnavailable = readClaudeResumeModelUnavailableError(message);
       if (modelUnavailable) {
         this.pendingConversationRolloverFailure = {

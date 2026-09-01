@@ -658,7 +658,10 @@ test.each([
   },
 );
 
-test("a successful post-resume turn disables model-not-found rollover for later turns", async () => {
+test.each([
+  { name: "resumed", resumed: true },
+  { name: "fresh after one success", resumed: false },
+])("a later model-not-found error rolls over a $name native session", async ({ resumed }) => {
   const text =
     "There's an issue with the selected model (claude-opus-5). It may not exist or you may not have access to it. Run --model to pick a different model.";
   let step = 0;
@@ -720,7 +723,9 @@ test("a successful post-resume turn disables model-not-found rollover for later 
     );
   });
 
-  const session = await createResumedSession("persisted-post-resume-success-session");
+  const session = resumed
+    ? await createResumedSession("persisted-post-resume-success-session")
+    : await createSession();
   try {
     const first = await collectUntilTerminal(streamSession(session, "first turn"));
     expect(first.at(-1)?.type).toBe("turn_completed");
@@ -728,9 +733,9 @@ test("a successful post-resume turn disables model-not-found rollover for later 
     const failure = second.find((event) => event.type === "turn_failed");
     expect(failure).toMatchObject({
       type: "turn_failed",
-      error: "Claude run failed",
+      error: text,
+      failureKind: "resume_model_unavailable",
     });
-    expect(failure?.failureKind).toBeUndefined();
     expect(second).toContainEqual(
       expect.objectContaining({
         type: "timeline",
@@ -740,6 +745,20 @@ test("a successful post-resume turn disables model-not-found rollover for later 
   } finally {
     await session.close();
   }
+});
+
+test("a model change requires a successful turn before model-not-found rollover", async () => {
+  const queryMock = createBaseQueryMock(vi.fn(async () => ({ done: true, value: undefined })));
+  sdkQueryFactory.mockReturnValue(queryMock);
+  const session = await createResumedSession("persisted-model-change-session");
+  const internal: { modelUnavailableRolloverEligible: boolean } = asInternals(session);
+
+  expect(internal.modelUnavailableRolloverEligible).toBe(true);
+  await session.setModel?.("claude-sonnet-4-5");
+  expect(queryMock.setModel).toHaveBeenCalledWith("claude-sonnet-4-5");
+  expect(internal.modelUnavailableRolloverEligible).toBe(false);
+
+  await session.close();
 });
 
 test("keeps context overflow classified after an AskUserQuestion response", async () => {
@@ -3171,8 +3190,8 @@ test("reuses one autonomous run for unbound stream_event bursts with no foregrou
   await session.close();
 });
 
-test("an autonomous success disables model-not-found rollover for a resumed session", async () => {
-  const session = await createResumedSession("persisted-autonomous-success-session");
+test("an autonomous success enables later model-not-found rollover", async () => {
+  const session = await createSession();
   const internal: {
     turnState: "idle" | "foreground" | "autonomous";
     routeSdkMessageFromPump: (
@@ -3180,11 +3199,11 @@ test("an autonomous success disables model-not-found rollover for a resumed sess
       activeQuery: QueryMock,
     ) => Promise<void>;
     autonomousTurn: { id: string } | null;
-    resumeModelUnavailableRolloverEligible: boolean;
+    modelUnavailableRolloverEligible: boolean;
   } = asInternals(session);
   const queryMock = createBaseQueryMock(vi.fn(async () => ({ done: true, value: undefined })));
 
-  expect(internal.resumeModelUnavailableRolloverEligible).toBe(true);
+  expect(internal.modelUnavailableRolloverEligible).toBe(false);
   internal.turnState = "idle";
   await internal.routeSdkMessageFromPump(
     {
@@ -3208,7 +3227,7 @@ test("an autonomous success disables model-not-found rollover for a resumed sess
     queryMock,
   );
   expect(internal.autonomousTurn).toBeNull();
-  expect(internal.resumeModelUnavailableRolloverEligible).toBe(false);
+  expect(internal.modelUnavailableRolloverEligible).toBe(true);
 
   await session.close();
 });
