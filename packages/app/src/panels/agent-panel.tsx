@@ -1,10 +1,8 @@
 import { Button } from "@/components/ui/button";
-import { SearchField } from "@/components/ui/search-field";
-import { Switch } from "@/components/ui/switch";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { TFunction } from "i18next";
-import { ChevronDown, ChevronUp, SquarePen } from "lucide-react-native";
+import { SquarePen } from "lucide-react-native";
 import React, {
   memo,
   useCallback,
@@ -15,7 +13,7 @@ import React, {
   useSyncExternalStore,
 } from "react";
 import { useTranslation } from "react-i18next";
-import { Pressable, StyleSheet as RNStyleSheet, Text, View } from "react-native";
+import { StyleSheet as RNStyleSheet, Text, View } from "react-native";
 import ReanimatedAnimated from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
@@ -24,6 +22,7 @@ import { shallow, useShallow } from "zustand/shallow";
 import { useStoreWithEqualityFn } from "zustand/traditional";
 import { AgentStreamView, type AgentStreamViewHandle } from "@/agent-stream/view";
 import { ArchivedAgentCallout } from "@/components/archived-agent-callout";
+import { ConversationFamilyToolbar } from "@/components/conversation-family-toolbar";
 import { FileDropZone } from "@/components/file-drop/file-drop-zone";
 import { useRetainedPanelActive } from "@/components/retained-panel";
 import { Composer } from "@/composer";
@@ -108,11 +107,8 @@ import { applyLegacyDaemonWorkspaceOwnership } from "@/workspace/legacy-daemon-w
 import type { WorkspaceFileOpenRequest } from "@/workspace/file-open";
 import { deriveSidebarStateBucket } from "@/utils/sidebar-agent-state";
 import { buildDraftAgentSetup, type ClientSlashCommand } from "@/client-slash-commands";
-import { parseConversationFamilyLabels, searchConversationFamily } from "@/conversation-family";
-import {
-  useConversationFamily,
-  type ConversationFamilyView,
-} from "@/hooks/use-conversation-family";
+import { parseConversationFamilyLabels } from "@/conversation-family";
+import { useConversationFamily } from "@/hooks/use-conversation-family";
 
 interface ChatAgentStateShape {
   serverId: string | null;
@@ -422,7 +418,10 @@ function DraftPanel() {
   const handleCreated = useCallback(
     (agentSnapshot: Parameters<typeof normalizeAgentSnapshot>[0]) => {
       const normalized = normalizeAgentSnapshot(agentSnapshot, serverId);
-      const agent = applyLegacyDaemonWorkspaceOwnership({ serverId, agent: normalized });
+      const agent = applyLegacyDaemonWorkspaceOwnership({
+        serverId,
+        agent: normalized,
+      });
       useSessionStore.getState().setAgents(serverId, (prev) => {
         const next = new Map(prev);
         next.set(agentSnapshot.id, agent);
@@ -639,10 +638,15 @@ function AgentPanelBody({
   const agentState = useSessionStore(
     useShallow((state) => selectChatAgentState(state, serverId, agentId)),
   );
-  const [lookupState, setLookupState] = useState<AgentLookupState>({ tag: "idle" });
+  const [lookupState, setLookupState] = useState<AgentLookupState>({
+    tag: "idle",
+  });
   const lookupAttemptTokenRef = useRef(0);
   const retryAgentLookup = useCallback(() => setLookupState({ tag: "idle" }), []);
-  const workspaceKey = buildWorkspaceTabPersistenceKey({ serverId, workspaceId });
+  const workspaceKey = buildWorkspaceTabPersistenceKey({
+    serverId,
+    workspaceId,
+  });
   const resolvePendingAgent = useWorkspaceLayoutStore((state) => state.resolvePendingAgent);
 
   useEffect(() => {
@@ -872,7 +876,11 @@ function ChatAgentContent({
     sync: viewedTimelineSync,
   });
   const hasActiveCreateHandoff = useCreateFlowStore((state) =>
-    findActiveCreateHandoff({ pendingByDraftId: state.pendingByDraftId, serverId, agentId }),
+    findActiveCreateHandoff({
+      pendingByDraftId: state.pendingByDraftId,
+      serverId,
+      agentId,
+    }),
   );
   const hasSession = useSessionStore((state) => Boolean(state.sessions[serverId]));
   const [missingAgentState, setMissingAgentState] = useState<AgentScreenMissingState>({
@@ -1289,7 +1297,10 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   onOpenWorkspaceFile?: (request: WorkspaceFileOpenRequest) => void;
 }) {
   const { t } = useTranslation();
-  const subagentRows = useSubagentsForParent({ serverId, parentAgentId: agentId });
+  const subagentRows = useSubagentsForParent({
+    serverId,
+    parentAgentId: agentId,
+  });
   const tasks = useSessionStore((state): TodoEntry[] | undefined =>
     state.sessions[serverId]?.agentTasks.get(agentId),
   );
@@ -1467,139 +1478,6 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   );
 });
 
-function ConversationFamilyToolbar({
-  family,
-  onJumpToMatch,
-}: {
-  family: ConversationFamilyView;
-  onJumpToMatch: (itemId: string) => void;
-}) {
-  const { t } = useTranslation();
-  const isCompactFormFactor = useIsCompactFormFactor();
-  const [query, setQuery] = useState("");
-  const [includeToolActivity, setIncludeToolActivity] = useState(false);
-  const [activeMatchIndex, setActiveMatchIndex] = useState(0);
-  const matches = useMemo(
-    () => searchConversationFamily(family.streamItems, query, { includeToolActivity }),
-    [family.streamItems, includeToolActivity, query],
-  );
-
-  useEffect(() => setActiveMatchIndex(0), [includeToolActivity, matches.length, query]);
-
-  const jumpToMatch = useCallback(
-    (index: number) => {
-      if (matches.length === 0) return;
-      const normalized = (index + matches.length) % matches.length;
-      setActiveMatchIndex(normalized);
-      onJumpToMatch(matches[normalized].itemId);
-    },
-    [matches, onJumpToMatch],
-  );
-  const hasMatches = matches.length > 0;
-  const matchNavigationAccessibilityState = useMemo(
-    () => ({ disabled: !hasMatches }),
-    [hasMatches],
-  );
-  const matchCountLabel = useMemo(() => {
-    if (query.trim().length === 0) return "";
-    if (!hasMatches) return t("agentStream.family.noMatches");
-    return t("agentStream.family.matchCount", {
-      current: Math.min(activeMatchIndex + 1, matches.length),
-      total: matches.length,
-    });
-  }, [activeMatchIndex, hasMatches, matches.length, query, t]);
-  const jumpToPreviousMatch = useCallback(
-    () => jumpToMatch(activeMatchIndex - 1),
-    [activeMatchIndex, jumpToMatch],
-  );
-  const jumpToNextMatch = useCallback(
-    () => jumpToMatch(activeMatchIndex + 1),
-    [activeMatchIndex, jumpToMatch],
-  );
-
-  return (
-    <View style={styles.familyToolbarRail} testID="conversation-family-toolbar">
-      <View style={styles.familyToolbar}>
-        <View style={styles.familySummary}>
-          {family.isLoading ? (
-            <ThemedLoadingSpinner size="small" uniProps={foregroundMutedColorMapping} />
-          ) : null}
-          <Text style={styles.familySummaryText} numberOfLines={1}>
-            {t("agentStream.family.fullHistory", { count: family.memberCount })}
-          </Text>
-          {family.error ? (
-            <Text style={styles.familyErrorText} numberOfLines={1}>
-              {t("agentStream.family.loadFailed")}
-            </Text>
-          ) : null}
-        </View>
-        <View
-          style={[styles.familySearchRow, isCompactFormFactor && styles.familySearchRowCompact]}
-        >
-          <View
-            style={[
-              styles.familySearchField,
-              isCompactFormFactor && styles.familySearchFieldCompact,
-            ]}
-          >
-            <SearchField
-              value={query}
-              onChangeText={setQuery}
-              placeholder={t("agentStream.family.searchPlaceholder")}
-              clearAccessibilityLabel={t("agentStream.family.clearSearch")}
-              testID="conversation-family-search"
-              clearTestID="conversation-family-search-clear"
-            />
-          </View>
-          <View
-            style={[
-              styles.familySearchControls,
-              isCompactFormFactor && styles.familySearchControlsCompact,
-            ]}
-          >
-            <Text style={styles.familyMatchCount} testID="conversation-family-match-count">
-              {matchCountLabel}
-            </Text>
-            <Pressable
-              style={styles.familyNavButton}
-              disabled={!hasMatches}
-              onPress={jumpToPreviousMatch}
-              accessibilityRole="button"
-              accessibilityLabel={t("agentStream.family.previousMatch")}
-              accessibilityState={matchNavigationAccessibilityState}
-              testID="conversation-family-previous"
-            >
-              <ThemedChevronUp size={16} uniProps={foregroundMutedColorMapping} />
-            </Pressable>
-            <Pressable
-              style={styles.familyNavButton}
-              disabled={!hasMatches}
-              onPress={jumpToNextMatch}
-              accessibilityRole="button"
-              accessibilityLabel={t("agentStream.family.nextMatch")}
-              accessibilityState={matchNavigationAccessibilityState}
-              testID="conversation-family-next"
-            >
-              <ThemedChevronDown size={16} uniProps={foregroundMutedColorMapping} />
-            </Pressable>
-            <View style={styles.familyToolToggle}>
-              <Text style={styles.familyToolToggleText}>
-                {t("agentStream.family.includeTools")}
-              </Text>
-              <Switch
-                value={includeToolActivity}
-                onValueChange={setIncludeToolActivity}
-                accessibilityLabel={t("agentStream.family.includeTools")}
-                testID="conversation-family-include-tools"
-              />
-            </View>
-          </View>
-        </View>
-      </View>
-    </View>
-  );
-}
-
 const AgentStreamSection = memo(function AgentStreamSection({
   streamViewRef,
   serverId,
@@ -1651,7 +1529,12 @@ const AgentStreamSection = memo(function AgentStreamSection({
     useShallow((state) =>
       agentId
         ? selectAgentTurnPresentation(state.sessions[serverId], agentId)
-        : { isActive: false, isCancelling: false, startedAt: null, turnId: null },
+        : {
+            isActive: false,
+            isCancelling: false,
+            startedAt: null,
+            turnId: null,
+          },
     ),
   );
   const streamItems = streamItemsRaw ?? EMPTY_STREAM_ITEMS;
@@ -1825,7 +1708,9 @@ function ActiveAgentComposer({
   const isCompactFormFactor = useIsCompactFormFactor();
   const { onLayout: onInputAreaLayout, isBelow: isCompactComposerLayout } = useContainerWidthBelow(
     COMPACT_FORM_FACTOR_WIDTH,
-    { initialIsBelow: isCompactFormFactor },
+    {
+      initialIsBelow: isCompactFormFactor,
+    },
   );
   const paneContext = usePaneContext();
   const openInSidePane = useSettings((settings) => settings.openInSidePane);
@@ -1850,7 +1735,10 @@ function ActiveAgentComposer({
       }
       openWorkspaceChanges({
         isCompact: isCompactFormFactor,
-        workspaceKey: buildWorkspaceTabPersistenceKey({ serverId, workspaceId }),
+        workspaceKey: buildWorkspaceTabPersistenceKey({
+          serverId,
+          workspaceId,
+        }),
         checkout: { serverId, cwd, isGit: true },
         preferences: openInSidePane,
       });
@@ -1865,7 +1753,10 @@ function ActiveAgentComposer({
         throw new Error("Agent not found");
       }
 
-      const workspaceKey = buildWorkspaceTabPersistenceKey({ serverId, workspaceId });
+      const workspaceKey = buildWorkspaceTabPersistenceKey({
+        serverId,
+        workspaceId,
+      });
       if (workspaceKey) {
         unpinWorkspaceAgent(workspaceKey, agentId);
         hideWorkspaceAgent(workspaceKey, agentId);
@@ -2003,8 +1894,6 @@ function AgentSessionUnavailableState({
 }
 
 const ThemedLoadingSpinner = withUnistyles(LoadingSpinner);
-const ThemedChevronUp = withUnistyles(ChevronUp);
-const ThemedChevronDown = withUnistyles(ChevronDown);
 
 const foregroundMutedColorMapping = (theme: Theme) => ({
   color: theme.colors.foregroundMuted,
@@ -2039,96 +1928,6 @@ const styles = StyleSheet.create((theme) => ({
   familyStreamContainer: {
     flex: 1,
     minHeight: 0,
-  },
-  familyToolbarRail: {
-    width: "100%",
-    alignItems: "center",
-    borderBottomWidth: theme.borderWidth[1],
-    borderBottomColor: theme.colors.border,
-    backgroundColor: theme.colors.surface0,
-    paddingHorizontal: {
-      xs: theme.spacing[3],
-      md: theme.spacing[6],
-    },
-    paddingVertical: theme.spacing[2],
-  },
-  familyToolbar: {
-    width: "100%",
-    maxWidth: MAX_CONTENT_WIDTH,
-    gap: theme.spacing[2],
-  },
-  familySummary: {
-    minHeight: 18,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: theme.spacing[2],
-  },
-  familySummaryText: {
-    color: theme.colors.foregroundMuted,
-    fontSize: theme.fontSize.sm,
-    fontWeight: theme.fontWeight.medium,
-  },
-  familyErrorText: {
-    color: theme.colors.statusDanger,
-    fontSize: theme.fontSize.sm,
-  },
-  familySearchRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: theme.spacing[2],
-  },
-  familySearchRowCompact: {
-    flexDirection: "column",
-    alignItems: "stretch",
-  },
-  familySearchField: {
-    flex: 1,
-    minWidth: 0,
-    maxWidth: 420,
-  },
-  familySearchFieldCompact: {
-    width: "100%",
-    maxWidth: "100%",
-  },
-  familySearchControls: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: theme.spacing[2],
-  },
-  familySearchControlsCompact: {
-    width: "100%",
-    justifyContent: "flex-end",
-  },
-  familyMatchCount: {
-    minWidth: 54,
-    color: theme.colors.foregroundMuted,
-    fontSize: theme.fontSize.sm,
-    textAlign: "center",
-  },
-  familyNavButton: {
-    width: {
-      xs: 48,
-      md: 32,
-    },
-    height: {
-      xs: 48,
-      md: 32,
-    },
-    alignItems: "center",
-    justifyContent: "center",
-    borderRadius: theme.borderRadius.md,
-    backgroundColor: theme.colors.surface1,
-    borderWidth: theme.borderWidth[1],
-    borderColor: theme.colors.border,
-  },
-  familyToolToggle: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: theme.spacing[2],
-  },
-  familyToolToggleText: {
-    color: theme.colors.foregroundMuted,
-    fontSize: theme.fontSize.sm,
   },
   familyReadOnlyCalloutRail: {
     width: "100%",
