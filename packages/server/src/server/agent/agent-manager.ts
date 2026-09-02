@@ -1335,7 +1335,7 @@ export class AgentManager {
     ) {
       return null;
     }
-    const rows = await this.getConversationRolloverTimelineRows(agentId);
+    const rows = await this.getConversationFamilyRolloverTimelineRows(records, predecessor);
     const prompt = buildAgentFreshSessionContinuationPrompt({
       rows,
       failureKind,
@@ -1384,7 +1384,52 @@ export class AgentManager {
     return successor.id;
   }
 
-  private async getConversationRolloverTimelineRows(
+  private async getConversationFamilyRolloverTimelineRows(
+    records: readonly StoredAgentRecord[],
+    failedMember: StoredAgentRecord,
+  ): Promise<readonly AgentTimelineRow[]> {
+    const familyId = failedMember.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim();
+    if (!familyId) {
+      return await this.getConversationMemberRolloverTimelineRows(failedMember.id);
+    }
+
+    const recordById = new Map(records.map((record) => [record.id, record]));
+    const members: StoredAgentRecord[] = [];
+    const visited = new Set<string>();
+    let cursorMember: StoredAgentRecord | undefined = failedMember;
+    while (
+      cursorMember &&
+      !visited.has(cursorMember.id) &&
+      cursorMember.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim() === familyId
+    ) {
+      visited.add(cursorMember.id);
+      members.unshift(cursorMember);
+      const predecessorId = cursorMember.labels?.[CONVERSATION_FAMILY_PREDECESSOR_LABEL]?.trim();
+      cursorMember = predecessorId ? recordById.get(predecessorId) : undefined;
+    }
+
+    const familySegments: AgentTimelineRow[][] = [];
+    for (let index = members.length - 1; index >= 0; index -= 1) {
+      const member = members[index];
+      if (!member) continue;
+      const rows = [...(await this.getConversationMemberRolloverTimelineRows(member.id))];
+      familySegments.unshift(rows);
+      if (
+        rows.some(
+          (row) =>
+            row.item.type === "user_message" &&
+            row.item.text.trim().length > 0 &&
+            !isSystemInjectedEnvelope(row.item.text),
+        )
+      ) {
+        break;
+      }
+    }
+    const familyRows = familySegments.flat();
+    return familyRows.map((row, index) => Object.assign({}, row, { seq: index + 1 }));
+  }
+
+  private async getConversationMemberRolloverTimelineRows(
     agentId: string,
   ): Promise<readonly AgentTimelineRow[]> {
     if (this.agents.has(agentId)) {

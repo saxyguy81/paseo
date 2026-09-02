@@ -89,6 +89,14 @@ An unresolved prior request and a context overflow both use the same durable rol
    pasted transcript or a request to repeat completed work.
 4. Transfer the durable prompt FIFO to the successor and continue draining it there.
 
+The handoff source is the ordered conversation family, not only the failed native session. A fresh
+successor starts with an internal handoff that is intentionally hidden from the user timeline. If
+that successor later needs another rollover, Paseo follows its predecessor chain backward only until
+it finds the latest substantive user request, then includes the bounded state recorded after that
+request. Following the lineage avoids adopting work from a divergent sibling if crash recovery ever
+left one behind. It also keeps repeated rollovers recoverable without loading unrelated early history
+or promoting an internal handoff into a new user instruction.
+
 The predecessor label is the transition's idempotency key. Repeated terminal events or a daemon crash
 adopt the already-created successor instead of creating another one. The UI stitches the read-only
 predecessor and writable successor into one searchable conversation history while keeping future

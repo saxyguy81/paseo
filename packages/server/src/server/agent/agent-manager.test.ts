@@ -9050,6 +9050,113 @@ test("a repeated rollover consumes the failed queued prompt and transfers only t
   }
 });
 
+test("a repeated rollover recovers the human request from an earlier family member", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-family-handoff-rollover-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const durableTimelineStore = new RecordingTimelineStore();
+  const originalId = "00000000-0000-4000-8000-000000000221";
+  const currentId = "00000000-0000-4000-8000-000000000222";
+  const nextId = "00000000-0000-4000-8000-000000000223";
+  const startedPrompts: AgentPromptInput[] = [];
+  const failureText = "API Error: 409 Conversation continuation was not found";
+
+  class RecordingSession extends TestAgentSession {
+    override async startTurn(prompt: AgentPromptInput): Promise<{ turnId: string }> {
+      startedPrompts.push(prompt);
+      return super.startTurn(prompt);
+    }
+  }
+
+  class RecordingClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new RecordingSession(config);
+    }
+  }
+
+  const ids = [originalId, currentId, nextId];
+  const manager = new AgentManager({
+    clients: { codex: new RecordingClient() },
+    registry: storage,
+    durableTimelineStore,
+    logger,
+    idFactory: () => ids.shift() ?? randomUUID(),
+  });
+
+  try {
+    const original = await manager.createAgent(
+      { provider: "codex", cwd: workdir, model: "gpt-5.4" },
+      undefined,
+      {
+        initialTitle: "Long-running regression",
+        labels: {
+          [CONVERSATION_FAMILY_ID_LABEL]: "long-running-regression-family",
+          [CONVERSATION_FAMILY_CURRENT_LABEL]: currentId,
+          [CONVERSATION_FAMILY_NAME_LABEL]: "Long-running regression",
+          [CONVERSATION_FAMILY_POSITION_LABEL]: "0",
+        },
+        workspaceId: undefined,
+      },
+    );
+    await manager.appendTimelineItem(original.id, {
+      type: "user_message",
+      text: "Run the Lantau UPF regressions and report the results.",
+    });
+
+    const current = await manager.createAgent(
+      { provider: "codex", cwd: workdir, model: "gpt-5.4" },
+      undefined,
+      {
+        initialTitle: "Long-running regression",
+        labels: {
+          [CONVERSATION_FAMILY_ID_LABEL]: "long-running-regression-family",
+          [CONVERSATION_FAMILY_CURRENT_LABEL]: currentId,
+          [CONVERSATION_FAMILY_NAME_LABEL]: "Long-running regression",
+          [CONVERSATION_FAMILY_POSITION_LABEL]: "1",
+          [CONVERSATION_FAMILY_PREDECESSOR_LABEL]: originalId,
+        },
+        workspaceId: undefined,
+      },
+    );
+    await manager.appendTimelineItem(current.id, {
+      type: "user_message",
+      text: "<paseo-system>\nContinue the previous handoff.\n</paseo-system>",
+    });
+    await manager.appendTimelineItem(current.id, {
+      type: "assistant_message",
+      text: "The corpus is ready and the mutation harness is half complete.",
+    });
+
+    const storedOriginal = (await storage.get(originalId))!;
+    await storage.upsert({
+      ...storedOriginal,
+      archivedAt: new Date().toISOString(),
+      lastStatus: "closed",
+    });
+    const storedCurrent = (await storage.get(currentId))!;
+    await storage.upsert({
+      ...storedCurrent,
+      lastStatus: "error",
+      lastError: failureText,
+      lastFailureKind: "conversation_unresolved",
+    });
+
+    await expect(
+      manager.ensureAgentFailureContinuation(currentId, "conversation_unresolved", failureText),
+    ).resolves.toBe(nextId);
+
+    await vi.waitFor(() => expect(startedPrompts).toHaveLength(1));
+    expect(startedPrompts[0]).toContain("Run the Lantau UPF regressions and report the results.");
+    expect(startedPrompts[0]).toContain(
+      "The corpus is ready and the mutation harness is half complete.",
+    );
+    expect(startedPrompts[0]).not.toContain("Continue the previous handoff");
+    expect((await storage.get(nextId))?.labels[CONVERSATION_FAMILY_POSITION_LABEL]).toBe("2");
+  } finally {
+    await manager.closeAgent(nextId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("turn_failed surfaces provider code and diagnostic in system error message", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-turn-failed-detail-"));
   const storagePath = join(workdir, "agents");
