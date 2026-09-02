@@ -2374,6 +2374,15 @@ export class Session {
         return this.daemonSession.handleHubRelationshipRequest(msg);
       case "diagnostics.request":
         return this.daemonSession.handleDiagnosticsRequest(msg);
+      case "diagnostics.incident.report.request": {
+        return this.agentManager.reportDiagnosticIncident(msg).then((accepted) => {
+          this.emit({
+            type: "diagnostics.incident.report.response",
+            payload: { requestId: msg.requestId, accepted },
+          });
+          return undefined;
+        });
+      }
       case "daemon.update.request":
         return this.daemonSession.handleUpdateRequest(msg);
       case "set_daemon_config_request":

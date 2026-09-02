@@ -828,6 +828,7 @@ export class AgentManager {
   private appendSystemPrompt: string;
   private onAgentAttention?: AgentAttentionCallback;
   private onTurnFailure?: AgentManagerOptions["onTurnFailure"];
+  private readonly diagnosticLastAt = new Map<string, number>();
   private onAgentArchived?: AgentArchivedCallback;
   private onWorkspaceStateMayHaveChanged?: (params: { cwd: string }) => void;
   private logger: Logger;
@@ -1135,6 +1136,40 @@ export class AgentManager {
     return Array.from(this.agents.values())
       .filter((agent) => !agent.internal)
       .map((agent) => Object.assign({}, agent));
+  }
+
+  async reportDiagnosticIncident(input: {
+    agentId?: string;
+    incidentId: string;
+    code: string;
+  }): Promise<boolean> {
+    if (!this.onTurnFailure || !this.acceptingAgentRegistrations) return false;
+    const record = input.agentId
+      ? (this.getAgent(input.agentId) ?? (await this.registry?.get(input.agentId)))
+      : null;
+    if (input.agentId && !record) return false;
+    const agentId =
+      record?.labels?.[CONVERSATION_FAMILY_CURRENT_LABEL] || record?.id || "service:paseo-client";
+    const key = input.code === "subagent_failed" ? input.incidentId : `${agentId}:${input.code}`;
+    const now = Date.now();
+    if (now - (this.diagnosticLastAt.get(key) ?? 0) < 300_000) return true;
+    await this.onTurnFailure({
+      agentId,
+      turnId: input.incidentId,
+      provider: record?.provider || "system",
+      code: input.code,
+      failureKind: input.code.startsWith("client_") ? "client_failure" : input.code,
+    });
+    this.diagnosticLastAt.set(key, now);
+    this.trimDiagnosticHistory(now);
+    return true;
+  }
+
+  private trimDiagnosticHistory(now: number): void {
+    if (this.diagnosticLastAt.size > 2000) {
+      for (const [oldKey, timestamp] of this.diagnosticLastAt)
+        if (now - timestamp >= 300_000) this.diagnosticLastAt.delete(oldKey);
+    }
   }
 
   async listImportableSessions(
@@ -4039,8 +4074,22 @@ export class AgentManager {
     event: AgentStreamEvent,
   ): Promise<void> {
     if (event.type === "provider_subagent") {
+      const previous = this.providerSubagents.get(agent.id, event.event.id);
       const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
       this.dispatch({ type: "provider_subagent", event: update });
+      if (
+        update.type === "upsert" &&
+        update.subagent.status === "failed" &&
+        previous?.status !== "failed" &&
+        (!agent.labels?.[CONVERSATION_FAMILY_CURRENT_LABEL] ||
+          agent.labels[CONVERSATION_FAMILY_CURRENT_LABEL] === agent.id)
+      ) {
+        await this.reportDiagnosticIncident({
+          agentId: agent.id,
+          code: "subagent_failed",
+          incidentId: `subagent:${agent.persistence?.sessionId || agent.id}:${update.subagent.id}`,
+        });
+      }
       return;
     }
     const turnId = getAgentStreamEventTurnId(event);
@@ -4798,11 +4847,7 @@ export class AgentManager {
     fromHistory: boolean,
   ): Promise<void> {
     const currentFamilyMember = agent.labels?.[CONVERSATION_FAMILY_CURRENT_LABEL];
-    if (
-      !fromHistory &&
-      (!currentFamilyMember || currentFamilyMember === agent.id) &&
-      !isProviderTeardownFailure(event.error)
-    ) {
+    if (!fromHistory && (!currentFamilyMember || currentFamilyMember === agent.id)) {
       await this.onTurnFailure?.({
         agentId: agent.id,
         turnId: eventTurnId ?? agent.activeForegroundTurnId ?? randomUUID(),

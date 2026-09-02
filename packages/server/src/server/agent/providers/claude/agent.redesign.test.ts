@@ -41,6 +41,141 @@ function buildUsage() {
   };
 }
 
+test.each([
+  { text: "API Error: 401 Invalid API key", tag: "authentication_error" },
+  { text: "Prompt is too long", tag: "invalid_request" },
+  { text: "Selected model unavailable", tag: "model_not_found" },
+])(
+  "structured failure is not completion even when SDK says success: $tag",
+  async ({ text, tag }) => {
+    const frames = [
+      { type: "system", subtype: "init", session_id: "failure-contract", model: "claude-opus-5" },
+      {
+        type: "assistant",
+        isApiErrorMessage: true,
+        error: tag,
+        message: { role: "assistant", model: "<synthetic>", content: [{ type: "text", text }] },
+      },
+      {
+        type: "result",
+        subtype: "success",
+        usage: buildUsage(),
+        result: "",
+        session_id: "failure-contract",
+      },
+    ];
+    sdkQueryFactory.mockImplementation(() =>
+      createBaseQueryMock(
+        vi.fn(async () => {
+          const value = frames.shift();
+          return value ? { done: false, value } : { done: true, value: undefined };
+        }),
+      ),
+    );
+    const session = await createSession();
+    try {
+      const events = await collectUntilTerminal(streamSession(session, "run the requested check"));
+      expect(events.filter((event) => event.type === "turn_completed")).toEqual([]);
+      expect(events.find((event) => event.type === "turn_failed")).toMatchObject({ error: text });
+    } finally {
+      await session.close();
+    }
+  },
+);
+
+test("an unsolicited aborted result remains a failure with its original cause", async () => {
+  const frames = [
+    { type: "system", subtype: "init", session_id: "aborted-contract", model: "claude-opus-5" },
+    {
+      type: "result",
+      subtype: "error_during_execution",
+      errors: ["Request aborted by upstream"],
+      usage: buildUsage(),
+    },
+  ];
+  sdkQueryFactory.mockImplementation(() =>
+    createBaseQueryMock(
+      vi.fn(async () => {
+        const value = frames.shift();
+        return value ? { done: false, value } : { done: true, value: undefined };
+      }),
+    ),
+  );
+  const session = await createSession();
+  try {
+    const events = await collectUntilTerminal(streamSession(session, "run the requested check"));
+    expect(events.find((event) => event.type === "turn_failed")).toMatchObject({
+      error: "Request aborted by upstream",
+    });
+  } finally {
+    await session.close();
+  }
+});
+
+test("canceling one turn cannot suppress the next turn's upstream abort", async () => {
+  let queryCount = 0;
+  sdkQueryFactory.mockImplementation(() => {
+    queryCount += 1;
+    if (queryCount === 1) {
+      let finish: ((value: { done: true; value: undefined }) => void) | undefined;
+      const query = createBaseQueryMock(
+        vi.fn(
+          () =>
+            new Promise((resolve) => {
+              finish = resolve;
+            }),
+        ),
+      );
+      query.close.mockImplementation(() => finish?.({ done: true, value: undefined }));
+      return query;
+    }
+    let emitted = false;
+    return createBaseQueryMock(
+      vi.fn(async () => {
+        if (emitted) return { done: true, value: undefined };
+        emitted = true;
+        return {
+          done: false,
+          value: {
+            type: "result",
+            subtype: "error_during_execution",
+            errors: ["Request aborted by upstream"],
+            usage: buildUsage(),
+          },
+        };
+      }),
+    );
+  });
+  const session = await createSession();
+  try {
+    await session.startTurn("first request");
+    await session.interrupt();
+    const events = await collectUntilTerminal(streamSession(session, "second request"));
+    expect(queryCount).toBe(2);
+    expect(events.find((event) => event.type === "turn_failed")).toMatchObject({
+      error: "Request aborted by upstream",
+    });
+  } finally {
+    await session.close();
+  }
+});
+
+test("runtime recreation never reuses a turn identity", async () => {
+  sdkQueryFactory.mockImplementation(() =>
+    createBaseQueryMock(vi.fn(async () => ({ done: true, value: undefined }))),
+  );
+  const first = await createSession();
+  const second = await createSession();
+  try {
+    const a = await first.startTurn("first runtime");
+    const b = await second.startTurn("second runtime");
+    expect(a.turnId).not.toBe(b.turnId);
+  } finally {
+    await first.close();
+    await second.close();
+  }
+});
+
 function createPromptUuidReader(prompt: AsyncIterable<unknown>) {
   const iterator = prompt[Symbol.asyncIterator]();
   let cached: Promise<string | null> | null = null;
@@ -651,7 +786,7 @@ test.each([
       const failure = events.find((event) => event.type === "turn_failed");
       expect(failure).toMatchObject({
         type: "turn_failed",
-        error: resumed ? text : "Claude run failed",
+        error: text,
       });
       expect(failure?.failureKind).toBe(expectedKind);
       expect(events).toContainEqual(
@@ -3168,7 +3303,7 @@ test("reuses one autonomous run for unbound stream_event bursts with no foregrou
   );
 
   const firstRunId = internal.autonomousTurn?.id ?? null;
-  expect(firstRunId).toBe("autonomous-turn-1");
+  expect(firstRunId).toMatch(/^autonomous-turn-[a-f0-9-]+-1$/);
   expect(internal.nextTurnOrdinal).toBe(2);
 
   await internal.routeSdkMessageFromPump(

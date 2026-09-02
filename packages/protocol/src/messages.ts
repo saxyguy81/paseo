@@ -1435,6 +1435,20 @@ export const DiagnosticsRequestSchema = z.object({
   requestId: z.string(),
 });
 
+export const DiagnosticIncidentRequestSchema = z.object({
+  type: z.literal("diagnostics.incident.report.request"),
+  requestId: z.string(),
+  incidentId: z.string().uuid(),
+  agentId: z.string().uuid().optional(),
+  code: z.enum([
+    "client_history_failed",
+    "client_history_empty",
+    "client_render_failed",
+    "client_connection_lost",
+    "client_queue_failed",
+  ]),
+});
+
 export const PluginCatalogGetRequestSchema = z.object({
   type: z.literal("plugin.catalog.get.request"),
   requestId: z.string(),
@@ -3040,6 +3054,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   HubManagementDaemonDisconnectRequestSchema,
   HubManagementDaemonPermissionsUpdateRequestSchema,
   DiagnosticsRequestSchema,
+  DiagnosticIncidentRequestSchema,
   PluginCatalogGetRequestSchema,
   PluginListRequestSchema,
   PluginLogsGetRequestSchema,
@@ -3362,6 +3377,7 @@ export const ServerInfoStatusPayloadSchema = z
     features: z
       .object({
         providersSnapshot: z.boolean().optional(),
+        diagnosticIncidents: z.boolean().optional(),
         // COMPAT(providersSnapshotCwd): added in v0.3.2, remove gate after 2027-02-10.
         providersSnapshotCwd: z.boolean().optional(),
         // COMPAT(directorySync): added in v0.3.x, remove gate after 2027-02-12.
@@ -4686,6 +4702,11 @@ export const DiagnosticsResponseSchema = z.object({
       diagnostic: z.string(),
     })
     .passthrough(),
+});
+
+export const DiagnosticIncidentResponseSchema = z.object({
+  type: z.literal("diagnostics.incident.report.response"),
+  payload: z.object({ requestId: z.string(), accepted: z.boolean() }),
 });
 
 export const SetDaemonConfigResponseMessageSchema = z.object({
@@ -6398,6 +6419,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   HubManagementDaemonDisconnectResponseSchema,
   HubManagementDaemonPermissionsUpdateResponseSchema,
   DiagnosticsResponseSchema,
+  DiagnosticIncidentResponseSchema,
   GetDaemonConfigResponseMessageSchema,
   SetDaemonConfigResponseMessageSchema,
   ReadProjectConfigResponseMessageSchema,

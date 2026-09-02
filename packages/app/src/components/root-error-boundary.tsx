@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { ScrollableCodeSurface } from "@/components/ui/scrollable-code-surface";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { formatCaughtValue } from "./root-error-details";
+import { getHostRuntimeStore } from "@/runtime/host-runtime";
 
 interface RootErrorBoundaryProps {
   children: ReactNode;
@@ -28,6 +29,7 @@ export class RootErrorBoundary extends Component<RootErrorBoundaryProps, RootErr
   }
 
   componentDidCatch(error: unknown, errorInfo: ErrorInfo) {
+    getHostRuntimeStore().reportRenderFailure();
     console.error("[RootErrorBoundary] Unhandled render error", {
       error: formatCaughtValue(error),
       componentStack: errorInfo.componentStack,

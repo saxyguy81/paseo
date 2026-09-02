@@ -4751,6 +4751,26 @@ export class DaemonClient {
     });
   }
 
+  async reportDiagnosticIncident(input: {
+    incidentId: string;
+    agentId?: string;
+    code:
+      | "client_history_failed"
+      | "client_history_empty"
+      | "client_render_failed"
+      | "client_connection_lost"
+      | "client_queue_failed";
+  }): Promise<boolean> {
+    // COMPAT(diagnosticIncidents): added in v0.7.2, remove gate after 2027-03-02.
+    if (!this.lastServerInfoMessage?.features?.diagnosticIncidents) return false;
+    const response =
+      await this.sendNamespacedCorrelatedSessionRequest<"diagnostics.incident.report.response">({
+        message: { type: "diagnostics.incident.report.request", ...input },
+        timeout: 8000,
+      });
+    return response.accepted;
+  }
+
   async patchDaemonConfig(
     config: MutableDaemonConfigPatch,
     requestId?: string,

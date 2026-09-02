@@ -2245,6 +2245,7 @@ class ClaudeAgentSession implements AgentSession {
   private historyPending = false;
   private turnState: TurnState = "idle";
   private nextTurnOrdinal = 1;
+  private readonly turnEpoch = randomUUID();
   private cancelCurrentTurn: (() => Promise<void>) | null = null;
   private cachedRuntimeInfo: AgentRuntimeInfo | null = null;
   private lastOptionsModel: string | null = null;
@@ -2259,7 +2260,7 @@ class ClaudeAgentSession implements AgentSession {
   private foregroundApiRecoveryAttempts = 0;
   private pendingPostWorkApiRecovery: PendingPostWorkApiRecovery | null = null;
   private pendingConversationRolloverFailure: {
-    kind: ConversationRolloverFailureKind;
+    kind?: ConversationRolloverFailureKind;
     error: string;
   } | null = null;
   /**
@@ -2447,7 +2448,12 @@ class ClaudeAgentSession implements AgentSession {
     this.notifySubscribers({ type: "turn_started", provider: "claude" });
 
     try {
+      // A cancellation belongs to the old query, not the next user request.
+      // Retire an unacknowledged interrupt before accepting new frames so its
+      // late result cannot swallow the next turn's real failure.
+      if (this.pendingInterruptAbort) this.queryRestartNeeded = true;
       await this.ensureQuery();
+      this.pendingInterruptAbort = false;
       if (!this.input) {
         throw new Error("Claude session input stream not initialized");
       }
@@ -3664,11 +3670,6 @@ class ClaudeAgentSession implements AgentSession {
     this.transitionTurnState("idle", reason);
   }
 
-  private isAbortError(message: SDKMessage): boolean {
-    const errors = "errors" in message && Array.isArray(message.errors) ? message.errors : [];
-    return errors.some((e: string) => /\baborted\b/i.test(e));
-  }
-
   private buildTurnFailedEvent(
     errorMessage: string,
     capturedKind?: ConversationRolloverFailureKind,
@@ -3732,7 +3733,7 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   private createTurnId(owner: "foreground" | "autonomous"): string {
-    return `${owner}-turn-${this.nextTurnOrdinal++}`;
+    return `${owner}-turn-${this.turnEpoch}-${this.nextTurnOrdinal++}`;
   }
 
   private isTerminalTurnEvent(event: AgentStreamEvent): boolean {
@@ -4071,10 +4072,6 @@ class ClaudeAgentSession implements AgentSession {
         return true;
       }
     }
-    if (message.type === "result" && message.subtype !== "success" && this.isAbortError(message)) {
-      this.logger.debug("Suppressing abort result by content");
-      return true;
-    }
     return false;
   }
 
@@ -4277,6 +4274,8 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   private captureConversationRolloverError(message: SDKMessage): void {
+    // A child failure belongs to its descriptor, never the parent's turn.
+    if (readClaudeParentToolUseId(message)) return;
     const contextOverflow = readClaudeContextOverflowError(message);
     if (contextOverflow) {
       this.pendingConversationRolloverFailure = {
@@ -4300,6 +4299,21 @@ class ClaudeAgentSession implements AgentSession {
           kind: "resume_model_unavailable",
           error: modelUnavailable,
         };
+        return;
+      }
+    }
+    if (message.type === "assistant") {
+      const text = collectClaudeTextContentParts(message.message.content).join("\n").trim();
+      if (isClaudeApiErrorMessage(toObjectRecord(message) ?? {})) {
+        this.pendingConversationRolloverFailure = { error: text || "Claude API request failed" };
+      } else if (
+        text ||
+        (Array.isArray(message.message.content) &&
+          message.message.content.some((block) => block.type === "tool_use"))
+      ) {
+        // A real assistant response after recovery supersedes the earlier error.
+        // A bare SDK success result does not.
+        this.pendingConversationRolloverFailure = null;
       }
     }
   }
@@ -4318,6 +4332,10 @@ class ClaudeAgentSession implements AgentSession {
     if (this.shouldSuppressStaleResult(message)) {
       return;
     }
+    const isForeground = Boolean(this.activeForegroundTurnId);
+    if (this.shouldStartAutonomousTurn(message)) {
+      this.startAutonomousTurn();
+    }
     this.captureConversationRolloverError(message);
     if (this.continueForegroundAfterApiFailureResult(message, sourceQuery)) {
       return;
@@ -4326,10 +4344,6 @@ class ClaudeAgentSession implements AgentSession {
       return;
     }
 
-    const isForeground = Boolean(this.activeForegroundTurnId);
-    if (this.shouldStartAutonomousTurn(message)) {
-      this.startAutonomousTurn();
-    }
     if (!isForeground && !this.autonomousTurn && message.type === "result") {
       return;
     }
@@ -4909,7 +4923,7 @@ class ClaudeAgentSession implements AgentSession {
     events: AgentStreamEvent[],
   ): void {
     const usage = this.convertUsage(message, message.modelUsage);
-    if (message.subtype === "success") {
+    if (message.subtype === "success" && !this.pendingConversationRolloverFailure) {
       events.push(...this.sidechainTracker.finishAll("completed"));
       // Built-in slash commands (e.g. /voice, /usage, "Unknown command: …")
       // run client-side in the Claude CLI with no model turn — output_tokens

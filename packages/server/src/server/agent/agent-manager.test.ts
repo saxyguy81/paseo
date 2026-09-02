@@ -8532,98 +8532,168 @@ test("archiveAgent cascade surfaces partial child archive failures", async () =>
   );
 });
 
-test("turn_failed emits a system error assistant timeline message and keeps error lifecycle", async () => {
-  const notices: import("./turn-failure-outbox.js").TurnFailureNotice[] = [];
-  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-turn-failed-"));
-  const storagePath = join(workdir, "agents");
-  const storage = new AgentStorage(storagePath, logger);
-
-  class TurnFailedSession extends TestAgentSession {
-    override async startTurn(): Promise<{ turnId: string }> {
-      const turnId = "turn-failed-1";
-      setTimeout(() => {
-        this.pushEvent({
-          type: "turn_started",
-          provider: this.provider,
-          turnId,
-        });
+test.each(["close", "archive", "shutdown"])(
+  "controlled %s does not notify process teardown",
+  async (action) => {
+    const workdir = mkdtempSync(join(tmpdir(), "paseo-controlled-close-"));
+    const notices: unknown[] = [];
+    class ClosingSession extends TestAgentSession {
+      override async close(): Promise<void> {
         this.pushEvent({
           type: "turn_failed",
           provider: this.provider,
-          error: "invalid model id",
-          turnId,
+          error: "Claude stopped unexpectedly (signal SIGTERM)",
+          turnId: "active-1",
         });
-      }, 0);
-      return { turnId };
+        this.pushEvent({
+          type: "provider_subagent",
+          provider: this.provider,
+          event: { type: "upsert", id: "closing-child", status: "failed" },
+        });
+        await super.close();
+      }
     }
-  }
-
-  class TurnFailedClient implements AgentClient {
-    readonly provider = "codex" as const;
-    readonly capabilities = TEST_CAPABILITIES;
-
-    async isAvailable(): Promise<boolean> {
-      return true;
-    }
-
-    async createSession(config: AgentSessionConfig): Promise<AgentSession> {
-      return new TurnFailedSession(config);
-    }
-
-    async resumeSession(config?: Partial<AgentSessionConfig>): Promise<AgentSession> {
-      return new TurnFailedSession({
-        provider: "codex",
-        cwd: config?.cwd ?? process.cwd(),
+    const session = new ClosingSession({ provider: "codex", cwd: workdir });
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const manager = new AgentManager({
+      clients: {
+        codex: new (class extends TestAgentClient {
+          override async createSession(): Promise<AgentSession> {
+            return session;
+          }
+        })(),
+      },
+      registry: storage,
+      logger,
+      onTurnFailure: async (notice) => {
+        notices.push(notice);
+      },
+    });
+    try {
+      const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+        workspaceId: undefined,
       });
+      session.pushEvent({ type: "turn_started", provider: "codex", turnId: "active-1" });
+      await vi.waitFor(() => expect(manager.getAgent(agent.id)?.lifecycle).toBe("running"));
+      if (action === "shutdown") manager.prepareForShutdown();
+      if (action === "archive") await manager.archiveAgent(agent.id);
+      else await manager.closeAgent(agent.id);
+      await manager.flush();
+      expect(notices).toEqual([]);
+    } finally {
+      await storage.flush();
+      rmSync(workdir, { recursive: true, force: true });
     }
-  }
+  },
+);
 
-  const manager = new AgentManager({
-    clients: {
-      codex: new TurnFailedClient(),
-    },
-    registry: storage,
-    logger,
-    idFactory: () => "00000000-0000-4000-8000-000000000131",
-    onTurnFailure: async (notice) => {
-      notices.push(notice);
-    },
-  });
+test.each(["invalid model id", "Claude stopped unexpectedly (signal SIGTERM)"])(
+  "turn_failed notifies and preserves error lifecycle: %s",
+  async (failureText) => {
+    const notices: import("./turn-failure-outbox.js").TurnFailureNotice[] = [];
+    const workdir = mkdtempSync(join(tmpdir(), "agent-manager-turn-failed-"));
+    const storagePath = join(workdir, "agents");
+    const storage = new AgentStorage(storagePath, logger);
 
-  const agent = await manager.createAgent(
-    {
-      provider: "codex",
-      cwd: workdir,
-      title: "Turn failed test",
-    },
-    undefined,
-    { workspaceId: undefined },
-  );
+    class TurnFailedSession extends TestAgentSession {
+      override async startTurn(): Promise<{ turnId: string }> {
+        const turnId = "turn-failed-1";
+        setTimeout(() => {
+          this.pushEvent({
+            type: "turn_started",
+            provider: this.provider,
+            turnId,
+          });
+          this.pushEvent({
+            type: "provider_subagent",
+            provider: this.provider,
+            event: { type: "upsert", id: "failed-child", status: "failed" },
+          });
+          this.pushEvent({
+            type: "turn_failed",
+            provider: this.provider,
+            error: failureText,
+            turnId,
+          });
+        }, 0);
+        return { turnId };
+      }
+    }
 
-  await expect(manager.runAgent(agent.id, "hello")).rejects.toThrow("invalid model id");
+    class TurnFailedClient implements AgentClient {
+      readonly provider = "codex" as const;
+      readonly capabilities = TEST_CAPABILITIES;
 
-  const snapshot = manager.getAgent(agent.id);
-  expect(snapshot?.lifecycle).toBe("error");
-  expect(snapshot?.lastError).toBe("invalid model id");
+      async isAvailable(): Promise<boolean> {
+        return true;
+      }
 
-  const systemErrors = manager
-    .getTimeline(agent.id)
-    .filter(
-      (item): item is Extract<AgentTimelineItem, { type: "assistant_message" }> =>
-        item.type === "assistant_message" && item.text.includes("[System Error]"),
+      async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+        return new TurnFailedSession(config);
+      }
+
+      async resumeSession(config?: Partial<AgentSessionConfig>): Promise<AgentSession> {
+        return new TurnFailedSession({
+          provider: "codex",
+          cwd: config?.cwd ?? process.cwd(),
+        });
+      }
+    }
+
+    const manager = new AgentManager({
+      clients: {
+        codex: new TurnFailedClient(),
+      },
+      registry: storage,
+      logger,
+      idFactory: () => "00000000-0000-4000-8000-000000000131",
+      onTurnFailure: async (notice) => {
+        if (notice.code === "subagent_failed")
+          expect(manager.getAgent(notice.agentId)?.lifecycle).toBe("running");
+        notices.push(notice);
+      },
+    });
+
+    const agent = await manager.createAgent(
+      {
+        provider: "codex",
+        cwd: workdir,
+        title: "Turn failed test",
+      },
+      undefined,
+      { workspaceId: undefined },
     );
-  expect(systemErrors).toHaveLength(1);
-  expect(systemErrors[0]?.text).toContain("invalid model id");
-  expect(notices).toEqual([
-    {
-      agentId: agent.id,
-      turnId: "turn-failed-1",
-      provider: "codex",
-      code: null,
-      failureKind: null,
-    },
-  ]);
-});
+
+    await expect(manager.runAgent(agent.id, "hello")).rejects.toThrow(failureText);
+
+    const snapshot = manager.getAgent(agent.id);
+    expect(snapshot?.lifecycle).toBe("error");
+    expect(snapshot?.lastError).toBe(failureText);
+
+    const systemErrors = manager
+      .getTimeline(agent.id)
+      .filter(
+        (item): item is Extract<AgentTimelineItem, { type: "assistant_message" }> =>
+          item.type === "assistant_message" && item.text.includes("[System Error]"),
+      );
+    expect(systemErrors).toHaveLength(1);
+    expect(systemErrors[0]?.text).toContain(failureText);
+    expect(notices).toEqual([
+      expect.objectContaining({
+        agentId: agent.id,
+        code: "subagent_failed",
+        failureKind: "subagent_failed",
+      }),
+      {
+        agentId: agent.id,
+        turnId: "turn-failed-1",
+        provider: "codex",
+        code: null,
+        failureKind: null,
+      },
+    ]);
+  },
+);
 
 test.each([
   {
