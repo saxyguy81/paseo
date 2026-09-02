@@ -398,6 +398,7 @@ export interface CreateAgentOptions {
 }
 
 export interface AgentManagerOptions {
+  onTurnFailure?: (notice: import("./turn-failure-outbox.js").TurnFailureNotice) => Promise<void>;
   clients?: ProviderClientMap;
   providerDefinitions?: ProviderEnabledMap;
   idFactory?: () => string;
@@ -826,6 +827,7 @@ export class AgentManager {
   private paseoToolCatalogFactory: PaseoToolCatalogFactory | null = null;
   private appendSystemPrompt: string;
   private onAgentAttention?: AgentAttentionCallback;
+  private onTurnFailure?: AgentManagerOptions["onTurnFailure"];
   private onAgentArchived?: AgentArchivedCallback;
   private onWorkspaceStateMayHaveChanged?: (params: { cwd: string }) => void;
   private logger: Logger;
@@ -838,6 +840,7 @@ export class AgentManager {
     this.registry = options?.registry;
     this.durableTimelineStore = options?.durableTimelineStore;
     this.onAgentAttention = options?.onAgentAttention;
+    this.onTurnFailure = options.onTurnFailure;
     this.onWorkspaceStateMayHaveChanged = options?.onWorkspaceStateMayHaveChanged;
     this.mcpBaseUrl = options?.mcpBaseUrl ?? null;
     this.mcpAuthToken = options?.mcpAuthToken ?? null;
@@ -4782,8 +4785,36 @@ export class AgentManager {
       options,
     );
     this.resolvePendingPermissionsForAgent(agent, event.provider, options, "Turn failed");
+    await this.persistTurnFailureNotice(agent, event, eventTurnId, options?.fromHistory === true);
     if (!isForegroundEvent && !agent.activeForegroundTurnId) {
       this.emitState(agent);
+    }
+  }
+
+  private async persistTurnFailureNotice(
+    agent: ActiveManagedAgent,
+    event: Extract<AgentStreamEvent, { type: "turn_failed" }>,
+    eventTurnId: string | undefined,
+    fromHistory: boolean,
+  ): Promise<void> {
+    const currentFamilyMember = agent.labels?.[CONVERSATION_FAMILY_CURRENT_LABEL];
+    if (
+      !fromHistory &&
+      (!currentFamilyMember || currentFamilyMember === agent.id) &&
+      !isProviderTeardownFailure(event.error)
+    ) {
+      await this.onTurnFailure?.({
+        agentId: agent.id,
+        turnId: eventTurnId ?? agent.activeForegroundTurnId ?? randomUUID(),
+        provider: event.provider,
+        code: event.code && /^[a-zA-Z0-9_.-]{1,100}$/.test(event.code) ? event.code : null,
+        failureKind: event.failureKind ?? null,
+      }).catch((error) =>
+        this.logger.error(
+          { err: error, agentId: agent.id },
+          "Could not persist failed-turn notification",
+        ),
+      );
     }
   }
 

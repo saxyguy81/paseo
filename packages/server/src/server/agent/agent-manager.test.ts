@@ -8533,6 +8533,7 @@ test("archiveAgent cascade surfaces partial child archive failures", async () =>
 });
 
 test("turn_failed emits a system error assistant timeline message and keeps error lifecycle", async () => {
+  const notices: import("./turn-failure-outbox.js").TurnFailureNotice[] = [];
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-turn-failed-"));
   const storagePath = join(workdir, "agents");
   const storage = new AgentStorage(storagePath, logger);
@@ -8584,6 +8585,9 @@ test("turn_failed emits a system error assistant timeline message and keeps erro
     registry: storage,
     logger,
     idFactory: () => "00000000-0000-4000-8000-000000000131",
+    onTurnFailure: async (notice) => {
+      notices.push(notice);
+    },
   });
 
   const agent = await manager.createAgent(
@@ -8610,6 +8614,15 @@ test("turn_failed emits a system error assistant timeline message and keeps erro
     );
   expect(systemErrors).toHaveLength(1);
   expect(systemErrors[0]?.text).toContain("invalid model id");
+  expect(notices).toEqual([
+    {
+      agentId: agent.id,
+      turnId: "turn-failed-1",
+      provider: "codex",
+      code: null,
+      failureKind: null,
+    },
+  ]);
 });
 
 test.each([

@@ -9,6 +9,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import type { Logger } from "pino";
 import { z } from "zod";
 import { createBranchChangeRouteHandler } from "./script-route-branch-handler.js";
+import { startConfiguredFailureOutbox } from "./agent/turn-failure-outbox.js";
 
 export type ListenTarget =
   | { type: "tcp"; host: string; port: number }
@@ -909,10 +910,16 @@ export async function createPaseoDaemon(
     if (git) configureGitProcessPolicy(git);
   });
   const initialAgentManagerState = providerSnapshotManager.getAgentManagerProviderState();
+  const failureOutbox = await startConfiguredFailureOutbox({
+    paseoHome: config.paseoHome,
+    command: process.env.PASEO_TURN_FAILURE_COMMAND,
+    warn: (error) => logger.warn({ err: error }, "Failed-turn notification remains pending"),
+  });
   const agentManager = new AgentManager({
     clients: initialAgentManagerState.clients,
     providerDefinitions: initialAgentManagerState.providerDefinitions,
     registry: agentStorage,
+    onTurnFailure: failureOutbox.onTurnFailure,
     appendSystemPrompt: config.appendSystemPrompt,
     onWorkspaceStateMayHaveChanged: ({ cwd }) => {
       workspaceGitService.onWorkspaceStateMayHaveChanged(cwd);
@@ -1758,6 +1765,7 @@ export async function createPaseoDaemon(
     // Freeze both ingress and registration before taking the agent closure snapshot.
     wsServer?.prepareForShutdown();
     agentManager.prepareForShutdown();
+    await failureOutbox.stop();
     await closeAllAgents(logger, agentManager);
     await agentManager.flushForShutdown().catch(() => undefined);
     detachAgentStoragePersistence();

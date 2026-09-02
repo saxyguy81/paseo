@@ -79,6 +79,9 @@ const family: ConversationFamilyView = {
   readOnlyItemIds: new Set<string>(),
   isLoading: false,
   error: null,
+  hasOlder: false,
+  progressKey: "family-1",
+  loadOlder: async () => false,
 };
 
 let root: Root | null = null;

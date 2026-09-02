@@ -138,7 +138,10 @@ export interface SeedDaemonClient {
       firstPromptPreview?: string | null;
     }>;
   }>;
-  updateAgent(agentId: string, updates: { name?: string }): Promise<void>;
+  updateAgent(
+    agentId: string,
+    updates: { name?: string; labels?: Record<string, string> },
+  ): Promise<void>;
   setAgentMode(agentId: string, modeId: string): Promise<unknown>;
   waitForAgentUpsert(
     agentId: string,

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import {
@@ -9,7 +9,7 @@ import {
 } from "@/conversation-family";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
 import { useFetchQuery } from "@/data/query";
-import { useSessionStore } from "@/stores/session-store";
+import { selectAgentTimelineState, useSessionStore } from "@/stores/session-store";
 import { planTimelineOlderFetch, planTimelineTailFetch } from "@/timeline/timeline-sync-plan";
 import type { StreamItem } from "@/types/stream";
 
@@ -54,25 +54,6 @@ async function fetchConversationFamilyMembers(input: {
   return members.sort((left, right) => left.position - right.position);
 }
 
-async function loadCompleteAgentTimeline(serverId: string, agentId: string): Promise<void> {
-  const runtime = getHostRuntimeStore();
-  let page = await runtime.fetchAgentTimeline(serverId, agentId, planTimelineTailFetch());
-  const seenCursors = new Set<string>();
-
-  while (page.hasOlder && page.startCursor) {
-    const cursorKey = `${page.startCursor.epoch}:${page.startCursor.seq}`;
-    if (seenCursors.has(cursorKey)) {
-      throw new Error(`Timeline cursor did not advance for ${agentId}`);
-    }
-    seenCursors.add(cursorKey);
-    page = await runtime.fetchAgentTimeline(
-      serverId,
-      agentId,
-      planTimelineOlderFetch(page.startCursor),
-    );
-  }
-}
-
 export interface ConversationFamilyView {
   familyId: string;
   name: string;
@@ -81,12 +62,14 @@ export interface ConversationFamilyView {
   readOnlyItemIds: ReadonlySet<string>;
   isLoading: boolean;
   error: string | null;
+  hasOlder: boolean;
+  progressKey: string;
+  loadOlder: () => Promise<boolean>;
 }
 
 /**
- * Loads every immutable predecessor of the selected session, then presents the
- * stored timelines as one local view. Only the family-designated current
- * session is eligible, so opening an old route can never accept a new prompt.
+ * Pages backwards through one session at a time. Search may explicitly request
+ * the complete family, but mounting or expanding the toolbar never does.
  */
 export function useConversationFamily(input: {
   serverId: string;
@@ -110,46 +93,29 @@ export function useConversationFamily(input: {
     dataShape: "list",
   });
   const members = membersQuery.data ?? EMPTY_FAMILY_MEMBERS;
-  const memberKey = members.map((member) => member.agentId).join(":");
-  const [timelineLoad, setTimelineLoad] = useState<{
-    key: string;
-    status: "idle" | "loading" | "ready" | "error";
-    error: string | null;
-  }>({ key: "", status: "idle", error: null });
+  const { pager, loadOlder } = useFamilyHistoryPager({
+    serverId: input.serverId,
+    agentId: input.agentId,
+    isCurrent,
+    members,
+    loadHistory: input.loadHistory,
+  });
 
-  useEffect(() => {
-    if (!input.loadHistory || !isCurrent || members.length === 0) return;
-    let cancelled = false;
-    setTimelineLoad({ key: memberKey, status: "loading", error: null });
-    void (async () => {
-      try {
-        await Promise.all(
-          members.map((member) => loadCompleteAgentTimeline(input.serverId, member.agentId)),
-        );
-        if (!cancelled) setTimelineLoad({ key: memberKey, status: "ready", error: null });
-      } catch (error) {
-        if (cancelled) return;
-        setTimelineLoad({
-          key: memberKey,
-          status: "error",
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [input.loadHistory, input.serverId, isCurrent, memberKey, members]);
-
-  const tails = useSessionStore(
-    (state) => state.sessions[input.serverId]?.agentStreamTail ?? EMPTY_TIMELINE_TAILS,
-  );
+  const session = useSessionStore((state) => state.sessions[input.serverId]);
+  const tails = session?.agentStreamTail ?? EMPTY_TIMELINE_TAILS;
+  const visible = pager.visible;
   const stitched = useMemo(() => {
-    if (!input.loadHistory || !metadata || !isCurrent || members.length === 0) return null;
-    const timelineMembers: ConversationFamilyTimelineMember[] = members.map((member) => ({
-      ...member,
-      items: tails.get(member.agentId) ?? [],
-    }));
+    if (!metadata || !isCurrent || members.length === 0) return null;
+    // Keep the live view until its initial tail is available.
+    if (!tails.get(input.agentId)?.length) return null;
+    const timelineMembers: ConversationFamilyTimelineMember[] = members
+      .filter((member) => visible.has(member.agentId))
+      .map((member) => ({
+        agentId: member.agentId,
+        title: member.title,
+        position: member.position,
+        items: tails.get(member.agentId) ?? [],
+      }));
     return stitchConversationFamilyTimeline({
       currentAgentId: metadata.currentAgentId,
       members: timelineMembers,
@@ -161,7 +127,9 @@ export function useConversationFamily(input: {
           { title: member.title },
         ),
     });
-  }, [input.loadHistory, isCurrent, members, metadata, t, tails]);
+  }, [input.agentId, isCurrent, members, metadata, t, tails, visible]);
+
+  const pagination = familyPaginationState(session, members, visible, input.agentId);
 
   if (!metadata || !isCurrent) return null;
   return {
@@ -170,13 +138,108 @@ export function useConversationFamily(input: {
     memberCount: Math.max(1, members.length),
     streamItems: stitched?.items ?? [],
     readOnlyItemIds: stitched?.readOnlyItemIds ?? new Set<string>(),
-    isLoading:
-      membersQuery.isPending ||
-      (input.loadHistory === true &&
-        timelineLoad.key === memberKey &&
-        timelineLoad.status === "loading"),
-    error:
-      (membersQuery.error instanceof Error ? membersQuery.error.message : null) ??
-      (timelineLoad.key === memberKey ? timelineLoad.error : null),
+    isLoading: membersQuery.isPending || pager.pending !== null,
+    hasOlder: pagination.hasOlder,
+    progressKey: pagination.progressKey,
+    loadOlder,
+    error: (membersQuery.error instanceof Error ? membersQuery.error.message : null) ?? pager.error,
   };
+}
+
+function familyPaginationState(
+  session: Parameters<typeof selectAgentTimelineState>[0],
+  members: ConversationFamilyMember[],
+  visible: ReadonlySet<string>,
+  currentAgentId: string,
+) {
+  const first = members.findIndex((member) => visible.has(member.agentId));
+  const oldest = first >= 0 ? selectAgentTimelineState(session, members[first].agentId) : null;
+  const range = oldest?.status === "synced" ? oldest.range : null;
+  return {
+    hasOlder: oldest?.status === "synced" && (first > 0 || oldest.older === "available"),
+    progressKey: `${members[first]?.agentId ?? currentAgentId}:${range?.epoch ?? ""}:${range?.startSeq ?? ""}`,
+  };
+}
+
+/** Owns family page admission; consumers only request one older page. */
+function useFamilyHistoryPager(input: {
+  serverId: string;
+  agentId: string;
+  isCurrent: boolean;
+  members: ConversationFamilyMember[];
+  loadHistory?: boolean;
+}) {
+  const { members, isCurrent } = input;
+  const pager = useMemo(
+    () => ({
+      serverId: input.serverId,
+      visible: new Set([input.agentId]),
+      pending: null as Promise<boolean> | null,
+      error: null as string | null,
+    }),
+    [input.serverId, input.agentId],
+  );
+  const [, refresh] = useState(0);
+  const loadOlder = useCallback((): Promise<boolean> => {
+    if (pager.pending) return pager.pending;
+    if (!isCurrent || !members.length) return Promise.resolve(false);
+    const first = members.findIndex((member) => pager.visible.has(member.agentId));
+    if (first < 0) return Promise.resolve(false);
+    const oldest = members[first];
+    const timeline = selectAgentTimelineState(
+      useSessionStore.getState().sessions[input.serverId],
+      oldest.agentId,
+    );
+    const cursor =
+      timeline.status === "synced" && timeline.older === "available" ? timeline.range : null;
+    const target = timeline.status !== "synced" || cursor ? oldest : members[first - 1];
+    if (!target) return Promise.resolve(false);
+    const request = cursor
+      ? planTimelineOlderFetch({ epoch: cursor.epoch, seq: cursor.startSeq })
+      : planTimelineTailFetch();
+    pager.error = null;
+    pager.pending = (async () => {
+      try {
+        const page = await getHostRuntimeStore().fetchAgentTimeline(
+          input.serverId,
+          target.agentId,
+          request,
+        );
+        if (page.error) throw new Error(page.error);
+        if (
+          cursor &&
+          page.hasOlder &&
+          page.startCursor?.epoch === cursor.epoch &&
+          page.startCursor.seq >= cursor.startSeq
+        ) {
+          throw new Error("History cursor did not advance");
+        }
+        pager.visible = new Set([...pager.visible, target.agentId]);
+        return true;
+      } catch (error) {
+        pager.error = error instanceof Error ? error.message : String(error);
+        return false;
+      } finally {
+        pager.pending = null;
+        refresh((value) => value + 1);
+      }
+    })();
+    refresh((value) => value + 1);
+    return pager.pending;
+  }, [input.serverId, isCurrent, members, pager]);
+
+  useEffect(() => {
+    if (!input.loadHistory) return;
+    let cancelled = false;
+    void (async () => {
+      for (;;) {
+        if (cancelled || !(await loadOlder())) break;
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [input.loadHistory, loadOlder]);
+
+  return { pager, loadOlder };
 }

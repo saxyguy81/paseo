@@ -1509,6 +1509,7 @@ const AgentStreamSection = memo(function AgentStreamSection({
   const isCompactFormFactor = useIsCompactFormFactor();
   const [isCompactFamilyHistoryExpanded, setIsCompactFamilyHistoryExpanded] = useState(false);
   const isFamilyHistoryExpanded = !isCompactFormFactor || isCompactFamilyHistoryExpanded;
+  const [isFamilySearchActive, setIsFamilySearchActive] = useState(false);
   useEffect(() => setIsCompactFamilyHistoryExpanded(false), [agent.id]);
   const hasWorkspaceDiffStat = useWorkspaceHasDiffStat(serverId, workspaceId);
   const hasVisibleComposerTracks =
@@ -1546,20 +1547,18 @@ const AgentStreamSection = memo(function AgentStreamSection({
     serverId,
     agentId: agent.id,
     labels: agent.labels,
-    loadHistory: isFamilyHistoryExpanded,
+    loadHistory: isFamilySearchActive,
   });
   const displayedStreamItems =
-    isFamilyHistoryExpanded && family && family.streamItems.length > 0
-      ? family.streamItems
-      : streamItems;
+    family && family.streamItems.length > 0 ? family.streamItems : streamItems;
   const familyHistoryPagination = useMemo(
     () =>
       family
         ? {
-            hasOlder: false,
+            hasOlder: family.hasOlder,
             isLoadingOlder: family.isLoading,
-            progressKey: family.familyId,
-            onLoadOlder: () => false,
+            progressKey: family.progressKey,
+            onLoadOlder: family.loadOlder,
           }
         : undefined,
     [family],
@@ -1601,6 +1600,7 @@ const AgentStreamSection = memo(function AgentStreamSection({
         <ConversationFamilyToolbar
           family={family}
           isExpanded={isFamilyHistoryExpanded}
+          onSearchActiveChange={setIsFamilySearchActive}
           onExpandedChange={setIsCompactFamilyHistoryExpanded}
           onJumpToMatch={handleJumpToFamilyMatch}
         />

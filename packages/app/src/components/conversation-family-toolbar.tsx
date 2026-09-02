@@ -32,11 +32,13 @@ export function ConversationFamilyToolbar({
   family,
   isExpanded,
   onExpandedChange,
+  onSearchActiveChange,
   onJumpToMatch,
 }: {
   family: ConversationFamilyView;
   isExpanded: boolean;
   onExpandedChange: (expanded: boolean) => void;
+  onSearchActiveChange?: (active: boolean) => void;
   onJumpToMatch: (itemId: string) => void;
 }) {
   const { t } = useTranslation();
@@ -57,6 +59,10 @@ export function ConversationFamilyToolbar({
   });
 
   useEffect(() => setActiveMatchIndex(0), [includeToolActivity, matches.length, query]);
+  useEffect(() => {
+    onSearchActiveChange?.(isSearchVisible && query.trim().length > 0);
+    return () => onSearchActiveChange?.(false);
+  }, [isSearchVisible, query, onSearchActiveChange]);
 
   const jumpToMatch = useCallback(
     (index: number) => {
