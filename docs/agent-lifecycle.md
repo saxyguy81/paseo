@@ -57,9 +57,14 @@ Not every upstream `409` means the same thing. A response saying the conversatio
 active request is a live ownership conflict and may receive one bounded retry on the same native
 session. CCProxy's distinct `Conversation has an unresolved prior request` response means delivery of
 an earlier request is ambiguous. Replaying that session could duplicate side effects, so Paseo never
-retries it in place. A `Continuation matching is temporarily unavailable` response gets one bounded
-same-session retry when the turn has no work yet, or when post-work recovery can be claimed safely and
-durably. If that retry is unsafe or the exact failure repeats, Paseo treats the native session as
+retries it in place. Likewise, `Conversation continuation was not found` means CCProxy cannot safely
+bind the submitted history to the saved native conversation; Paseo rolls forward instead of letting
+Claude misreport the conflict as model unavailability. CCProxy returns that deterministic rejection
+with `x-should-retry: false`; the status, message, and retry header form the cross-service rollover
+contract. A `Continuation matching is temporarily unavailable` response gets one bounded same-session
+retry when the turn has no work yet, or when
+post-work recovery can be claimed safely and durably. If that retry is unsafe or the exact failure
+repeats, Paseo treats the native session as
 unresolved and rolls forward. Authentication, model-access, quota, and rate-limit failures remain
 visible instead of being treated as ownership conflicts.
 

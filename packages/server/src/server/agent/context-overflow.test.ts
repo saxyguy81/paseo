@@ -89,6 +89,21 @@ describe("readTerminalConversationRolloverFailure", () => {
     });
   });
 
+  test("classifies a missing CCProxy continuation as an unresolved conversation", () => {
+    const text = "API Error: 409 Conversation continuation was not found";
+    expect(
+      readTerminalConversationRolloverFailure(
+        rows({
+          type: "assistant_message",
+          text,
+        }),
+      ),
+    ).toEqual({
+      kind: "conversation_unresolved",
+      text,
+    });
+  });
+
   test("rehydrates a terminal resumed-session model rejection as its own failure kind", () => {
     const text =
       "There's an issue with the selected model (claude-opus-5). It may not exist or you may not have access to it. Run --model to pick a different model.";

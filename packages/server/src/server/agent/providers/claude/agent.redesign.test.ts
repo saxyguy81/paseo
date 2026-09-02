@@ -264,6 +264,14 @@ test("recognizes only retryable synthetic Claude API failures", () => {
       apiError("API Error: 503 Continuation matching is temporarily unavailable"),
     ),
   ).toBe("API Error: 503 Continuation matching is temporarily unavailable");
+  expect(
+    readClaudeUnresolvedTurnError(
+      apiError("API Error: 409 Conversation continuation was not found"),
+    ),
+  ).toBe("API Error: 409 Conversation continuation was not found");
+  expect(
+    readRetryableClaudeApiError(apiError("API Error: 409 Conversation continuation was not found")),
+  ).toBeNull();
   expect(readRetryableClaudeApiError(apiError("API Error: 429 Rate limit exceeded"))).toBeNull();
   expect(readRetryableClaudeApiError(apiError("API Error: prompt too long"))).toBeNull();
   expect(

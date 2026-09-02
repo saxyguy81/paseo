@@ -17,10 +17,14 @@ export function isContextOverflowFailureText(value: unknown): value is string {
 
 /** Return true only when the provider cannot safely continue the native conversation. */
 export function isConversationUnresolvedFailureText(value: unknown): value is string {
+  // These exact CCProxy messages are a cross-service contract. In particular,
+  // continuation-not-found is deterministic and must roll forward, not retry
+  // the same native session or masquerade as Claude model unavailability.
   return (
     typeof value === "string" &&
     (/^API Error:\s*409\s+Conversation has an unresolved prior request\b/i.test(value.trim()) ||
       /^API Error:\s*409\s+Conversation already has an active request\b/i.test(value.trim()) ||
+      /^API Error:\s*409\s+Conversation continuation was not found\b/i.test(value.trim()) ||
       /^API Error:\s*503\s+Continuation matching is temporarily unavailable\b/i.test(value.trim()))
   );
 }

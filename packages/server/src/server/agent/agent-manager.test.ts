@@ -8628,6 +8628,11 @@ test.each([
     failureText: "API Error: 409 Conversation already has an active request",
   },
   {
+    name: "missing CCProxy continuation",
+    failureKind: "conversation_unresolved" as const,
+    failureText: "API Error: 409 Conversation continuation was not found",
+  },
+  {
     name: "resumed-session model rejection",
     failureKind: "resume_model_unavailable" as const,
     failureText:
