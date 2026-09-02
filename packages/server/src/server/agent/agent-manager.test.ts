@@ -1711,7 +1711,7 @@ test("does not persist an initializing session after shutdown closes it", async 
   }
 });
 
-test("shutdown preserves a durable rollover failure when provider teardown emits SIGTERM", async () => {
+test("provider teardown SIGTERM cannot replace a durable rollover failure before shutdown starts", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-shutdown-failure-state-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
   let resumedSession: TestAgentSession | null = null;
@@ -1749,13 +1749,14 @@ test("shutdown preserves a durable rollover failure when provider teardown emits
     await ensureAgentLoaded(agent.id, { agentManager: manager, agentStorage: storage, logger });
     expect(resumedSession).not.toBeNull();
 
-    manager.prepareForShutdown();
     resumedSession!.pushEvent({
       type: "turn_failed",
       provider: "codex",
       error:
         "Claude stopped unexpectedly (signal SIGTERM). Any background work was terminated with it.",
     });
+    await vi.waitFor(() => expect(manager.getAgent(agent.id)?.lastError).toBe(failureText));
+    manager.prepareForShutdown();
     await manager.closeAgent(agent.id);
     await storage.flush();
 

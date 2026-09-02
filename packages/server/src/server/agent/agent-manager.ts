@@ -122,6 +122,11 @@ function submittedPromptText(prompt: AgentPromptInput): string {
     .trim();
 }
 
+function isProviderTeardownFailure(error: string): boolean {
+  const normalized = error.toLowerCase();
+  return normalized.includes("stopped unexpectedly") && normalized.includes("sigterm");
+}
+
 function parseFamilyPosition(value: string | null | undefined): number {
   const position = Number(value);
   return Number.isInteger(position) && position >= 0 ? position : 0;
@@ -4686,6 +4691,27 @@ export class AgentManager {
       },
       "handleStreamEvent: turn_failed",
     );
+    if (
+      agent.lastFailureKind !== undefined &&
+      event.failureKind === undefined &&
+      isProviderTeardownFailure(event.error)
+    ) {
+      // The supervisor can signal a provider subprocess a few milliseconds
+      // before the worker enters prepareForShutdown(). A synthetic SIGTERM
+      // failure from that race must not replace an earlier durable rollover
+      // failure, or startup reconciliation will no longer know the native
+      // conversation is poisoned and needs a fresh family member.
+      this.logger.info(
+        {
+          agentId: agent.id,
+          provider: agent.provider,
+          eventTurnId,
+          preservedFailureKind: agent.lastFailureKind,
+        },
+        "Ignoring provider teardown failure that would replace a durable conversation failure",
+      );
+      return;
+    }
     if (!this.acceptingAgentRegistrations) {
       // Provider runtimes can emit a synthetic failure while closeAllAgents is
       // terminating their subprocesses. That event is not a user turn and

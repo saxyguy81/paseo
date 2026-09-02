@@ -102,6 +102,11 @@ adopt the already-created successor instead of creating another one. The UI stit
 predecessor and writable successor into one searchable conversation history while keeping future
 prompts on the canonical successor.
 
+Daemon shutdown also preserves any durable rollover failure already recorded for a family member.
+The supervisor can terminate a provider subprocess just before the worker enters its shutdown state;
+the resulting synthetic SIGTERM failure is teardown noise and must not replace the failure that tells
+startup reconciliation to create a fresh successor.
+
 ## Relationships
 
 Agents can launch other agents via the agent-scoped `create_agent` MCP tool. Agent-scoped creation is always asynchronous and always stamps `paseo.parent-agent-id`, pointing back at the caller. Omit `workspaceId` to use the caller's workspace, or pass an existing workspace ID returned by `create_workspace`. Placement never changes parentage.
