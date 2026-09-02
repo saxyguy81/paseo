@@ -157,6 +157,7 @@ export function buildAgentFreshSessionContinuationPrompt(input: {
   rows: readonly AgentTimelineRow[];
   failureKind: "context_overflow" | "conversation_unresolved" | "resume_model_unavailable";
   maxChars?: number;
+  outstandingRequest?: string | null;
 }): string | null {
   const maxChars = input.maxChars ?? DEFAULT_CONTEXT_OVERFLOW_CONTINUATION_MAX_CHARS;
   const projected = projectTimelineRows({ rows: input.rows, mode: "projected" });
@@ -166,15 +167,12 @@ export function buildAgentFreshSessionContinuationPrompt(input: {
       entry.item.text.trim().length > 0 &&
       !isSystemInjectedEnvelope(entry.item.text),
   );
-  if (latestUserIndex < 0) {
-    return null;
-  }
-
-  const latestUser = projected[latestUserIndex]?.item;
-  if (!latestUser || latestUser.type !== "user_message") {
-    return null;
-  }
-  const request = latestUser.text.trim();
+  const latestUser = latestUserIndex >= 0 ? projected[latestUserIndex]?.item : null;
+  const request =
+    latestUser?.type === "user_message"
+      ? latestUser.text.trim()
+      : input.outstandingRequest?.trim() || null;
+  if (!request) return null;
   let reason =
     "cannot be resumed safely because Claude rejected the saved native session before doing new work";
   if (input.failureKind === "context_overflow") {
@@ -194,7 +192,7 @@ export function buildAgentFreshSessionContinuationPrompt(input: {
   }
 
   const stateEntries = projected
-    .slice(latestUserIndex + 1)
+    .slice(latestUserIndex >= 0 ? latestUserIndex + 1 : 0)
     .map((entry) => formatContextOverflowStateEntry(entry.item))
     .filter((entry): entry is string => Boolean(entry));
   if (stateEntries.length === 0) {

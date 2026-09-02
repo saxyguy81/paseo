@@ -141,6 +141,39 @@ function findConversationSuccessor(
   );
 }
 
+function latestSubstantiveUserRequest(rows: readonly AgentTimelineRow[]): string | null {
+  const row = rows.findLast(
+    (candidate) =>
+      candidate.item.type === "user_message" &&
+      candidate.item.text.trim().length > 0 &&
+      !isSystemInjectedEnvelope(candidate.item.text),
+  );
+  return row?.item.type === "user_message" ? row.item.text.trim() : null;
+}
+
+function inheritedConversationRequest(
+  records: readonly StoredAgentRecord[],
+  failedMember: StoredAgentRecord,
+): string | null {
+  const familyId = failedMember.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim();
+  if (!familyId) return failedMember.continuationRequest?.trim() || null;
+  const recordById = new Map(records.map((record) => [record.id, record]));
+  const visited = new Set<string>();
+  let cursor: StoredAgentRecord | undefined = failedMember;
+  while (
+    cursor &&
+    !visited.has(cursor.id) &&
+    cursor.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim() === familyId
+  ) {
+    visited.add(cursor.id);
+    const request = cursor.continuationRequest?.trim();
+    if (request) return request;
+    const predecessorId = cursor.labels?.[CONVERSATION_FAMILY_PREDECESSOR_LABEL]?.trim();
+    cursor = predecessorId ? recordById.get(predecessorId) : undefined;
+  }
+  return null;
+}
+
 function isEligibleConversationPredecessor(
   predecessor: StoredAgentRecord,
   agentId: string,
@@ -1341,9 +1374,12 @@ export class AgentManager {
       return null;
     }
     const rows = await this.getConversationFamilyRolloverTimelineRows(records, predecessor);
+    const continuationRequest =
+      latestSubstantiveUserRequest(rows) ?? inheritedConversationRequest(records, predecessor);
     const prompt = buildAgentFreshSessionContinuationPrompt({
       rows,
       failureKind,
+      outstandingRequest: continuationRequest,
     });
     if (!prompt) {
       this.logger.warn(
@@ -1381,6 +1417,14 @@ export class AgentManager {
       workspaceId: predecessor.workspaceId,
       owner: predecessor.owner,
     });
+
+    if (continuationRequest) {
+      const successorRecord = await registry.get(successor.id);
+      if (!successorRecord) {
+        throw new Error("Conversation rollover successor is missing from storage");
+      }
+      await registry.upsert({ ...successorRecord, continuationRequest });
+    }
 
     await this.repairConversationFamily(agentId, successor.id);
 

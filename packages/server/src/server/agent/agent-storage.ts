@@ -100,6 +100,7 @@ const STORED_AGENT_SCHEMA = z.object({
   internal: z.boolean().optional(),
   archivedAt: z.string().nullable().optional(),
   owner: AgentOwnerSchema.optional(),
+  continuationRequest: z.string().max(24_000).nullable().optional(),
   pendingPrompts: z.array(STORED_PENDING_AGENT_PROMPT_SCHEMA).max(32).default([]),
 });
 
@@ -497,6 +498,7 @@ export class AgentStorage {
         record.archivedAt = existing.archivedAt;
       }
       if (existing) {
+        record.continuationRequest = existing.continuationRequest;
         record.pendingPrompts = existing.pendingPrompts;
       }
       return record;

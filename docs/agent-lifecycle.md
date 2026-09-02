@@ -97,6 +97,12 @@ request. Following the lineage avoids adopting work from a divergent sibling if 
 left one behind. It also keeps repeated rollovers recoverable without loading unrelated early history
 or promoting an internal handoff into a new user instruction.
 
+Each fresh family member also stores the bounded outstanding user request separately from provider
+history. Provider history and Paseo's committed timeline can have different retention boundaries, so
+the request is the durable recovery anchor while the current member's timeline supplies newer working
+state. This avoids reopening a poisoned predecessor or depending on stitched history being locally
+materialized at the instant another rollover is required.
+
 The predecessor label is the transition's idempotency key. Repeated terminal events or a daemon crash
 adopt the already-created successor instead of creating another one. The UI stitches the read-only
 predecessor and writable successor into one searchable conversation history while keeping future

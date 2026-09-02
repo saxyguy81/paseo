@@ -9051,7 +9051,7 @@ test("a repeated rollover consumes the failed queued prompt and transfers only t
   }
 });
 
-test("a repeated rollover recovers the human request from an earlier family member", async () => {
+test("a repeated rollover recovers the durable request when predecessor rows are unavailable", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-family-handoff-rollover-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
   const durableTimelineStore = new RecordingTimelineStore();
@@ -9136,10 +9136,12 @@ test("a repeated rollover recovers the human request from an earlier family memb
     const storedCurrent = (await storage.get(currentId))!;
     await storage.upsert({
       ...storedCurrent,
+      continuationRequest: "Run the Lantau UPF regressions and report the results.",
       lastStatus: "error",
       lastError: failureText,
       lastFailureKind: "conversation_unresolved",
     });
+    await durableTimelineStore.deleteAgent(originalId);
 
     await expect(
       manager.ensureAgentFailureContinuation(currentId, "conversation_unresolved", failureText),
@@ -9152,6 +9154,9 @@ test("a repeated rollover recovers the human request from an earlier family memb
     );
     expect(startedPrompts[0]).not.toContain("Continue the previous handoff");
     expect((await storage.get(nextId))?.labels[CONVERSATION_FAMILY_POSITION_LABEL]).toBe("2");
+    expect((await storage.get(nextId))?.continuationRequest).toBe(
+      "Run the Lantau UPF regressions and report the results.",
+    );
   } finally {
     await manager.closeAgent(nextId).catch(() => undefined);
     rmSync(workdir, { recursive: true, force: true });
