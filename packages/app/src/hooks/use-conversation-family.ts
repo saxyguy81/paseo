@@ -92,6 +92,7 @@ export function useConversationFamily(input: {
   serverId: string;
   agentId: string;
   labels?: Record<string, string>;
+  loadHistory?: boolean;
 }): ConversationFamilyView | null {
   const { t } = useTranslation();
   const metadata = useMemo(() => parseConversationFamilyLabels(input.labels), [input.labels]);
@@ -117,7 +118,7 @@ export function useConversationFamily(input: {
   }>({ key: "", status: "idle", error: null });
 
   useEffect(() => {
-    if (!isCurrent || members.length === 0) return;
+    if (!input.loadHistory || !isCurrent || members.length === 0) return;
     let cancelled = false;
     setTimelineLoad({ key: memberKey, status: "loading", error: null });
     void (async () => {
@@ -138,13 +139,13 @@ export function useConversationFamily(input: {
     return () => {
       cancelled = true;
     };
-  }, [input.serverId, isCurrent, memberKey, members]);
+  }, [input.loadHistory, input.serverId, isCurrent, memberKey, members]);
 
   const tails = useSessionStore(
     (state) => state.sessions[input.serverId]?.agentStreamTail ?? EMPTY_TIMELINE_TAILS,
   );
   const stitched = useMemo(() => {
-    if (!metadata || !isCurrent || members.length === 0) return null;
+    if (!input.loadHistory || !metadata || !isCurrent || members.length === 0) return null;
     const timelineMembers: ConversationFamilyTimelineMember[] = members.map((member) => ({
       ...member,
       items: tails.get(member.agentId) ?? [],
@@ -160,7 +161,7 @@ export function useConversationFamily(input: {
           { title: member.title },
         ),
     });
-  }, [isCurrent, members, metadata, t, tails]);
+  }, [input.loadHistory, isCurrent, members, metadata, t, tails]);
 
   if (!metadata || !isCurrent) return null;
   return {
@@ -171,7 +172,9 @@ export function useConversationFamily(input: {
     readOnlyItemIds: stitched?.readOnlyItemIds ?? new Set<string>(),
     isLoading:
       membersQuery.isPending ||
-      (timelineLoad.key === memberKey && timelineLoad.status === "loading"),
+      (input.loadHistory === true &&
+        timelineLoad.key === memberKey &&
+        timelineLoad.status === "loading"),
     error:
       (membersQuery.error instanceof Error ? membersQuery.error.message : null) ??
       (timelineLoad.key === memberKey ? timelineLoad.error : null),

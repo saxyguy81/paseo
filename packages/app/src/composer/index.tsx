@@ -2197,8 +2197,12 @@ function ComposerContentImpl({
     [keyboardAnimatedStyle],
   );
   const inputAreaContainerStyle = useMemo(
-    () => [styles.inputAreaContainer, isComposerLocked && styles.inputAreaLocked],
-    [isComposerLocked],
+    () => [
+      styles.inputAreaContainer,
+      isCompactLayout && styles.inputAreaContainerCompact,
+      isComposerLocked && styles.inputAreaLocked,
+    ],
+    [isCompactLayout, isComposerLocked],
   );
 
   const attachmentTray = useMemo(
@@ -2407,6 +2411,9 @@ const styles = StyleSheet.create((theme: Theme) => ({
   },
   inputAreaLocked: {
     opacity: 0.6,
+  },
+  inputAreaContainerCompact: {
+    paddingBottom: theme.spacing[1],
   },
   inputAreaContent: {
     flexShrink: 1,

@@ -101,9 +101,22 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function renderToolbar(): void {
+function renderToolbar({
+  isExpanded = false,
+  onExpandedChange = vi.fn(),
+}: {
+  isExpanded?: boolean;
+  onExpandedChange?: (expanded: boolean) => void;
+} = {}): void {
   act(() => {
-    root?.render(<ConversationFamilyToolbar family={family} onJumpToMatch={vi.fn()} />);
+    root?.render(
+      <ConversationFamilyToolbar
+        family={family}
+        isExpanded={isExpanded}
+        onExpandedChange={onExpandedChange}
+        onJumpToMatch={vi.fn()}
+      />,
+    );
   });
 }
 
@@ -126,7 +139,8 @@ describe("conversation family toolbar visibility", () => {
   });
 
   it("collapses the search by default on compact screens and reveals it on demand", () => {
-    renderToolbar();
+    const onExpandedChange = vi.fn();
+    renderToolbar({ onExpandedChange });
 
     const disclosure = byTestId("conversation-family-disclosure");
     expect(disclosure).not.toBeNull();
@@ -135,14 +149,19 @@ describe("conversation family toolbar visibility", () => {
     expect(byTestId("conversation-family-search")).toBeNull();
 
     click(disclosure as HTMLElement);
+    expect(onExpandedChange).toHaveBeenCalledWith(true);
 
-    expect(disclosure?.getAttribute("aria-expanded")).toBe("true");
+    renderToolbar({ isExpanded: true, onExpandedChange });
+
+    expect(byTestId("conversation-family-disclosure")?.getAttribute("aria-expanded")).toBe("true");
     expect(byTestId("conversation-family-search")).not.toBeNull();
     expect(byTestId("conversation-family-include-tools")).not.toBeNull();
 
-    click(disclosure as HTMLElement);
+    click(byTestId("conversation-family-disclosure") as HTMLElement);
+    expect(onExpandedChange).toHaveBeenLastCalledWith(false);
 
-    expect(disclosure?.getAttribute("aria-expanded")).toBe("false");
+    renderToolbar({ onExpandedChange });
+    expect(byTestId("conversation-family-disclosure")?.getAttribute("aria-expanded")).toBe("false");
     expect(byTestId("conversation-family-search")).toBeNull();
   });
 

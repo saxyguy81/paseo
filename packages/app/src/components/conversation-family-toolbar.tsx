@@ -30,14 +30,17 @@ export function resolveConversationFamilySearchVisibility(input: {
 
 export function ConversationFamilyToolbar({
   family,
+  isExpanded,
+  onExpandedChange,
   onJumpToMatch,
 }: {
   family: ConversationFamilyView;
+  isExpanded: boolean;
+  onExpandedChange: (expanded: boolean) => void;
   onJumpToMatch: (itemId: string) => void;
 }) {
   const { t } = useTranslation();
   const isCompactFormFactor = useIsCompactFormFactor();
-  const [isCompactExpanded, setIsCompactExpanded] = useState(false);
   const [query, setQuery] = useState("");
   const [includeToolActivity, setIncludeToolActivity] = useState(false);
   const [activeMatchIndex, setActiveMatchIndex] = useState(0);
@@ -50,7 +53,7 @@ export function ConversationFamilyToolbar({
   );
   const isSearchVisible = resolveConversationFamilySearchVisibility({
     isCompactFormFactor,
-    isCompactExpanded,
+    isCompactExpanded: isExpanded,
   });
 
   useEffect(() => setActiveMatchIndex(0), [includeToolActivity, matches.length, query]);
@@ -86,8 +89,8 @@ export function ConversationFamilyToolbar({
     [activeMatchIndex, jumpToMatch],
   );
   const toggleCompactSearch = useCallback(
-    () => setIsCompactExpanded((isExpanded) => !isExpanded),
-    [],
+    () => onExpandedChange(!isExpanded),
+    [isExpanded, onExpandedChange],
   );
   const fullHistoryLabel = t("agentStream.family.fullHistory", {
     count: family.memberCount,
@@ -106,9 +109,9 @@ export function ConversationFamilyToolbar({
   const disclosureTrailing = useMemo(
     () =>
       isSearchVisible ? (
-        <ThemedChevronUp size={18} uniProps={foregroundMutedColorMapping} />
+        <ThemedChevronUp size={14} uniProps={foregroundMutedColorMapping} />
       ) : (
-        <ThemedChevronDown size={18} uniProps={foregroundMutedColorMapping} />
+        <ThemedChevronDown size={14} uniProps={foregroundMutedColorMapping} />
       ),
     [isSearchVisible],
   );
@@ -125,8 +128,9 @@ export function ConversationFamilyToolbar({
           {isCompactFormFactor ? (
             <Button
               {...webDisclosureState}
-              size="md"
+              size="xs"
               variant="ghost"
+              hitSlop={8}
               style={styles.familyDisclosureButton}
               textStyle={styles.familyDisclosureText}
               leftIcon={disclosureLeftIcon}
@@ -242,7 +246,7 @@ const styles = StyleSheet.create((theme) => ({
     gap: theme.spacing[2],
   },
   familyToolbarRailCompact: {
-    paddingVertical: theme.spacing[1],
+    paddingVertical: 0,
   },
   familySummary: {
     minHeight: 18,
@@ -251,7 +255,7 @@ const styles = StyleSheet.create((theme) => ({
     gap: theme.spacing[2],
   },
   familySummaryCompact: {
-    minHeight: 44,
+    minHeight: 28,
     flexDirection: "column",
     alignItems: "stretch",
   },

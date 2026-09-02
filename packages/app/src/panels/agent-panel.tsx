@@ -1507,6 +1507,9 @@ const AgentStreamSection = memo(function AgentStreamSection({
   readOnly: boolean;
 }) {
   const isCompactFormFactor = useIsCompactFormFactor();
+  const [isCompactFamilyHistoryExpanded, setIsCompactFamilyHistoryExpanded] = useState(false);
+  const isFamilyHistoryExpanded = !isCompactFormFactor || isCompactFamilyHistoryExpanded;
+  useEffect(() => setIsCompactFamilyHistoryExpanded(false), [agent.id]);
   const hasWorkspaceDiffStat = useWorkspaceHasDiffStat(serverId, workspaceId);
   const hasVisibleComposerTracks =
     hasActiveComposer && (hasVisibleAgentTracks || hasWorkspaceDiffStat);
@@ -1543,9 +1546,12 @@ const AgentStreamSection = memo(function AgentStreamSection({
     serverId,
     agentId: agent.id,
     labels: agent.labels,
+    loadHistory: isFamilyHistoryExpanded,
   });
   const displayedStreamItems =
-    family && family.streamItems.length > 0 ? family.streamItems : streamItems;
+    isFamilyHistoryExpanded && family && family.streamItems.length > 0
+      ? family.streamItems
+      : streamItems;
   const familyHistoryPagination = useMemo(
     () =>
       family
@@ -1592,7 +1598,12 @@ const AgentStreamSection = memo(function AgentStreamSection({
   return (
     <View style={styles.familyStreamContainer}>
       {family ? (
-        <ConversationFamilyToolbar family={family} onJumpToMatch={handleJumpToFamilyMatch} />
+        <ConversationFamilyToolbar
+          family={family}
+          isExpanded={isFamilyHistoryExpanded}
+          onExpandedChange={setIsCompactFamilyHistoryExpanded}
+          onJumpToMatch={handleJumpToFamilyMatch}
+        />
       ) : null}
       <AgentStreamView
         ref={streamViewRef}
