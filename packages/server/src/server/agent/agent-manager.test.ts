@@ -1711,6 +1711,66 @@ test("does not persist an initializing session after shutdown closes it", async 
   }
 });
 
+test("shutdown preserves a durable rollover failure when provider teardown emits SIGTERM", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-shutdown-failure-state-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  let resumedSession: TestAgentSession | null = null;
+  const client = new (class extends TestAgentClient {
+    override async resumeSession(
+      _handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+    ): Promise<AgentSession> {
+      resumedSession = new TestAgentSession({
+        provider: "codex",
+        cwd: config?.cwd ?? workdir,
+      });
+      return resumedSession;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const failureText =
+    "There's an issue with the selected model (claude-opus-5). It may not exist or you may not have access to it.";
+
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.closeAgent(agent.id);
+    const stored = (await storage.get(agent.id))!;
+    await storage.upsert({
+      ...stored,
+      lastStatus: "error",
+      lastError: failureText,
+      lastFailureKind: "resume_model_unavailable",
+      requiresAttention: true,
+      attentionReason: "error",
+      attentionTimestamp: new Date().toISOString(),
+    });
+    await ensureAgentLoaded(agent.id, { agentManager: manager, agentStorage: storage, logger });
+    expect(resumedSession).not.toBeNull();
+
+    manager.prepareForShutdown();
+    resumedSession!.pushEvent({
+      type: "turn_failed",
+      provider: "codex",
+      error:
+        "Claude stopped unexpectedly (signal SIGTERM). Any background work was terminated with it.",
+    });
+    await manager.closeAgent(agent.id);
+    await storage.flush();
+
+    expect(await storage.get(agent.id)).toMatchObject({
+      lastStatus: "closed",
+      lastError: failureText,
+      lastFailureKind: "resume_model_unavailable",
+    });
+  } finally {
+    await manager.flushForShutdown().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("reload leaves a closed durable snapshot when shutdown starts during the swap", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-shutdown-reload-test-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);

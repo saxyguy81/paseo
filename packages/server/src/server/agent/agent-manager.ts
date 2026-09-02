@@ -4337,6 +4337,7 @@ export class AgentManager {
     terminalDisposition: ActiveTurnTerminalDisposition,
   ): void {
     if (
+      this.acceptingAgentRegistrations &&
       !fromHistory &&
       event.type === "turn_failed" &&
       isConversationRolloverFailureKind(event.failureKind) &&
@@ -4640,6 +4641,17 @@ export class AgentManager {
       },
       "handleStreamEvent: turn_failed",
     );
+    if (!this.acceptingAgentRegistrations) {
+      // Provider runtimes can emit a synthetic failure while closeAllAgents is
+      // terminating their subprocesses. That event is not a user turn and
+      // must not overwrite a durable failure classification that startup
+      // reconciliation still needs after an upgrade or daemon restart.
+      this.logger.info(
+        { agentId: agent.id, provider: agent.provider, eventTurnId },
+        "Ignoring provider turn failure during agent manager shutdown",
+      );
+      return;
+    }
     if (terminalDisposition === "stale") return;
     if (!isForegroundEvent && !agent.activeForegroundTurnId) {
       agent.lifecycle = "error";
