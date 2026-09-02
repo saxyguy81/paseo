@@ -112,6 +112,38 @@ test("an unsolicited aborted result remains a failure with its original cause", 
   }
 });
 
+test.each([{ is_error: true }, { api_error_status: 503 }])(
+  "SDK success with error flags still fails: %j",
+  async (flags) => {
+    const frames = [
+      {
+        type: "result",
+        subtype: "success",
+        ...flags,
+        errors: ["API Error: upstream rejected the request"],
+        usage: buildUsage(),
+      },
+    ];
+    sdkQueryFactory.mockImplementation(() =>
+      createBaseQueryMock(
+        vi.fn(async () => {
+          const value = frames.shift();
+          return value ? { done: false, value } : { done: true, value: undefined };
+        }),
+      ),
+    );
+    const session = await createSession();
+    try {
+      const events = await collectUntilTerminal(streamSession(session, "check it"));
+      expect(events.find((event) => event.type === "turn_failed")).toMatchObject({
+        error: "API Error: upstream rejected the request",
+      });
+    } finally {
+      await session.close();
+    }
+  },
+);
+
 test("canceling one turn cannot suppress the next turn's upstream abort", async () => {
   let queryCount = 0;
   sdkQueryFactory.mockImplementation(() => {

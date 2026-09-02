@@ -4923,7 +4923,13 @@ class ClaudeAgentSession implements AgentSession {
     events: AgentStreamEvent[],
   ): void {
     const usage = this.convertUsage(message, message.modelUsage);
-    if (message.subtype === "success" && !this.pendingConversationRolloverFailure) {
+    const errorResult = toObjectRecord(message) ?? {};
+    const isErrorResult = errorResult.is_error === true || Boolean(errorResult.api_error_status);
+    if (
+      message.subtype === "success" &&
+      !isErrorResult &&
+      !this.pendingConversationRolloverFailure
+    ) {
       events.push(...this.sidechainTracker.finishAll("completed"));
       // Built-in slash commands (e.g. /voice, /usage, "Unknown command: …")
       // run client-side in the Claude CLI with no model turn — output_tokens
