@@ -693,11 +693,20 @@ class QueuedPromptAgentSession implements AgentSession {
     this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
   }
 
-  fail(error = "transient provider failure"): void {
+  fail(
+    error = "transient provider failure",
+    failureKind?: Extract<AgentStreamEvent, { type: "turn_failed" }>["failureKind"],
+  ): void {
     const turnId = this.activeTurnId;
     if (!turnId) throw new Error("No active turn");
     this.activeTurnId = null;
-    this.pushEvent({ type: "turn_failed", provider: this.provider, turnId, error });
+    this.pushEvent({
+      type: "turn_failed",
+      provider: this.provider,
+      turnId,
+      error,
+      ...(failureKind ? { failureKind } : {}),
+    });
   }
 
   subscribe(callback: (event: AgentStreamEvent) => void): () => void {
@@ -1084,6 +1093,150 @@ test("a terminal failure advances the durable prompt FIFO instead of wedging it"
     await vi.waitFor(() =>
       expect(client.session.prompts).toEqual(["first request", "second request", "third request"]),
     );
+    client.session.complete();
+    await vi.waitFor(async () => {
+      await expect(storage.listPendingPrompts(snapshot.id)).resolves.toEqual([]);
+    });
+  } finally {
+    await agentManager.closeAgent(snapshot.id).catch(() => undefined);
+    await agentManager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("a retryable pre-work API failure retains the durable prompt", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-durable-prompt-transient-api-"));
+  const logger = createTestLogger();
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new QueuedPromptAgentClient();
+  const agentManager = new AgentManager({
+    clients: { "claude-acc": client },
+    registry: storage,
+    logger,
+  });
+  const snapshot = await agentManager.createAgent(
+    { provider: "claude-acc", cwd: workdir },
+    undefined,
+    { workspaceId: undefined },
+  );
+
+  try {
+    await sendPromptToAgent({
+      agentManager,
+      agentStorage: storage,
+      agentId: snapshot.id,
+      prompt: "run this after the gateway recovers",
+      messageId: "message-transient-api",
+      activeTurnBehavior: "queue",
+      logger,
+    });
+    await vi.waitFor(() =>
+      expect(client.session.prompts).toEqual(["run this after the gateway recovers"]),
+    );
+
+    client.session.fail("API Error: 502 status code (no body)", "retryable_api");
+
+    await vi.waitFor(async () => {
+      await expect(storage.listPendingPrompts(snapshot.id)).resolves.toMatchObject([
+        {
+          id: "message-transient-api",
+          prompt: "run this after the gateway recovers",
+          state: "queued",
+          attemptCount: 1,
+        },
+      ]);
+    });
+  } finally {
+    await agentManager.closeAgent(snapshot.id).catch(() => undefined);
+    await agentManager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("a retained transient prompt retries automatically as a continuation", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-durable-prompt-transient-retry-"));
+  const logger = createTestLogger();
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new QueuedPromptAgentClient();
+  const agentManager = new AgentManager({
+    clients: { "claude-acc": client },
+    registry: storage,
+    transientPromptRetryBaseDelayMs: 5,
+    transientPromptRetryMaxDelayMs: 5,
+    logger,
+  });
+  const snapshot = await agentManager.createAgent(
+    { provider: "claude-acc", cwd: workdir },
+    undefined,
+    { workspaceId: undefined },
+  );
+
+  try {
+    await sendPromptToAgent({
+      agentManager,
+      agentStorage: storage,
+      agentId: snapshot.id,
+      prompt: "finish the interrupted regression",
+      messageId: "message-transient-retry",
+      activeTurnBehavior: "queue",
+      logger,
+    });
+    await vi.waitFor(() =>
+      expect(client.session.prompts).toEqual(["finish the interrupted regression"]),
+    );
+
+    client.session.fail("API Error: 502 status code (no body)", "retryable_api");
+
+    await vi.waitFor(() => expect(client.session.prompts).toHaveLength(2));
+    expect(client.session.prompts[1]).toContain("<paseo-system>");
+    expect(client.session.prompts[1]).toContain("Continue that unfinished request now");
+    client.session.complete();
+    await vi.waitFor(async () => {
+      await expect(storage.listPendingPrompts(snapshot.id)).resolves.toEqual([]);
+    });
+  } finally {
+    await agentManager.closeAgent(snapshot.id).catch(() => undefined);
+    await agentManager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("daemon recovery preserves a queued retry whose user message is already recorded", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-durable-prompt-transient-restart-"));
+  const logger = createTestLogger();
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new QueuedPromptAgentClient();
+  const agentManager = new AgentManager({
+    clients: { "claude-acc": client },
+    registry: storage,
+    logger,
+  });
+  const snapshot = await agentManager.createAgent(
+    { provider: "claude-acc", cwd: workdir },
+    undefined,
+    { workspaceId: undefined },
+  );
+
+  try {
+    await storage.enqueuePendingPrompt(snapshot.id, {
+      id: "message-transient-restart",
+      prompt: "finish after both the API and daemon recover",
+    });
+    await storage.claimPendingPrompt(snapshot.id);
+    await storage.releasePendingPrompt(snapshot.id, "message-transient-restart");
+    await agentManager.appendTimelineItem(snapshot.id, {
+      type: "user_message",
+      text: "finish after both the API and daemon recover",
+      clientMessageId: "message-transient-restart",
+    });
+
+    await resumePendingAgentPrompts({ agentManager, agentStorage: storage, logger });
+    await vi.waitFor(() => expect(client.session.prompts).toHaveLength(1));
+    expect(client.session.prompts[0]).toContain("<paseo-system>");
+    expect(client.session.prompts[0]).toContain("Continue that unfinished request now");
     client.session.complete();
     await vi.waitFor(async () => {
       await expect(storage.listPendingPrompts(snapshot.id)).resolves.toEqual([]);

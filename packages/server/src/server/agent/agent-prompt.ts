@@ -290,6 +290,12 @@ export async function resumePendingAgentPrompts(params: {
             logger: params.logger,
           });
           for (const pending of record.pendingPrompts) {
+            if (pending.state === "queued") {
+              // Queued is an explicit durable replay decision. This includes a request that
+              // reached Claude but failed safely before work began; its submitted timeline row
+              // is identity and history, not proof of completion.
+              continue;
+            }
             if (params.agentManager.hasSubmittedPrompt(record.id, pending.id)) {
               // startTurn accepted this stable client message before the daemon
               // exited. The durable timeline is the commit record; replaying

@@ -46,7 +46,6 @@ import { parsePartialJsonObject } from "./partial-json.js";
 import { ClaudeSidechainTracker } from "./sidechain-tracker.js";
 import { ClaudeTaskState } from "./task-state.js";
 import {
-  type ConversationRolloverFailureKind,
   isContextOverflowFailureText,
   isConversationUnresolvedFailureText,
 } from "../../context-overflow.js";
@@ -94,6 +93,7 @@ import {
 
 import {
   getAgentStreamEventTurnId,
+  type AgentFailureKind,
   type AgentPermissionAction,
   type AgentCapabilityFlags,
   type AgentClient,
@@ -556,27 +556,31 @@ interface PendingPostWorkApiRecovery {
  */
 export function readRetryableClaudeApiError(message: unknown): string | null {
   const text = readClaudeApiErrorText(message);
-  if (!text) {
+  if (!text || !isRetryableClaudeApiErrorText(text)) {
     return null;
   }
 
+  return text;
+}
+
+function isRetryableClaudeApiErrorText(text: string): boolean {
   if (/^API Error:\s*409\s+Conversation already has an active request\b/i.test(text)) {
-    return text;
+    return true;
   }
   if (/^API Error:\s*(?:408|500|502|503|504|529)\b/i.test(text)) {
-    return text;
+    return true;
   }
   if (/^API Error:\s*The operation timed out\.?$/i.test(text)) {
-    return text;
+    return true;
   }
   if (
     /^API Error:.*(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|socket hang up|fetch failed|connection error)/i.test(
       text,
     )
   ) {
-    return text;
+    return true;
   }
-  return null;
+  return false;
 }
 
 function readClaudeApiErrorText(message: unknown): string | null {
@@ -2260,7 +2264,7 @@ class ClaudeAgentSession implements AgentSession {
   private foregroundApiRecoveryAttempts = 0;
   private pendingPostWorkApiRecovery: PendingPostWorkApiRecovery | null = null;
   private pendingConversationRolloverFailure: {
-    kind?: ConversationRolloverFailureKind;
+    kind?: AgentFailureKind;
     error: string;
   } | null = null;
   /**
@@ -3672,17 +3676,28 @@ class ClaudeAgentSession implements AgentSession {
 
   private buildTurnFailedEvent(
     errorMessage: string,
-    capturedKind?: ConversationRolloverFailureKind,
+    capturedKind?: AgentFailureKind,
   ): Extract<AgentStreamEvent, { type: "turn_failed" }> {
     const normalized = errorMessage.trim() || "Claude run failed";
     const exitCodeMatch = normalized.match(/\bcode\s+(\d+)\b/i);
     const code = exitCodeMatch ? exitCodeMatch[1] : undefined;
     const diagnostic = this.getRecentStderrDiagnostic();
-    let failureKind: ConversationRolloverFailureKind | undefined = capturedKind;
+    let failureKind: Extract<AgentStreamEvent, { type: "turn_failed" }>["failureKind"] =
+      capturedKind;
     if (!failureKind && readClaudeContextOverflowError(normalized)) {
       failureKind = "context_overflow";
     } else if (!failureKind && isConversationUnresolvedFailureText(normalized)) {
       failureKind = "conversation_unresolved";
+    } else if (
+      !failureKind &&
+      !this.foregroundHasProviderActivity &&
+      !this.activeTurnHasAssistantText &&
+      isRetryableClaudeApiErrorText(normalized)
+    ) {
+      // The provider's same-session retry has either failed or could not start. Tell the
+      // durable admission layer that replay remains safe because no assistant, tool,
+      // permission, or subagent activity occurred in this turn.
+      failureKind = "retryable_api";
     }
     return {
       type: "turn_failed",
@@ -4305,7 +4320,14 @@ class ClaudeAgentSession implements AgentSession {
     if (message.type === "assistant") {
       const text = collectClaudeTextContentParts(message.message.content).join("\n").trim();
       if (isClaudeApiErrorMessage(toObjectRecord(message) ?? {})) {
-        this.pendingConversationRolloverFailure = { error: text || "Claude API request failed" };
+        this.pendingConversationRolloverFailure = {
+          error: text || "Claude API request failed",
+          ...(!this.foregroundHasProviderActivity &&
+          !this.activeTurnHasAssistantText &&
+          isRetryableClaudeApiErrorText(text)
+            ? { kind: "retryable_api" as const }
+            : {}),
+        };
       } else if (
         text ||
         (Array.isArray(message.message.content) &&

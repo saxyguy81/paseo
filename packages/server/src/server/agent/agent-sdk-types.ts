@@ -213,6 +213,12 @@ export type AgentPromptContentBlock =
 
 export type AgentPromptInput = string | AgentPromptContentBlock[];
 
+export type AgentFailureKind =
+  | "context_overflow"
+  | "conversation_unresolved"
+  | "resume_model_unavailable"
+  | "retryable_api";
+
 export interface AgentRunOptions {
   outputSchema?: unknown;
   resumeFrom?: AgentPersistenceHandle;
@@ -426,7 +432,7 @@ export type AgentStreamEvent =
       type: "turn_failed";
       provider: AgentProvider;
       error: string;
-      failureKind?: "context_overflow" | "conversation_unresolved" | "resume_model_unavailable";
+      failureKind?: AgentFailureKind;
       code?: string;
       diagnostic?: string;
       turnId?: string;

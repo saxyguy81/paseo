@@ -1202,6 +1202,67 @@ test.each([
   }
 });
 
+test("classifies an exhausted pre-work 502 for durable prompt recovery", async () => {
+  vi.useFakeTimers();
+  let queryNumber = 0;
+
+  sdkQueryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    queryNumber += 1;
+    const iterator = prompt[Symbol.asyncIterator]();
+    let step = 0;
+    return createBaseQueryMock(
+      vi.fn(async () => {
+        if (step === 0) {
+          step += 1;
+          await iterator.next();
+          return {
+            done: false,
+            value: {
+              type: "assistant",
+              isApiErrorMessage: true,
+              message: {
+                role: "assistant",
+                content: [{ type: "text", text: "API Error: 502 status code (no body)" }],
+              },
+            },
+          };
+        }
+        if (step === 1) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "result",
+              subtype: "error_during_execution",
+              usage: buildUsage(),
+              errors: ["API Error: 502 status code (no body)"],
+              total_cost_usd: 0,
+            },
+          };
+        }
+        return { done: true, value: undefined };
+      }),
+    );
+  });
+
+  const session = await createSession();
+  try {
+    const eventsPromise = collectUntilTerminal(streamSession(session, "original request"));
+    await vi.advanceTimersByTimeAsync(2_001);
+    const events = await eventsPromise;
+
+    expect(queryNumber).toBe(2);
+    expect(events.find((event) => event.type === "turn_failed")).toMatchObject({
+      type: "turn_failed",
+      error: "API Error: 502 status code (no body)",
+      failureKind: "retryable_api",
+    });
+  } finally {
+    await session.close();
+    vi.useRealTimers();
+  }
+});
+
 test("retries continuation matching once, then requires a fresh native session", async () => {
   vi.useFakeTimers();
   const errorText = "API Error: 503 Continuation matching is temporarily unavailable";

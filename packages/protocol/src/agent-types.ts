@@ -2,6 +2,12 @@ import type { AgentAttachment } from "./messages.js";
 
 export type AgentProvider = string;
 
+export type AgentFailureKind =
+  | "context_overflow"
+  | "conversation_unresolved"
+  | "resume_model_unavailable"
+  | "retryable_api";
+
 export interface AgentMetadata {
   [key: string]: unknown;
 }
@@ -382,7 +388,7 @@ export type AgentStreamEvent =
       type: "turn_failed";
       provider: AgentProvider;
       error: string;
-      failureKind?: "context_overflow" | "conversation_unresolved" | "resume_model_unavailable";
+      failureKind?: AgentFailureKind;
       code?: string;
       diagnostic?: string;
       turnId?: string;

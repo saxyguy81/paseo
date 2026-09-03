@@ -7,15 +7,16 @@ separate from detection. No detector sends prompts, cancels work, or restarts a 
 
 ## Detection and ownership
 
-| Condition                                                                                       | Detector                            | Meaning                                                     |
-| ----------------------------------------------------------------------------------------------- | ----------------------------------- | ----------------------------------------------------------- |
-| Provider terminal failure, including system/model/authentication/quota/context/transport errors | Agent manager's `turn_failed` event | The turn failed after any provider-owned recovery           |
-| Unexpected process exit, SIGTERM, or upstream abort                                             | Provider adapter and manager        | Not a user cancellation; notify                             |
-| Synthetic API error followed only by SDK `success`                                              | Claude adapter                      | Preserve the error; bare success is not proof of recovery   |
-| Failed child agent                                                                              | Live subagent descriptor transition | Child failure only; parent may remain healthy               |
-| History request failure, hydration timeout, or contradictory empty tail                         | Client incident queue               | History/display failure, not evidence that execution failed |
-| Root render exception or failed queued-message admission                                        | Client incident queue               | Client failure, not permission to replay the message        |
-| Sustained foreground disconnection                                                              | Client incident queue               | Retained locally and reported when connection returns       |
+| Condition                                                                                       | Detector                            | Meaning                                                      |
+| ----------------------------------------------------------------------------------------------- | ----------------------------------- | ------------------------------------------------------------ |
+| Provider terminal failure, including system/model/authentication/quota/context/transport errors | Agent manager's `turn_failed` event | The turn failed after any provider-owned recovery            |
+| Unexpected process exit, SIGTERM, or upstream abort                                             | Provider adapter and manager        | Not a user cancellation; notify                              |
+| Synthetic API error followed only by SDK `success`                                              | Claude adapter                      | Preserve the error; bare success is not proof of recovery    |
+| Retryable API failure before assistant, tool, permission, or subagent activity                  | Claude adapter and durable FIFO     | Retain the request and retry with capped exponential backoff |
+| Failed child agent                                                                              | Live subagent descriptor transition | Child failure only; parent may remain healthy                |
+| History request failure, hydration timeout, or contradictory empty tail                         | Client incident queue               | History/display failure, not evidence that execution failed  |
+| Root render exception or failed queued-message admission                                        | Client incident queue               | Client failure, not permission to replay the message         |
+| Sustained foreground disconnection                                                              | Client incident queue               | Retained locally and reported when connection returns        |
 
 Client reporting uses the optional `server_info.features.diagnosticIncidents`
 capability and `diagnostics.incident.report.request/response`. Reports contain a UUID,
@@ -30,6 +31,14 @@ Every Claude runtime creates a unique turn epoch. Recreating a runtime cannot re
 after an unacknowledged interrupt retires the interrupted query first; its trailing
 result cannot be confused with the new request's result. Explicit user cancellations,
 controlled shutdown, stale query frames and read-only history are not failures.
+
+The Claude adapter first makes its bounded same-session recovery attempt. If an eligible
+408, 5xx, timeout, or connection failure still ends the turn before any work begins, the agent
+manager returns the original FIFO item to `queued` instead of deleting it. It then sends a hidden
+continuation after 30 seconds, doubles the delay after each failed attempt, and caps the interval
+at five minutes. The durable item survives daemon restarts. Authentication, quota, model-access,
+context-overflow, cancellation, and any failure after observable work are never replayed through
+this path.
 
 ## Reconciliation outside Paseo
 

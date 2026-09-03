@@ -102,6 +102,16 @@ describe("canonical timeline turn ID compatibility", () => {
     });
     expect(failure.failureKind).toBe("resume_model_unavailable");
   });
+
+  it("accepts a retryable pre-work API failure", () => {
+    const failure = AgentStreamEventPayloadSchema.parse({
+      type: "turn_failed",
+      provider: "claude",
+      error: "API Error: 502 status code (no body)",
+      failureKind: "retryable_api",
+    });
+    expect(failure.failureKind).toBe("retryable_api");
+  });
 });
 
 describe("legacy daemon send request schema compatibility", () => {

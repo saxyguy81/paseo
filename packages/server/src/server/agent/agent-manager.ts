@@ -97,6 +97,11 @@ import {
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
+const TRANSIENT_PROMPT_RETRY_BASE_DELAY_MS = 30_000;
+const TRANSIENT_PROMPT_RETRY_MAX_DELAY_MS = 5 * 60_000;
+const TRANSIENT_PROMPT_RECOVERY_PROMPT = `<paseo-system>
+The latest user request failed before any work began because the model API was temporarily unavailable. Continue that unfinished request now. Do not repeat completed work.
+</paseo-system>`;
 const STORED_AGENT_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: false,
   supportsSessionPersistence: true,
@@ -418,7 +423,26 @@ export interface AgentManagerOptions {
     agentId: string;
     expectedTurnId: string;
   }) => Promise<void>;
+  transientPromptRetryBaseDelayMs?: number;
+  transientPromptRetryMaxDelayMs?: number;
   logger: Logger;
+}
+
+function resolveTransientPromptRetryDelays(options: AgentManagerOptions): {
+  baseMs: number;
+  maxMs: number;
+} {
+  const baseMs = Math.max(
+    0,
+    options.transientPromptRetryBaseDelayMs ?? TRANSIENT_PROMPT_RETRY_BASE_DELAY_MS,
+  );
+  return {
+    baseMs,
+    maxMs: Math.max(
+      baseMs,
+      options.transientPromptRetryMaxDelayMs ?? TRANSIENT_PROMPT_RETRY_MAX_DELAY_MS,
+    ),
+  };
 }
 
 export type ActiveTurnSteerDispatchResult =
@@ -820,6 +844,7 @@ export class AgentManager {
   private readonly lifecycleMutationTails = new Map<string, Promise<void>>();
   private readonly conversationRollovers = new Map<string, Promise<string | null>>();
   private readonly pendingPromptDrainTasks = new Map<string, Promise<void>>();
+  private readonly pendingPromptRetryTimers = new Map<string, NodeJS.Timeout>();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private readonly mcpAuthToken: string | null;
@@ -834,6 +859,8 @@ export class AgentManager {
   private logger: Logger;
   private readonly rescueTimeouts: Required<AgentManagerRescueTimeouts>;
   private readonly beforeSteerUnavailableFallback?: AgentManagerOptions["beforeSteerUnavailableFallback"];
+  private readonly transientPromptRetryBaseDelayMs: number;
+  private readonly transientPromptRetryMaxDelayMs: number;
   private acceptingAgentRegistrations = true;
 
   constructor(options: AgentManagerOptions) {
@@ -858,6 +885,9 @@ export class AgentManager {
         options.rescueTimeouts?.interruptSessionMs ?? INTERRUPT_SESSION_TIMEOUT_MS,
     };
     this.beforeSteerUnavailableFallback = options.beforeSteerUnavailableFallback;
+    const transientPromptRetryDelays = resolveTransientPromptRetryDelays(options);
+    this.transientPromptRetryBaseDelayMs = transientPromptRetryDelays.baseMs;
+    this.transientPromptRetryMaxDelayMs = transientPromptRetryDelays.maxMs;
     this.agentStreamCoalescer = new AgentStreamCoalescer({
       windowMs: options.agentStreamCoalesceWindowMs ?? AGENT_STREAM_COALESCE_DEFAULT_WINDOW_MS,
       timers: { setTimeout, clearTimeout },
@@ -920,6 +950,8 @@ export class AgentManager {
 
   prepareForShutdown(): void {
     this.acceptingAgentRegistrations = false;
+    for (const timer of this.pendingPromptRetryTimers.values()) clearTimeout(timer);
+    this.pendingPromptRetryTimers.clear();
   }
 
   setPaseoToolsEnabled(enabled: boolean): void {
@@ -1040,13 +1072,18 @@ export class AgentManager {
       const pending = await registry.claimPendingPrompt(agentId);
       if (!pending) return;
 
+      const replayingSubmittedPrompt =
+        pending.attemptCount > 1 && this.hasSubmittedPrompt(agentId, pending.id);
+      const prompt = replayingSubmittedPrompt ? TRANSIENT_PROMPT_RECOVERY_PROMPT : pending.prompt;
+
       let started = false;
       let terminal: "completed" | "failed" | "canceled" | null = null;
       let failureKind: Extract<AgentStreamEvent, { type: "turn_failed" }>["failureKind"];
       try {
-        for await (const event of this.streamAgent(agentId, pending.prompt, {
-          clientMessageId: pending.id,
-        })) {
+        // A recovery prompt is a system continuation of a user message already in both
+        // timelines. Do not reuse that message's provider UUID or append a second user row.
+        const runOptions = replayingSubmittedPrompt ? undefined : { clientMessageId: pending.id };
+        for await (const event of this.streamAgent(agentId, prompt, runOptions)) {
           if (event.type === "turn_started") started = true;
           if (event.type === "turn_completed") terminal = "completed";
           if (event.type === "turn_canceled") terminal = "canceled";
@@ -1073,6 +1110,11 @@ export class AgentManager {
         await registry.releasePendingPrompt(agentId, pending.id);
         return;
       }
+      if (failureKind === "retryable_api") {
+        await registry.releasePendingPrompt(agentId, pending.id);
+        this.scheduleTransientPromptRetry(agentId, pending.attemptCount);
+        return;
+      }
       await registry.completePendingPrompt(agentId, pending.id);
       if (terminal === null) {
         this.logger.error(
@@ -1089,6 +1131,38 @@ export class AgentManager {
       // A failed or canceled prompt is terminal too. Its error remains in the
       // timeline; it must not wedge unrelated messages behind it forever.
     }
+  }
+
+  private scheduleTransientPromptRetry(agentId: string, attemptCount: number): void {
+    if (!this.acceptingAgentRegistrations || this.pendingPromptRetryTimers.has(agentId)) return;
+    const exponent = Math.max(0, Math.min(attemptCount - 1, 10));
+    const delayMs = Math.min(
+      this.transientPromptRetryMaxDelayMs,
+      this.transientPromptRetryBaseDelayMs * 2 ** exponent,
+    );
+    const timer = setTimeout(() => {
+      this.pendingPromptRetryTimers.delete(agentId);
+      if (!this.acceptingAgentRegistrations || !this.agents.has(agentId)) return;
+      const activeDrain = this.pendingPromptDrainTasks.get(agentId);
+      const retry = () =>
+        this.drainStoredPendingPrompts(agentId).catch((error) => {
+          this.logger.error(
+            { err: error, agentId },
+            "Failed to retry durable prompt after transient API failure",
+          );
+        });
+      if (activeDrain) {
+        void activeDrain.then(retry, retry);
+      } else {
+        void retry();
+      }
+    }, delayMs);
+    timer.unref?.();
+    this.pendingPromptRetryTimers.set(agentId, timer);
+    this.logger.warn(
+      { agentId, attemptCount, delayMs },
+      "Retained durable prompt for retry after transient API failure",
+    );
   }
 
   subscribe(callback: AgentSubscriber, options?: SubscribeOptions): () => void {
