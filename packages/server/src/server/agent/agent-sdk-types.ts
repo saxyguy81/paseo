@@ -246,6 +246,17 @@ export interface AgentUsage {
   contextWindowUsedTokens?: number;
 }
 
+export interface AgentPromptPreflight {
+  /** Stable provider-owned identity used to deduplicate this synthetic queue item. */
+  key: string;
+  prompt: AgentPromptInput;
+}
+
+export type AgentPromptAdmissionDecision =
+  | { type: "dispatch" }
+  | ({ type: "preflight" } & AgentPromptPreflight)
+  | { type: "reject"; message: string };
+
 export const TOOL_CALL_ICON_NAMES = [
   "wrench",
   "square_terminal",
@@ -403,7 +414,14 @@ export interface CompactionTimelineItem {
 }
 
 export type AgentTimelineItem =
-  | { type: "user_message"; text: string; messageId?: string; clientMessageId?: string }
+  | {
+      type: "user_message";
+      text: string;
+      messageId?: string;
+      clientMessageId?: string;
+      /** Present only when Paseo rejected the message before provider submission. */
+      deliveryStatus?: "rejected";
+    }
   | { type: "assistant_message"; text: string; messageId?: string }
   | { type: "reasoning"; text: string }
   | ToolCallTimelineItem
@@ -414,15 +432,29 @@ export type AgentTimelineItem =
 export type AgentStreamEvent =
   | { type: "thread_started"; sessionId: string; provider: AgentProvider }
   | { type: "turn_started"; provider: AgentProvider; turnId?: string }
-  | { type: "turn_completed"; provider: AgentProvider; usage?: AgentUsage; turnId?: string }
-  | { type: "usage_updated"; provider: AgentProvider; usage: AgentUsage; turnId?: string }
+  | {
+      type: "turn_completed";
+      provider: AgentProvider;
+      usage?: AgentUsage;
+      turnId?: string;
+    }
+  | {
+      type: "usage_updated";
+      provider: AgentProvider;
+      usage: AgentUsage;
+      turnId?: string;
+    }
   | {
       type: "mode_changed";
       provider: AgentProvider;
       currentModeId: string | null;
       availableModes: AgentMode[];
     }
-  | { type: "model_changed"; provider: AgentProvider; runtimeInfo: AgentRuntimeInfo }
+  | {
+      type: "model_changed";
+      provider: AgentProvider;
+      runtimeInfo: AgentRuntimeInfo;
+    }
   | {
       type: "thinking_option_changed";
       provider: AgentProvider;
@@ -437,7 +469,12 @@ export type AgentStreamEvent =
       diagnostic?: string;
       turnId?: string;
     }
-  | { type: "turn_canceled"; provider: AgentProvider; reason: string; turnId?: string }
+  | {
+      type: "turn_canceled";
+      provider: AgentProvider;
+      reason: string;
+      turnId?: string;
+    }
   | {
       type: "timeline";
       item: AgentTimelineItem;
@@ -653,6 +690,15 @@ export interface AgentSession {
   readonly features?: AgentFeature[];
   run(prompt: AgentPromptInput, options?: AgentRunOptions): Promise<AgentRunResult>;
   startTurn(prompt: AgentPromptInput, options?: AgentRunOptions): Promise<{ turnId: string }>;
+  /**
+   * Optional provider-owned admission hook for work that must finish before a
+   * user prompt can be safely dispatched. Paseo owns durability and ordering;
+   * the provider owns its context semantics and synthetic command.
+   */
+  planPromptAdmission?(
+    prompt: AgentPromptInput,
+    usage: AgentUsage | undefined,
+  ): AgentPromptAdmissionDecision;
   steerActiveTurn?(prompt: AgentPromptInput, options: SteerActiveTurnOptions): Promise<SteerResult>;
   subscribe(callback: (event: AgentStreamEvent) => void): () => void;
   streamHistory(): AsyncGenerator<AgentStreamEvent>;

@@ -4,6 +4,7 @@ import type {
   AgentPersistenceHandle,
   AgentProvider,
   AgentSessionConfig,
+  AgentUsage,
 } from "./agent/agent-sdk-types.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent/agent-storage.js";
 
@@ -113,6 +114,7 @@ export function extractTimestamps(record: StoredAgentRecord): {
   labels?: Record<string, string>;
   workspaceId?: string;
   owner?: StoredAgentRecord["owner"];
+  lastUsage?: AgentUsage;
   lastError?: string;
   lastFailureKind?: NonNullable<StoredAgentRecord["lastFailureKind"]>;
 } {
@@ -123,6 +125,7 @@ export function extractTimestamps(record: StoredAgentRecord): {
     labels: record.labels,
     workspaceId: record.workspaceId,
     owner: record.owner,
+    lastUsage: record.lastUsage,
     lastError: record.lastError ?? undefined,
     lastFailureKind: record.lastFailureKind ?? undefined,
   };

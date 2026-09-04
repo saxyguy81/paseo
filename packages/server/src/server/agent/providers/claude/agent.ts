@@ -145,6 +145,8 @@ import { withTimeout } from "../../../../utils/promise-timeout.js";
 import { terminateWithTreeKill } from "../../../../utils/tree-kill.js";
 import { execCommand } from "../../../../utils/spawn.js";
 import { composeSystemPromptParts } from "../../system-prompt.js";
+import { isClaudeContextPreflightPrompt, planClaudePromptAdmission } from "./prompt-admission.js";
+import { isInternalPromptPreflightId } from "../../prompt-preflight.js";
 
 const fsPromises = promises;
 const CLAUDE_SETTING_SOURCES: NonNullable<ClaudeOptions["settingSources"]> = [
@@ -374,17 +376,38 @@ const NO_RESPONSE_REQUESTED_PLACEHOLDER = "No response requested.";
 const STEER_SUPERSEDED_PERMISSION_MESSAGE =
   "The user answered with a message instead of approving. Their message follows.";
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const INTERNAL_CONTEXT_PREFLIGHT_UUID_PREFIX = "f17ecafe-";
 
-function toStableClaudeUserMessageUuid(stableMessageId?: string): SDKUserMessage["uuid"] {
+function toStableClaudeUserMessageUuid(
+  stableMessageId?: string,
+  internalContextPreflight = false,
+): SDKUserMessage["uuid"] {
   const stableId = stableMessageId?.trim();
   if (!stableId) return randomUUID();
-  if (UUID_PATTERN.test(stableId)) return stableId as SDKUserMessage["uuid"];
-
   const digest = createHash("sha256").update(stableId).digest("hex");
-  return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-5${digest.slice(
+  if (internalContextPreflight) {
+    return `f17ecafe-${digest.slice(0, 4)}-5${digest.slice(5, 8)}-a${digest.slice(
+      9,
+      12,
+    )}-${digest.slice(12, 24)}`;
+  }
+  if (UUID_PATTERN.test(stableId) && !isInternalContextPreflightUuid(stableId)) {
+    return stableId as SDKUserMessage["uuid"];
+  }
+  const safePrefix = digest.startsWith(INTERNAL_CONTEXT_PREFLIGHT_UUID_PREFIX.slice(0, -1))
+    ? `e${digest.slice(1, 8)}`
+    : digest.slice(0, 8);
+  return `${safePrefix}-${digest.slice(8, 12)}-5${digest.slice(
     13,
     16,
   )}-a${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
+}
+
+function isInternalContextPreflightUuid(value: unknown): boolean {
+  return (
+    typeof value === "string" &&
+    value.toLowerCase().startsWith(INTERNAL_CONTEXT_PREFLIGHT_UUID_PREFIX)
+  );
 }
 
 interface SlashCommandInvocation {
@@ -1110,7 +1133,10 @@ function claudeModeCatalog(env: NodeJS.ProcessEnv): {
   defaultModeId: PermissionMode;
 } {
   if (claudeAutoModeUnavailableOn(env)) {
-    return { modes: DEFAULT_MODES.filter((mode) => mode.id !== "auto"), defaultModeId: "default" };
+    return {
+      modes: DEFAULT_MODES.filter((mode) => mode.id !== "auto"),
+      defaultModeId: "default",
+    };
   }
   return { modes: DEFAULT_MODES, defaultModeId: "auto" };
 }
@@ -1745,7 +1771,10 @@ export class ClaudeAgentClient implements AgentClient {
       getClaudeModelsWithSettings(this.logger, this.configDir, claudeCodeVersion),
     );
     const modeCatalog = claudeModeCatalog(
-      createProviderEnv({ baseEnv: process.env, runtimeSettings: this.runtimeSettings }),
+      createProviderEnv({
+        baseEnv: process.env,
+        runtimeSettings: this.runtimeSettings,
+      }),
     );
     return {
       models,
@@ -2379,6 +2408,10 @@ class ClaudeAgentSession implements AgentSession {
     }
 
     return result;
+  }
+
+  planPromptAdmission(prompt: AgentPromptInput, usage: AgentUsage | undefined) {
+    return planClaudePromptAdmission({ prompt, usage });
   }
 
   async startTurn(
@@ -3639,7 +3672,11 @@ class ClaudeAgentSession implements AgentSession {
       content.push({ type: "text", text: prompt });
     }
 
-    const messageId = toStableClaudeUserMessageUuid(stableMessageId);
+    const internalContextPreflight =
+      isInternalPromptPreflightId(stableMessageId) &&
+      typeof prompt === "string" &&
+      isClaudeContextPreflightPrompt(prompt);
+    const messageId = toStableClaudeUserMessageUuid(stableMessageId, internalContextPreflight);
     this.rememberUserMessageId(messageId);
 
     return {
@@ -4436,6 +4473,10 @@ class ClaudeAgentSession implements AgentSession {
     messageIdHint: string | null,
     turnId: string | null,
   ): Promise<AgentStreamEvent[]> {
+    // Claude emits the compacted context as an assistant-shaped transcript
+    // record. It is provider state, not a reply to the user; history hydration
+    // already omits the same record via `isCompactSummary`.
+    if (toObjectRecord(message)?.isCompactSummary === true) return [];
     const messageEvents = this.translateMessageToEvents(message, {
       suppressAssistantText: true,
       suppressReasoning: true,
@@ -4744,6 +4785,9 @@ class ClaudeAgentSession implements AgentSession {
     turnId: string,
     clientMessageId?: string,
   ): void {
+    if (isInternalContextPreflightUuid(message.uuid)) {
+      return;
+    }
     const events: AgentStreamEvent[] = [];
     this.appendUserMessageEvents(message, events);
     if (events.length === 0) {
@@ -6509,6 +6553,9 @@ function convertClaudeHistoryEntryPreamble(
   }
 
   const content = message.content;
+  if (entry.type === "user" && isInternalContextPreflightUuid(entry.uuid)) {
+    return { shortCircuit: [] };
+  }
   if (
     (entry.type === "user" || entry.type === "assistant") &&
     isClaudeTranscriptNoiseContent(content)

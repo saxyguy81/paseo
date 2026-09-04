@@ -176,6 +176,25 @@ export class InMemoryAgentTimelineStore {
     return row ? cloneRow(row) : null;
   }
 
+  markUserMessageProviderSubmitted(
+    agentId: string,
+    clientMessageId: string,
+  ): AgentTimelineRow | null {
+    const state = this.requireState(agentId);
+    const index = state.rows.findIndex(
+      (candidate) =>
+        candidate.item.type === "user_message" &&
+        candidate.item.clientMessageId === clientMessageId,
+    );
+    const row = state.rows[index];
+    if (!row || row.item.type !== "user_message") return null;
+    const submittedItem = { ...row.item };
+    delete submittedItem.deliveryStatus;
+    const submitted: AgentTimelineRow = { ...row, item: submittedItem };
+    state.rows[index] = submitted;
+    return cloneRow(submitted);
+  }
+
   enrichSubmittedUserMessage(
     agentId: string,
     clientMessageId: string,

@@ -20,10 +20,16 @@ import type { AgentManagerEvent, ManagedAgent } from "./agent-manager.js";
 import type {
   AgentClient,
   AgentPermissionRequest,
+  AgentPromptAdmissionDecision,
   AgentRunResult,
   AgentSession,
   AgentStreamEvent,
+  AgentUsage,
 } from "./agent-sdk-types.js";
+import {
+  isClaudeContextPreflightPrompt,
+  planClaudePromptAdmission,
+} from "./providers/claude/prompt-admission.js";
 
 interface CapturedLogger {
   logger: Logger;
@@ -112,6 +118,9 @@ function createFinishNotificationScenario(
     return options?.childLastAssistantMessage ?? null;
   });
   Reflect.set(agentManager, "tryRunOutOfBand", () => false);
+  Reflect.set(agentManager, "planPromptAdmission", () => ({
+    type: "dispatch",
+  }));
   Reflect.set(agentManager, "hasInFlightRun", () => Boolean(options?.parentPromptError));
   Reflect.set(agentManager, "steerOrReplaceActiveTurn", async () => {
     steerAttemptCount += 1;
@@ -425,7 +434,9 @@ test("detaching a child ends its parent-owned finish notification", async () => 
 });
 
 test("follow-up finish notifications do not require a parent relationship", async () => {
-  const scenario = createFinishNotificationScenario({ childParentAgentId: "another-agent" });
+  const scenario = createFinishNotificationScenario({
+    childParentAgentId: "another-agent",
+  });
 
   scenario.startWatchingChild();
   const parentPrompt = await scenario.finishChildAndReadParentPrompt();
@@ -450,7 +461,9 @@ test("finish notifications log a rejected parent prompt without an unhandled rej
       childAgentId: "child-agent",
       callerAgentId: "caller-agent",
       reason: "finished",
-      err: expect.objectContaining({ message: "parent provider rejected replacement" }),
+      err: expect.objectContaining({
+        message: "parent provider rejected replacement",
+      }),
     }),
   ]);
 });
@@ -591,7 +604,11 @@ class SlowStartAgentSession implements AgentSession {
     const turnId = "turn-1";
     setTimeout(() => {
       this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
-      this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+      this.pushEvent({
+        type: "turn_completed",
+        provider: this.provider,
+        turnId,
+      });
     }, 0);
     return { turnId };
   }
@@ -612,7 +629,12 @@ class SlowStartAgentSession implements AgentSession {
   async *streamHistory(): AsyncGenerator<AgentStreamEvent> {}
 
   async getRuntimeInfo() {
-    return { provider: this.provider, sessionId: this.id, model: null, modeId: null };
+    return {
+      provider: this.provider,
+      sessionId: this.id,
+      model: null,
+      modeId: null,
+    };
   }
 
   async getAvailableModes() {
@@ -675,6 +697,16 @@ class QueuedPromptAgentSession implements AgentSession {
   private readonly subscribers = new Set<(event: AgentStreamEvent) => void>();
   private activeTurnId: string | null = null;
 
+  planPromptAdmission(
+    prompt: string | unknown[],
+    usage: AgentUsage | undefined,
+  ): AgentPromptAdmissionDecision {
+    return planClaudePromptAdmission({
+      prompt: prompt as Parameters<typeof planClaudePromptAdmission>[0]["prompt"],
+      usage,
+    });
+  }
+
   async run(): Promise<AgentRunResult> {
     return { sessionId: this.id, finalText: "", timeline: [] };
   }
@@ -686,11 +718,35 @@ class QueuedPromptAgentSession implements AgentSession {
     return { turnId: this.activeTurnId };
   }
 
-  complete(): void {
+  complete(usage?: AgentUsage): void {
     const turnId = this.activeTurnId;
     if (!turnId) throw new Error("No active turn");
     this.activeTurnId = null;
-    this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+    this.pushEvent({
+      type: "turn_completed",
+      provider: this.provider,
+      turnId,
+      usage,
+    });
+  }
+
+  reportUsage(usage: AgentUsage): void {
+    this.pushEvent({ type: "usage_updated", provider: this.provider, usage });
+  }
+
+  reportCompactionBoundary(postTokens: number): void {
+    const turnId = this.activeTurnId;
+    if (!turnId) throw new Error("No active turn");
+    this.pushEvent({
+      type: "timeline",
+      provider: this.provider,
+      turnId,
+      item: { type: "compaction", status: "completed", trigger: "manual" },
+    });
+    this.reportUsage({
+      contextWindowMaxTokens: 200_000,
+      contextWindowUsedTokens: postTokens,
+    });
   }
 
   fail(
@@ -720,7 +776,12 @@ class QueuedPromptAgentSession implements AgentSession {
 
   async *streamHistory(): AsyncGenerator<AgentStreamEvent> {}
   async getRuntimeInfo() {
-    return { provider: this.provider, sessionId: this.id, model: null, modeId: null };
+    return {
+      provider: this.provider,
+      sessionId: this.id,
+      model: null,
+      modeId: null,
+    };
   }
   async getAvailableModes() {
     return [];
@@ -768,6 +829,798 @@ class QueuedPromptAgentClient implements AgentClient {
     return { models: [], modes: [] };
   }
 }
+
+async function createContextPreflightScenario(options?: { retryDelayMs?: number }): Promise<{
+  workdir: string;
+  logger: Logger;
+  storage: AgentStorage;
+  client: QueuedPromptAgentClient;
+  agentManager: AgentManager;
+  agentId: string;
+  cleanup(): Promise<void>;
+}> {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-context-preflight-scenario-"));
+  const logger = createTestLogger();
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new QueuedPromptAgentClient();
+  const agentManager = new AgentManager({
+    clients: { "claude-acc": client },
+    registry: storage,
+    ...(options?.retryDelayMs === undefined
+      ? {}
+      : {
+          transientPromptRetryBaseDelayMs: options.retryDelayMs,
+          transientPromptRetryMaxDelayMs: options.retryDelayMs,
+        }),
+    logger,
+  });
+  const snapshot = await agentManager.createAgent(
+    { provider: "claude-acc", cwd: workdir },
+    undefined,
+    { workspaceId: undefined },
+  );
+  client.session.reportUsage({
+    contextWindowMaxTokens: 200_000,
+    contextWindowUsedTokens: 163_000,
+  });
+  await vi.waitFor(() =>
+    expect(agentManager.getAgent(snapshot.id)?.lastUsage).toMatchObject({
+      contextWindowUsedTokens: 163_000,
+    }),
+  );
+
+  return {
+    workdir,
+    logger,
+    storage,
+    client,
+    agentManager,
+    agentId: snapshot.id,
+    async cleanup() {
+      await agentManager.closeAgent(snapshot.id).catch(() => undefined);
+      await agentManager.flush().catch(() => undefined);
+      await storage.flush().catch(() => undefined);
+      rmSync(workdir, { recursive: true, force: true, maxRetries: 3, retryDelay: 10 });
+    },
+  };
+}
+
+test("precompacts high-context Claude sessions before releasing the exact queued user prompt", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-context-preflight-"));
+  const logger = createTestLogger();
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new QueuedPromptAgentClient();
+  const agentManager = new AgentManager({
+    clients: { "claude-acc": client },
+    registry: storage,
+    logger,
+  });
+  const snapshot = await agentManager.createAgent(
+    { provider: "claude-acc", cwd: workdir },
+    undefined,
+    { workspaceId: undefined },
+  );
+
+  try {
+    client.session.reportUsage({
+      contextWindowMaxTokens: 200_000,
+      contextWindowUsedTokens: 163_000,
+    });
+    await vi.waitFor(() =>
+      expect(agentManager.getAgent(snapshot.id)?.lastUsage).toMatchObject({
+        contextWindowUsedTokens: 163_000,
+      }),
+    );
+
+    await expect(
+      sendPromptToAgent({
+        agentManager,
+        agentStorage: storage,
+        agentId: snapshot.id,
+        prompt: "/team finish the current goal",
+        messageId: "message-high-context",
+        activeTurnBehavior: "queue",
+        logger,
+      }),
+    ).resolves.toEqual({ disposition: "queued" });
+
+    await vi.waitFor(() => expect(client.session.prompts).toHaveLength(1));
+    expect(isClaudeContextPreflightPrompt(client.session.prompts[0]!)).toBe(true);
+    expect(client.session.prompts).not.toContain("/team finish the current goal");
+
+    await expect(
+      sendPromptToAgent({
+        agentManager,
+        agentStorage: storage,
+        agentId: snapshot.id,
+        prompt: "then summarize the result",
+        messageId: "message-after-high-context",
+        activeTurnBehavior: "queue",
+        logger,
+      }),
+    ).resolves.toEqual({ disposition: "queued" });
+
+    // A clean compact result is sufficient even when the SDK omits compact_boundary.
+    client.session.complete({
+      contextWindowMaxTokens: 200_000,
+      contextWindowUsedTokens: 163_000,
+    });
+    await vi.waitFor(() =>
+      expect(client.session.prompts).toEqual([
+        expect.stringContaining("PASEO_INTERNAL_CONTEXT_PREFLIGHT"),
+        "/team finish the current goal",
+      ]),
+    );
+
+    client.session.complete();
+    await vi.waitFor(() =>
+      expect(client.session.prompts).toEqual([
+        expect.stringContaining("PASEO_INTERNAL_CONTEXT_PREFLIGHT"),
+        "/team finish the current goal",
+        "then summarize the result",
+      ]),
+    );
+    client.session.complete();
+    await vi.waitFor(async () => {
+      await expect(storage.listPendingPrompts(snapshot.id)).resolves.toEqual([]);
+    });
+    expect(
+      client.session.prompts.filter((prompt) => prompt === "/team finish the current goal"),
+    ).toHaveLength(1);
+    expect(
+      client.session.prompts.filter((prompt) => prompt === "then summarize the result"),
+    ).toHaveLength(1);
+  } finally {
+    await agentManager.closeAgent(snapshot.id).catch(() => undefined);
+    await agentManager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("retries a transient compaction before dispatching the retained user prompt", async () => {
+  const scenario = await createContextPreflightScenario({ retryDelayMs: 5 });
+  try {
+    await sendPromptToAgent({
+      agentManager: scenario.agentManager,
+      agentStorage: scenario.storage,
+      agentId: scenario.agentId,
+      prompt: "finish after the gateway recovers",
+      messageId: "message-after-preflight-retry",
+      activeTurnBehavior: "queue",
+      logger: scenario.logger,
+    });
+    await vi.waitFor(() => expect(scenario.client.session.prompts).toHaveLength(1));
+    scenario.client.session.fail("API Error: 502 status code (no body)", "retryable_api");
+
+    await vi.waitFor(() => expect(scenario.client.session.prompts).toHaveLength(2));
+    expect(scenario.client.session.prompts.every(isClaudeContextPreflightPrompt)).toBe(true);
+    scenario.client.session.complete();
+    await vi.waitFor(() =>
+      expect(scenario.client.session.prompts[2]).toBe("finish after the gateway recovers"),
+    );
+    scenario.client.session.complete();
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("precompacts a submitted retry without executing the original user turn twice", async () => {
+  const scenario = await createContextPreflightScenario({ retryDelayMs: 5 });
+  try {
+    scenario.client.session.reportUsage({
+      contextWindowMaxTokens: 200_000,
+      contextWindowUsedTokens: 100_000,
+    });
+    await vi.waitFor(() =>
+      expect(scenario.agentManager.getAgent(scenario.agentId)?.lastUsage).toMatchObject({
+        contextWindowUsedTokens: 100_000,
+      }),
+    );
+    await sendPromptToAgent({
+      agentManager: scenario.agentManager,
+      agentStorage: scenario.storage,
+      agentId: scenario.agentId,
+      prompt: "perform this exact user instruction once",
+      messageId: "message-submitted-before-preflight",
+      activeTurnBehavior: "queue",
+      logger: scenario.logger,
+    });
+    await vi.waitFor(() =>
+      expect(scenario.client.session.prompts).toEqual(["perform this exact user instruction once"]),
+    );
+
+    scenario.client.session.reportUsage({
+      contextWindowMaxTokens: 200_000,
+      contextWindowUsedTokens: 163_000,
+    });
+    scenario.client.session.fail("API Error: 502 status code (no body)", "retryable_api");
+
+    await vi.waitFor(() => expect(scenario.client.session.prompts).toHaveLength(2));
+    expect(isClaudeContextPreflightPrompt(scenario.client.session.prompts[1]!)).toBe(true);
+    scenario.client.session.complete();
+    await vi.waitFor(() => expect(scenario.client.session.prompts).toHaveLength(3));
+    expect(scenario.client.session.prompts[2]).toContain("<paseo-system>");
+    expect(
+      scenario.client.session.prompts.filter(
+        (prompt) => prompt === "perform this exact user instruction once",
+      ),
+    ).toHaveLength(1);
+    scenario.client.session.complete();
+    await vi.waitFor(async () => {
+      await expect(scenario.storage.listPendingPrompts(scenario.agentId)).resolves.toEqual([]);
+    });
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("does not repeat compaction after a boundary even if the trailing result fails", async () => {
+  const scenario = await createContextPreflightScenario({ retryDelayMs: 5 });
+  try {
+    await sendPromptToAgent({
+      agentManager: scenario.agentManager,
+      agentStorage: scenario.storage,
+      agentId: scenario.agentId,
+      prompt: "continue after the completed compact boundary",
+      messageId: "message-after-boundary",
+      activeTurnBehavior: "queue",
+      logger: scenario.logger,
+    });
+    await vi.waitFor(() => expect(scenario.client.session.prompts).toHaveLength(1));
+    scenario.client.session.reportCompactionBoundary(12_000);
+    scenario.client.session.fail("API Error: 502 after compact", "retryable_api");
+
+    await vi.waitFor(() =>
+      expect(scenario.client.session.prompts).toEqual([
+        expect.stringContaining("PASEO_INTERNAL_CONTEXT_PREFLIGHT"),
+        "continue after the completed compact boundary",
+      ]),
+    );
+    scenario.client.session.complete();
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("stops the predecessor drain when a completed preflight ends in rollover failure", async () => {
+  const scenario = await createContextPreflightScenario();
+  try {
+    await scenario.storage.enqueuePendingPrompt(scenario.agentId, {
+      id: "message-transferred-after-preflight",
+      prompt: "continue only on the rollover successor",
+    });
+    await scenario.storage.claimPendingPrompt(scenario.agentId);
+    await scenario.storage.insertPendingPromptPreflight(
+      scenario.agentId,
+      "message-transferred-after-preflight",
+      {
+        key: "claude_context_compaction",
+        prompt: "/compact [PASEO_INTERNAL_CONTEXT_PREFLIGHT] preserve state",
+      },
+    );
+    const preflight = await scenario.storage.claimPendingPrompt(scenario.agentId);
+    if (!preflight) throw new Error("Expected claimed preflight");
+    const settleStoredPreflight = Reflect.get(scenario.agentManager, "settleStoredPreflight") as (
+      ...args: unknown[]
+    ) => Promise<boolean>;
+
+    await expect(
+      Reflect.apply(settleStoredPreflight, scenario.agentManager, [
+        scenario.agentId,
+        preflight,
+        {
+          started: true,
+          terminal: "failed",
+          failureKind: "context_overflow",
+          preflightBoundaryObserved: true,
+        },
+        scenario.storage,
+      ]),
+    ).resolves.toBe(false);
+    await expect(scenario.storage.listPendingPrompts(scenario.agentId)).resolves.toMatchObject([
+      { id: "message-transferred-after-preflight", state: "queued" },
+    ]);
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("stops after an unclassified stream error even when the compact boundary completed", async () => {
+  const scenario = await createContextPreflightScenario();
+  try {
+    await scenario.storage.enqueuePendingPrompt(scenario.agentId, {
+      id: "message-after-unknown-preflight-error",
+      prompt: "remain queued after an unknown stream failure",
+    });
+    await scenario.storage.claimPendingPrompt(scenario.agentId);
+    await scenario.storage.insertPendingPromptPreflight(
+      scenario.agentId,
+      "message-after-unknown-preflight-error",
+      {
+        key: "claude_context_compaction",
+        prompt: "/compact [PASEO_INTERNAL_CONTEXT_PREFLIGHT] preserve state",
+      },
+    );
+    const preflight = await scenario.storage.claimPendingPrompt(scenario.agentId);
+    if (!preflight) throw new Error("Expected claimed preflight");
+    const settleStoredPreflight = Reflect.get(scenario.agentManager, "settleStoredPreflight") as (
+      ...args: unknown[]
+    ) => Promise<boolean>;
+
+    await expect(
+      Reflect.apply(settleStoredPreflight, scenario.agentManager, [
+        scenario.agentId,
+        preflight,
+        {
+          started: true,
+          terminal: null,
+          preflightBoundaryObserved: true,
+          error: new Error("stream iterator failed after the compact boundary"),
+        },
+        scenario.storage,
+      ]),
+    ).resolves.toBe(false);
+    await expect(scenario.storage.listPendingPrompts(scenario.agentId)).resolves.toMatchObject([
+      { id: "message-after-unknown-preflight-error", state: "queued" },
+    ]);
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("retains the user prompt without looping after a non-retryable compaction failure", async () => {
+  const scenario = await createContextPreflightScenario({ retryDelayMs: 5 });
+  try {
+    await sendPromptToAgent({
+      agentManager: scenario.agentManager,
+      agentStorage: scenario.storage,
+      agentId: scenario.agentId,
+      prompt: "wait for credentials to be repaired",
+      messageId: "message-after-auth-repair",
+      activeTurnBehavior: "queue",
+      logger: scenario.logger,
+    });
+    await vi.waitFor(() => expect(scenario.client.session.prompts).toHaveLength(1));
+    scenario.client.session.fail("Invalid API key");
+
+    await vi.waitFor(async () => {
+      await expect(scenario.storage.listPendingPrompts(scenario.agentId)).resolves.toMatchObject([
+        {
+          id: "message-after-auth-repair",
+          state: "queued",
+        },
+      ]);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    expect(scenario.client.session.prompts).toHaveLength(1);
+
+    await sendPromptToAgent({
+      agentManager: scenario.agentManager,
+      agentStorage: scenario.storage,
+      agentId: scenario.agentId,
+      prompt: "continue once authentication is repaired",
+      messageId: "message-after-auth-repair-follow-up",
+      activeTurnBehavior: "steer",
+      logger: scenario.logger,
+    });
+    await vi.waitFor(() => expect(scenario.client.session.prompts).toHaveLength(2));
+    expect(isClaudeContextPreflightPrompt(scenario.client.session.prompts[1]!)).toBe(true);
+    scenario.client.session.complete();
+    await vi.waitFor(() =>
+      expect(scenario.client.session.prompts[2]).toBe("wait for credentials to be repaired"),
+    );
+    scenario.client.session.complete();
+    await vi.waitFor(() =>
+      expect(scenario.client.session.prompts[3]).toBe("continue once authentication is repaired"),
+    );
+    scenario.client.session.complete();
+    await vi.waitFor(async () => {
+      await expect(scenario.storage.listPendingPrompts(scenario.agentId)).resolves.toEqual([]);
+    });
+    expect(
+      scenario.client.session.prompts.filter(
+        (prompt) => prompt === "wait for credentials to be repaired",
+      ),
+    ).toHaveLength(1);
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("daemon recovery reclaims an interrupted preflight before releasing its user prompt", async () => {
+  const scenario = await createContextPreflightScenario({ retryDelayMs: 5 });
+  let recoveredManager: AgentManager | undefined;
+  try {
+    await scenario.agentManager.flush();
+    await scenario.storage.enqueuePendingPrompt(scenario.agentId, {
+      id: "message-after-preflight-restart",
+      prompt: "continue exactly once after the daemon restart",
+    });
+    await scenario.storage.flush();
+
+    const reloaded = new AgentStorage(join(scenario.workdir, "agents"), scenario.logger);
+    const recoveredClient = new QueuedPromptAgentClient();
+    recoveredManager = new AgentManager({
+      clients: { "claude-acc": recoveredClient },
+      registry: reloaded,
+      logger: scenario.logger,
+    });
+    await resumePendingAgentPrompts({
+      agentManager: recoveredManager,
+      agentStorage: reloaded,
+      logger: scenario.logger,
+    });
+
+    await vi.waitFor(() => expect(recoveredClient.session.prompts).toHaveLength(1));
+    expect(isClaudeContextPreflightPrompt(recoveredClient.session.prompts[0]!)).toBe(true);
+    recoveredClient.session.complete();
+    await vi.waitFor(() =>
+      expect(recoveredClient.session.prompts[1]).toBe(
+        "continue exactly once after the daemon restart",
+      ),
+    );
+    recoveredClient.session.complete();
+    await vi.waitFor(async () => {
+      await expect(reloaded.listPendingPrompts(scenario.agentId)).resolves.toEqual([]);
+    });
+  } finally {
+    await recoveredManager?.closeAgent(scenario.agentId).catch(() => undefined);
+    await recoveredManager?.flush().catch(() => undefined);
+    await scenario.cleanup();
+  }
+});
+
+test("daemon recovery does not repeat a compact whose exact boundary receipt was persisted", async () => {
+  const scenario = await createContextPreflightScenario({ retryDelayMs: 5 });
+  let recoveredManager: AgentManager | undefined;
+  try {
+    await scenario.agentManager.flush();
+    await scenario.storage.enqueuePendingPrompt(scenario.agentId, {
+      id: "message-after-persisted-boundary",
+      prompt: "continue after the already completed compact",
+    });
+    await scenario.storage.claimPendingPrompt(scenario.agentId);
+    await scenario.storage.insertPendingPromptPreflight(
+      scenario.agentId,
+      "message-after-persisted-boundary",
+      {
+        key: "claude_context_compaction",
+        prompt: "/compact [PASEO_INTERNAL_CONTEXT_PREFLIGHT] preserve state",
+      },
+    );
+    const preflight = await scenario.storage.claimPendingPrompt(scenario.agentId);
+    if (!preflight) throw new Error("Expected claimed preflight");
+    await scenario.storage.recordPendingPromptPreflightBoundary(scenario.agentId, preflight.id);
+    const stored = await scenario.storage.get(scenario.agentId);
+    if (!stored) throw new Error("Expected stored agent");
+    await scenario.storage.upsert({
+      ...stored,
+      lastUsage: {
+        contextWindowMaxTokens: 200_000,
+        contextWindowUsedTokens: 163_000,
+      },
+    });
+    await scenario.storage.flush();
+
+    const reloaded = new AgentStorage(join(scenario.workdir, "agents"), scenario.logger);
+    const recoveredClient = new QueuedPromptAgentClient();
+    recoveredManager = new AgentManager({
+      clients: { "claude-acc": recoveredClient },
+      registry: reloaded,
+      logger: scenario.logger,
+    });
+    await resumePendingAgentPrompts({
+      agentManager: recoveredManager,
+      agentStorage: reloaded,
+      logger: scenario.logger,
+    });
+
+    await vi.waitFor(() =>
+      expect(recoveredClient.session.prompts).toEqual([
+        "continue after the already completed compact",
+      ]),
+    );
+    expect(recoveredClient.session.prompts.some(isClaudeContextPreflightPrompt)).toBe(false);
+    expect(
+      recoveredManager.getAgent(scenario.agentId)?.lastUsage?.contextWindowUsedTokens,
+    ).toBeUndefined();
+    await recoveredManager.flush();
+    expect(
+      (await reloaded.get(scenario.agentId))?.lastUsage?.contextWindowUsedTokens,
+    ).toBeUndefined();
+    recoveredClient.session.complete();
+    await vi.waitFor(async () => {
+      await expect(reloaded.listPendingPrompts(scenario.agentId)).resolves.toEqual([]);
+    });
+  } finally {
+    await recoveredManager?.closeAgent(scenario.agentId).catch(() => undefined);
+    await recoveredManager?.flush().catch(() => undefined);
+    await scenario.cleanup();
+  }
+});
+
+test("daemon recovery never infers a compact boundary from a stale low usage value", async () => {
+  const scenario = await createContextPreflightScenario({ retryDelayMs: 5 });
+  let recoveredManager: AgentManager | undefined;
+  try {
+    await scenario.agentManager.flush();
+    await scenario.storage.enqueuePendingPrompt(scenario.agentId, {
+      id: "message-after-unproven-boundary",
+      prompt: "compact before this request despite stale storage",
+    });
+    await scenario.storage.claimPendingPrompt(scenario.agentId);
+    await scenario.storage.insertPendingPromptPreflight(
+      scenario.agentId,
+      "message-after-unproven-boundary",
+      {
+        key: "claude_context_compaction",
+        prompt: "/compact [PASEO_INTERNAL_CONTEXT_PREFLIGHT] preserve state",
+      },
+    );
+    await scenario.storage.claimPendingPrompt(scenario.agentId);
+    const stored = await scenario.storage.get(scenario.agentId);
+    if (!stored) throw new Error("Expected stored agent");
+    await scenario.storage.upsert({
+      ...stored,
+      lastUsage: {
+        contextWindowMaxTokens: 200_000,
+        contextWindowUsedTokens: 120_000,
+      },
+    });
+    await scenario.storage.flush();
+
+    const reloaded = new AgentStorage(join(scenario.workdir, "agents"), scenario.logger);
+    const recoveredClient = new QueuedPromptAgentClient();
+    recoveredManager = new AgentManager({
+      clients: { "claude-acc": recoveredClient },
+      registry: reloaded,
+      logger: scenario.logger,
+    });
+    await resumePendingAgentPrompts({
+      agentManager: recoveredManager,
+      agentStorage: reloaded,
+      logger: scenario.logger,
+    });
+
+    await vi.waitFor(() => expect(recoveredClient.session.prompts).toHaveLength(1));
+    expect(isClaudeContextPreflightPrompt(recoveredClient.session.prompts[0]!)).toBe(true);
+    recoveredClient.session.complete();
+    await vi.waitFor(() =>
+      expect(recoveredClient.session.prompts[1]).toBe(
+        "compact before this request despite stale storage",
+      ),
+    );
+    recoveredClient.session.complete();
+  } finally {
+    await recoveredManager?.closeAgent(scenario.agentId).catch(() => undefined);
+    await recoveredManager?.flush().catch(() => undefined);
+    await scenario.cleanup();
+  }
+});
+
+test("releases a claimed user prompt when admission planning throws", async () => {
+  const scenario = await createContextPreflightScenario({ retryDelayMs: 5 });
+  try {
+    const admission = vi
+      .spyOn(scenario.client.session, "planPromptAdmission")
+      .mockImplementationOnce(() => {
+        throw new Error("admission probe failed");
+      })
+      .mockReturnValue({ type: "dispatch" });
+    await scenario.storage.enqueuePendingPrompt(scenario.agentId, {
+      id: "message-admission-exception",
+      prompt: "run after the admission probe recovers",
+    });
+
+    await scenario.agentManager.drainStoredPendingPrompts(scenario.agentId);
+    await expect(scenario.storage.listPendingPrompts(scenario.agentId)).resolves.toMatchObject([
+      { id: "message-admission-exception", state: "queued" },
+    ]);
+    expect(scenario.client.session.prompts).toEqual([]);
+
+    const recoveredDrain = scenario.agentManager.drainStoredPendingPrompts(scenario.agentId);
+    await vi.waitFor(() =>
+      expect(scenario.client.session.prompts).toEqual(["run after the admission probe recovers"]),
+    );
+    scenario.client.session.complete();
+    await recoveredDrain;
+    await vi.waitFor(async () => {
+      await expect(scenario.storage.listPendingPrompts(scenario.agentId)).resolves.toEqual([]);
+    });
+    admission.mockRestore();
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("completes a rejected queue item and continues with the next user prompt", async () => {
+  const scenario = await createContextPreflightScenario({ retryDelayMs: 5 });
+  try {
+    const admission = vi
+      .spyOn(scenario.client.session, "planPromptAdmission")
+      .mockReturnValueOnce({ type: "reject", message: "message exceeds safe context limit" })
+      .mockReturnValue({ type: "dispatch" });
+    await scenario.storage.enqueuePendingPrompt(scenario.agentId, {
+      id: "message-rejected",
+      prompt: "an oversized message",
+    });
+    await scenario.storage.enqueuePendingPrompt(scenario.agentId, {
+      id: "message-after-rejected",
+      prompt: "a later independent request",
+    });
+
+    const drain = scenario.agentManager.drainStoredPendingPrompts(scenario.agentId);
+    await vi.waitFor(() =>
+      expect(scenario.client.session.prompts).toEqual(["a later independent request"]),
+    );
+    await expect(scenario.storage.listPendingPrompts(scenario.agentId)).resolves.toMatchObject([
+      { id: "message-after-rejected", state: "dispatching" },
+    ]);
+    expect(scenario.agentManager.getTimeline(scenario.agentId)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "user_message",
+          text: "an oversized message",
+          clientMessageId: "message-rejected",
+        }),
+      ]),
+    );
+    expect(scenario.agentManager.hasSubmittedPrompt(scenario.agentId, "message-rejected")).toBe(
+      false,
+    );
+    scenario.client.session.complete();
+    await drain;
+    await vi.waitFor(async () => {
+      await expect(scenario.storage.listPendingPrompts(scenario.agentId)).resolves.toEqual([]);
+    });
+    admission.mockRestore();
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("does not treat a locally rejected timeline row as provider submission", async () => {
+  const scenario = await createContextPreflightScenario({ retryDelayMs: 5 });
+  try {
+    const admission = vi
+      .spyOn(scenario.client.session, "planPromptAdmission")
+      .mockReturnValueOnce({ type: "reject", message: "message exceeds safe context limit" })
+      .mockReturnValue({ type: "dispatch" });
+    const messageId = "message-rejected-then-retried";
+    const prompt = "retry this literal only after admission changes";
+    await scenario.storage.enqueuePendingPrompt(scenario.agentId, { id: messageId, prompt });
+    await scenario.agentManager.drainStoredPendingPrompts(scenario.agentId);
+
+    expect(scenario.agentManager.hasSubmittedPrompt(scenario.agentId, messageId)).toBe(false);
+    expect(
+      scenario.agentManager
+        .getTimeline(scenario.agentId)
+        .filter((item) => item.type === "user_message" && item.clientMessageId === messageId),
+    ).toEqual([expect.objectContaining({ deliveryStatus: "rejected", text: prompt })]);
+
+    await scenario.storage.enqueuePendingPrompt(scenario.agentId, { id: messageId, prompt });
+    const retry = scenario.agentManager.drainStoredPendingPrompts(scenario.agentId);
+    await vi.waitFor(() => expect(scenario.client.session.prompts).toEqual([prompt]));
+    expect(scenario.agentManager.hasSubmittedPrompt(scenario.agentId, messageId)).toBe(true);
+    expect(
+      scenario.agentManager
+        .getTimeline(scenario.agentId)
+        .filter((item) => item.type === "user_message" && item.clientMessageId === messageId),
+    ).toEqual([expect.not.objectContaining({ deliveryStatus: "rejected" })]);
+    scenario.client.session.complete();
+    await retry;
+    admission.mockRestore();
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("queues an in-flight steer when high context requires compaction", async () => {
+  const logger = createTestLogger();
+  const steerOrReplaceActiveTurn = vi.fn(async () => ({ status: "steered" as const }));
+  const agentManager = Object.create(AgentManager.prototype) as AgentManager;
+  Reflect.set(agentManager, "getAgent", () => ({
+    provider: "claude-acc",
+    persistence: null,
+    capabilities: { supportsInFlightSteering: true },
+    pendingPermissions: new Map(),
+  }));
+  Reflect.set(agentManager, "planPromptAdmission", () => ({
+    type: "preflight",
+    key: "claude_context_compaction",
+    prompt: "/compact [PASEO_INTERNAL_CONTEXT_PREFLIGHT] preserve state",
+  }));
+  Reflect.set(agentManager, "hasInFlightRun", () => true);
+  Reflect.set(agentManager, "tryRunOutOfBand", () => false);
+  Reflect.set(agentManager, "hasSubmittedPrompt", () => false);
+  Reflect.set(agentManager, "drainStoredPendingPrompts", async () => undefined);
+  Reflect.set(agentManager, "steerOrReplaceActiveTurn", steerOrReplaceActiveTurn);
+  const agentStorage = Object.create(AgentStorage.prototype) as AgentStorage;
+  Reflect.set(agentStorage, "get", async () => null);
+  const enqueuePendingPrompt = vi.fn(async () => ({ enqueued: true, position: 1 }));
+  Reflect.set(agentStorage, "enqueuePendingPrompt", enqueuePendingPrompt);
+
+  await expect(
+    sendPromptToAgent({
+      agentManager,
+      agentStorage,
+      agentId: "running-agent",
+      prompt: "change direction without interrupting",
+      activeTurnBehavior: "steer",
+      logger,
+    }),
+  ).resolves.toEqual({ disposition: "queued" });
+  expect(steerOrReplaceActiveTurn).not.toHaveBeenCalled();
+  expect(enqueuePendingPrompt).toHaveBeenCalledWith(
+    "running-agent",
+    expect.objectContaining({ prompt: "change direction without interrupting" }),
+  );
+});
+
+test("rejects a user message id in Paseo's reserved preflight namespace", async () => {
+  const logger = createTestLogger();
+  await expect(
+    sendPromptToAgent({
+      agentManager: Object.create(AgentManager.prototype) as AgentManager,
+      agentStorage: Object.create(AgentStorage.prototype) as AgentStorage,
+      agentId: "direct-agent",
+      prompt: "keep this visible",
+      messageId: "paseo-internal-preflight:user-spoof",
+      logger,
+    }),
+  ).rejects.toThrow("reserved internal prefix");
+});
+
+test("queues an ordinary steer while the synthetic compact turn owns the provider", async () => {
+  const scenario = await createContextPreflightScenario();
+  try {
+    await sendPromptToAgent({
+      agentManager: scenario.agentManager,
+      agentStorage: scenario.storage,
+      agentId: scenario.agentId,
+      prompt: "first request after compact",
+      messageId: "message-after-synthetic",
+      activeTurnBehavior: "queue",
+      logger: scenario.logger,
+    });
+    await vi.waitFor(() => expect(scenario.client.session.prompts).toHaveLength(1));
+    expect(isClaudeContextPreflightPrompt(scenario.client.session.prompts[0]!)).toBe(true);
+
+    await expect(
+      sendPromptToAgent({
+        agentManager: scenario.agentManager,
+        agentStorage: scenario.storage,
+        agentId: scenario.agentId,
+        prompt: "follow-up sent during compact",
+        messageId: "message-during-synthetic",
+        activeTurnBehavior: "steer",
+        logger: scenario.logger,
+      }),
+    ).resolves.toEqual({ disposition: "queued" });
+    expect(scenario.client.session.prompts).toHaveLength(1);
+    await expect(scenario.storage.listPendingPrompts(scenario.agentId)).resolves.toMatchObject([
+      { id: expect.stringMatching(/^paseo-internal-preflight:/), state: "dispatching" },
+      { id: "message-after-synthetic", state: "queued" },
+      { id: "message-during-synthetic", state: "queued" },
+    ]);
+
+    scenario.client.session.complete();
+    await vi.waitFor(() =>
+      expect(scenario.client.session.prompts[1]).toBe("first request after compact"),
+    );
+    scenario.client.session.complete();
+    await vi.waitFor(() =>
+      expect(scenario.client.session.prompts[2]).toBe("follow-up sent during compact"),
+    );
+    scenario.client.session.complete();
+    await vi.waitFor(async () => {
+      await expect(scenario.storage.listPendingPrompts(scenario.agentId)).resolves.toEqual([]);
+    });
+  } finally {
+    await scenario.cleanup();
+  }
+});
 
 test("serializes all queue-mode prompts through one durable FIFO", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-durable-prompt-queue-"));
@@ -1035,7 +1888,9 @@ test("a repeated client message id is not enqueued after provider acceptance", a
       });
     await send("run this once");
     await vi.waitFor(() => expect(client.session.prompts).toEqual(["run this once"]));
-    await expect(send("browser retried this request")).resolves.toEqual({ disposition: "queued" });
+    await expect(send("browser retried this request")).resolves.toEqual({
+      disposition: "queued",
+    });
     expect(client.session.prompts).toEqual(["run this once"]);
     await expect(storage.listPendingPrompts(snapshot.id)).resolves.toHaveLength(1);
 
@@ -1233,7 +2088,11 @@ test("daemon recovery preserves a queued retry whose user message is already rec
       clientMessageId: "message-transient-restart",
     });
 
-    await resumePendingAgentPrompts({ agentManager, agentStorage: storage, logger });
+    await resumePendingAgentPrompts({
+      agentManager,
+      agentStorage: storage,
+      logger,
+    });
     await vi.waitFor(() => expect(client.session.prompts).toHaveLength(1));
     expect(client.session.prompts[0]).toContain("<paseo-system>");
     expect(client.session.prompts[0]).toContain("Continue that unfinished request now");
@@ -1272,7 +2131,11 @@ test("daemon recovery reclaims an interrupted dispatch without blocking startup"
     });
     await storage.claimPendingPrompt(snapshot.id);
 
-    await resumePendingAgentPrompts({ agentManager, agentStorage: storage, logger });
+    await resumePendingAgentPrompts({
+      agentManager,
+      agentStorage: storage,
+      logger,
+    });
     await vi.waitFor(() =>
       expect(client.session.prompts).toEqual(["resume this after daemon restart"]),
     );
@@ -1320,7 +2183,11 @@ test("daemon recovery retires a dispatch already committed to the durable timeli
       clientMessageId: "accepted-before-restart",
     });
 
-    await resumePendingAgentPrompts({ agentManager, agentStorage: storage, logger });
+    await resumePendingAgentPrompts({
+      agentManager,
+      agentStorage: storage,
+      logger,
+    });
     await expect(storage.listPendingPrompts(snapshot.id)).resolves.toEqual([]);
     expect(client.session.prompts).toEqual([]);
   } finally {

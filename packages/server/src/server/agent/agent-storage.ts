@@ -7,8 +7,17 @@ import { writeJsonFileAtomic } from "../atomic-file.js";
 import { AgentFeatureSchema, AgentStatusSchema } from "../messages.js";
 import { toStoredAgentRecord } from "./agent-projections.js";
 import type { ManagedAgent } from "./agent-manager.js";
-import type { AgentPromptInput, AgentSessionConfig } from "./agent-sdk-types.js";
+import type {
+  AgentPromptInput,
+  AgentPromptPreflight,
+  AgentSessionConfig,
+} from "./agent-sdk-types.js";
 import { AgentOwnerSchema, daemonExecutionKey, type DaemonAgentOwner } from "./agent-owner.js";
+import {
+  buildInternalPromptPreflightId,
+  INTERNAL_PROMPT_PREFLIGHT_ID_PREFIX,
+  isInternalPromptPreflightId,
+} from "./prompt-preflight.js";
 
 const SERIALIZABLE_CONFIG_SCHEMA = z
   .object({
@@ -61,7 +70,16 @@ const STORED_PENDING_AGENT_PROMPT_SCHEMA = z
   })
   .strict();
 
+// Preserve one schema-compatible slot for a synthetic context preflight. The
+// previous daemon accepts at most 32 queue records, so a rollback can still
+// read every file written by this release.
+const MAX_PENDING_USER_PROMPTS = 31;
+const MAX_STORED_PENDING_ITEMS = 32;
 export type StoredPendingAgentPrompt = z.infer<typeof STORED_PENDING_AGENT_PROMPT_SCHEMA>;
+
+export function isStoredPendingPromptPreflight(item: StoredPendingAgentPrompt): boolean {
+  return isInternalPromptPreflightId(item.id);
+}
 
 const STORED_AGENT_SCHEMA = z.object({
   id: z.string(),
@@ -101,7 +119,22 @@ const STORED_AGENT_SCHEMA = z.object({
   archivedAt: z.string().nullable().optional(),
   owner: AgentOwnerSchema.optional(),
   continuationRequest: z.string().max(24_000).nullable().optional(),
-  pendingPrompts: z.array(STORED_PENDING_AGENT_PROMPT_SCHEMA).max(32).default([]),
+  pendingPrompts: z
+    .array(STORED_PENDING_AGENT_PROMPT_SCHEMA)
+    .max(MAX_STORED_PENDING_ITEMS)
+    .default([]),
+  completedPromptPreflightIds: z.array(z.string()).max(MAX_STORED_PENDING_ITEMS).default([]),
+  lastUsage: z
+    .object({
+      inputTokens: z.number().finite().optional(),
+      cachedInputTokens: z.number().finite().optional(),
+      outputTokens: z.number().finite().optional(),
+      totalCostUsd: z.number().finite().optional(),
+      contextWindowMaxTokens: z.number().finite().optional(),
+      contextWindowUsedTokens: z.number().finite().nonnegative().optional(),
+    })
+    .strict()
+    .optional(),
 });
 
 export type SerializableAgentConfig = Pick<
@@ -117,6 +150,16 @@ export type SerializableAgentConfig = Pick<
 >;
 
 export type StoredAgentRecord = z.infer<typeof STORED_AGENT_SCHEMA>;
+
+function clearContextWindowUsedTokens(
+  usage: StoredAgentRecord["lastUsage"],
+): StoredAgentRecord["lastUsage"] {
+  if (usage?.contextWindowUsedTokens === undefined) return usage;
+  const remaining = { ...usage };
+  delete remaining.contextWindowUsedTokens;
+  return Object.keys(remaining).length > 0 ? remaining : undefined;
+}
+
 export function parseStoredAgentRecord(value: unknown): StoredAgentRecord {
   return STORED_AGENT_SCHEMA.parse(value);
 }
@@ -188,6 +231,9 @@ export class AgentStorage {
     input: Pick<StoredPendingAgentPrompt, "id" | "prompt">,
   ): Promise<{ enqueued: boolean; position: number }> {
     await this.load();
+    if (isInternalPromptPreflightId(input.id)) {
+      throw new Error(`Prompt id uses reserved prefix: ${INTERNAL_PROMPT_PREFLIGHT_ID_PREFIX}`);
+    }
     let result: { enqueued: boolean; position: number } | null = null;
     await this.queueRecordMutation(agentId, (existing) => {
       if (!existing) {
@@ -198,8 +244,18 @@ export class AgentStorage {
         result = { enqueued: false, position: duplicateIndex + 1 };
         return existing;
       }
-      if (existing.pendingPrompts.length >= 32) {
-        throw new Error(`Agent ${agentId} prompt queue is full (32 messages)`);
+      const pendingUserPrompts = existing.pendingPrompts.filter(
+        (item) => !isStoredPendingPromptPreflight(item),
+      ).length;
+      if (pendingUserPrompts >= MAX_PENDING_USER_PROMPTS) {
+        throw new Error(
+          `Agent ${agentId} prompt queue is full (${MAX_PENDING_USER_PROMPTS} messages)`,
+        );
+      }
+      if (existing.pendingPrompts.length >= MAX_STORED_PENDING_ITEMS) {
+        throw new Error(
+          `Agent ${agentId} prompt queue is full (${MAX_STORED_PENDING_ITEMS} items)`,
+        );
       }
       const pendingPrompts = [
         ...existing.pendingPrompts,
@@ -211,7 +267,7 @@ export class AgentStorage {
           attemptCount: 0,
         },
       ];
-      result = { enqueued: true, position: pendingPrompts.length };
+      result = { enqueued: true, position: pendingUserPrompts + 1 };
       return { ...existing, pendingPrompts };
     });
     if (!result) {
@@ -301,8 +357,8 @@ export class AgentStorage {
       if (!existing) {
         throw new Error(`Agent ${agentId} not found`);
       }
-      const index = existing.pendingPrompts.findIndex((item) => item.state === "queued");
-      if (index < 0) {
+      const index = 0;
+      if (existing.pendingPrompts[index]?.state !== "queued") {
         return existing;
       }
       const next = [...existing.pendingPrompts];
@@ -315,6 +371,84 @@ export class AgentStorage {
       return { ...existing, pendingPrompts: next };
     });
     return claimed;
+  }
+
+  async insertPendingPromptPreflight(
+    agentId: string,
+    targetPromptId: string,
+    preflight: AgentPromptPreflight,
+  ): Promise<boolean> {
+    await this.load();
+    let inserted = false;
+    await this.queueRecordMutation(agentId, (existing) => {
+      if (!existing) throw new Error(`Agent ${agentId} not found`);
+      const targetIndex = existing.pendingPrompts.findIndex((item) => item.id === targetPromptId);
+      if (targetIndex < 0) return existing;
+      const target = existing.pendingPrompts[targetIndex]!;
+      if (isStoredPendingPromptPreflight(target)) return existing;
+
+      const preflightId = buildInternalPromptPreflightId(targetPromptId, preflight.key);
+      const duplicate = existing.pendingPrompts.some((item) => item.id === preflightId);
+      // Preserve the attempt count: an earlier provider dispatch may already
+      // have recorded this stable client message before a retry needed the
+      // preflight. Resetting it can make the later user dispatch execute twice.
+      const queuedTarget = { ...target, state: "queued" as const };
+      const pendingPrompts = [...existing.pendingPrompts];
+      pendingPrompts[targetIndex] = queuedTarget;
+      if (duplicate) return { ...existing, pendingPrompts };
+      if (pendingPrompts.length >= MAX_STORED_PENDING_ITEMS) {
+        throw new Error(`Agent ${agentId} prompt preflight queue is full`);
+      }
+
+      pendingPrompts.splice(targetIndex, 0, {
+        id: preflightId,
+        prompt: preflight.prompt,
+        createdAt: new Date().toISOString(),
+        state: "queued",
+        attemptCount: 0,
+      });
+      inserted = true;
+      return { ...existing, pendingPrompts };
+    });
+    return inserted;
+  }
+
+  async settlePendingPromptPreflight(
+    agentId: string,
+    preflightId: string,
+    options?: { clearContextUsage?: boolean },
+  ): Promise<void> {
+    await this.load();
+    await this.queueRecordMutation(agentId, (existing) => {
+      if (!existing) throw new Error(`Agent ${agentId} not found`);
+      const preflight = existing.pendingPrompts.find((item) => item.id === preflightId);
+      if (!preflight || !isStoredPendingPromptPreflight(preflight)) return existing;
+      const lastUsage = options?.clearContextUsage
+        ? clearContextWindowUsedTokens(existing.lastUsage)
+        : existing.lastUsage;
+      return {
+        ...existing,
+        pendingPrompts: existing.pendingPrompts.filter((item) => item.id !== preflightId),
+        completedPromptPreflightIds: existing.completedPromptPreflightIds.filter(
+          (id) => id !== preflightId,
+        ),
+        ...(lastUsage ? { lastUsage } : { lastUsage: undefined }),
+      };
+    });
+  }
+
+  async recordPendingPromptPreflightBoundary(agentId: string, preflightId: string): Promise<void> {
+    await this.load();
+    await this.queueRecordMutation(agentId, (existing) => {
+      if (!existing) throw new Error(`Agent ${agentId} not found`);
+      const preflight = existing.pendingPrompts.find((item) => item.id === preflightId);
+      if (!preflight || !isStoredPendingPromptPreflight(preflight)) return existing;
+      if (existing.completedPromptPreflightIds.includes(preflightId)) return existing;
+      return {
+        ...existing,
+        completedPromptPreflightIds: [...existing.completedPromptPreflightIds, preflightId],
+      };
+    });
   }
 
   async completePendingPrompt(agentId: string, promptId: string): Promise<void> {
@@ -352,16 +486,18 @@ export class AgentStorage {
     const source = await this.get(sourceAgentId);
     if (!source || source.pendingPrompts.length === 0) return;
 
-    const prompts = source.pendingPrompts.map((item) => ({
-      id: item.id,
-      prompt: item.prompt,
-      createdAt: item.createdAt,
-      // A provider iterator cannot survive a family rollover. The successor
-      // owns replay admission and will claim the prompt again once its bounded
-      // handoff turn settles.
-      state: "queued" as const,
-      attemptCount: item.attemptCount,
-    }));
+    const prompts = source.pendingPrompts
+      .filter((item) => !isStoredPendingPromptPreflight(item))
+      .map((item) => ({
+        id: item.id,
+        prompt: item.prompt,
+        createdAt: item.createdAt,
+        // A provider iterator cannot survive a family rollover. The successor
+        // owns replay admission and will claim the prompt again once its bounded
+        // handoff turn settles.
+        state: "queued" as const,
+        attemptCount: item.attemptCount,
+      }));
     await this.queueRecordMutation(targetAgentId, (target) => {
       if (!target) {
         throw new Error(`Agent ${targetAgentId} not found`);
@@ -374,8 +510,16 @@ export class AgentStorage {
         // prompts and must remain behind them.
         ...target.pendingPrompts,
       ];
-      if (pendingPrompts.length > 32) {
-        throw new Error(`Agent ${targetAgentId} prompt queue is full (32 messages)`);
+      const pendingUserPrompts = pendingPrompts.filter(
+        (item) => !isStoredPendingPromptPreflight(item),
+      ).length;
+      if (pendingUserPrompts > MAX_PENDING_USER_PROMPTS) {
+        throw new Error(
+          `Agent ${targetAgentId} prompt queue is full (${MAX_PENDING_USER_PROMPTS} messages)`,
+        );
+      }
+      if (pendingPrompts.length > MAX_STORED_PENDING_ITEMS) {
+        throw new Error(`Agent ${targetAgentId} prompt preflight queue is full`);
       }
       return { ...target, pendingPrompts };
     });
@@ -386,7 +530,9 @@ export class AgentStorage {
       const movedIds = new Set(prompts.map((item) => item.id));
       return {
         ...latestSource,
-        pendingPrompts: latestSource.pendingPrompts.filter((item) => !movedIds.has(item.id)),
+        pendingPrompts: latestSource.pendingPrompts.filter(
+          (item) => !isStoredPendingPromptPreflight(item) && !movedIds.has(item.id),
+        ),
       };
     });
   }
@@ -500,6 +646,7 @@ export class AgentStorage {
       if (existing) {
         record.continuationRequest = existing.continuationRequest;
         record.pendingPrompts = existing.pendingPrompts;
+        record.completedPromptPreflightIds = existing.completedPromptPreflightIds;
       }
       return record;
     });

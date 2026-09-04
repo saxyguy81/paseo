@@ -9,8 +9,13 @@ import type {
 } from "./agent-sdk-types.js";
 import { isConversationRolloverFailureKind } from "./context-overflow.js";
 import type { AgentManager, ManagedAgent } from "./agent-manager.js";
-import type { AgentStorage } from "./agent-storage.js";
+import {
+  isStoredPendingPromptPreflight,
+  type AgentStorage,
+  type StoredPendingAgentPrompt,
+} from "./agent-storage.js";
 import { ensureAgentLoaded } from "./agent-loading.js";
+import { isInternalPromptPreflightId } from "./prompt-preflight.js";
 import { getParentAgentIdFromLabels } from "@getpaseo/protocol/agent-labels";
 import type { ActiveTurnBehavior } from "@getpaseo/protocol/messages";
 
@@ -296,6 +301,20 @@ export async function resumePendingAgentPrompts(params: {
               // is identity and history, not proof of completion.
               continue;
             }
+            if (isStoredPendingPromptPreflight(pending)) {
+              if (record.completedPromptPreflightIds.includes(pending.id)) {
+                // An exact durable boundary receipt proves this synthetic
+                // compact completed before the daemon exited. Never infer that
+                // from a token count that might be stale or independently saved.
+                await params.agentStorage.settlePendingPromptPreflight(record.id, pending.id, {
+                  clearContextUsage: true,
+                });
+                params.agentManager.clearPromptAdmissionContextUsage(record.id);
+                continue;
+              }
+              await params.agentStorage.releasePendingPrompt(record.id, pending.id);
+              continue;
+            }
             if (params.agentManager.hasSubmittedPrompt(record.id, pending.id)) {
               // startTurn accepted this stable client message before the daemon
               // exited. The durable timeline is the commit record; replaying
@@ -329,6 +348,69 @@ export async function resumePendingAgentPrompts(params: {
   );
 }
 
+function promptMustUseDurableQueue(params: {
+  hasInFlightRun: boolean;
+  pendingPrompts: StoredPendingAgentPrompt[];
+  preflightRequired: boolean;
+  requestedQueue: boolean;
+  unsafeSteer: boolean;
+  replaceBlockedPermission: boolean;
+}): boolean {
+  const pendingHead = params.pendingPrompts[0];
+  const preflightInFlight =
+    params.hasInFlightRun &&
+    pendingHead?.state === "dispatching" &&
+    isStoredPendingPromptPreflight(pendingHead);
+  const hasBlockingPendingPrompt =
+    Boolean(pendingHead) &&
+    (pendingHead?.state === "queued" ||
+      !params.hasInFlightRun ||
+      preflightInFlight ||
+      params.pendingPrompts.length > 1) &&
+    !params.replaceBlockedPermission;
+  return (
+    preflightInFlight ||
+    hasBlockingPendingPrompt ||
+    params.preflightRequired ||
+    params.requestedQueue ||
+    (params.unsafeSteer && !params.replaceBlockedPermission)
+  );
+}
+
+async function enqueuePromptForDrain(
+  params: SendPromptToAgentParams,
+): Promise<{ disposition: "queued" }> {
+  const promptId = params.messageId ?? randomUUID();
+  if (params.agentManager.hasSubmittedPrompt(params.agentId, promptId)) {
+    params.logger.info(
+      { agentId: params.agentId, messageId: promptId },
+      "Ignored duplicate prompt that was already accepted",
+    );
+    return { disposition: "queued" };
+  }
+
+  const queued = await params.agentStorage.enqueuePendingPrompt(params.agentId, {
+    id: promptId,
+    prompt: params.prompt,
+  });
+  params.logger.info(
+    { agentId: params.agentId, messageId: promptId, position: queued.position },
+    "Persisted prompt in agent FIFO",
+  );
+  void drainNextPendingPrompt({
+    agentManager: params.agentManager,
+    agentStorage: params.agentStorage,
+    agentId: params.agentId,
+    logger: params.logger,
+  }).catch((error) => {
+    params.logger.error(
+      { err: error, agentId: params.agentId },
+      "Failed to start durable prompt drain",
+    );
+  });
+  return { disposition: "queued" };
+}
+
 /**
  * Outer bound on a run reaching "started" after dispatch.
  *
@@ -360,7 +442,9 @@ export async function waitForAgentRunStartWithTimeout(
   );
 
   try {
-    await agentManager.waitForAgentRunStart(agentId, { signal: startAbort.signal });
+    await agentManager.waitForAgentRunStart(agentId, {
+      signal: startAbort.signal,
+    });
   } finally {
     clearTimeout(startTimeout);
   }
@@ -380,6 +464,9 @@ export async function waitForAgentRunStartWithTimeout(
 export async function sendPromptToAgent(
   params: SendPromptToAgentParams,
 ): Promise<{ disposition: PromptDispatchDisposition }> {
+  if (params.messageId && isInternalPromptPreflightId(params.messageId)) {
+    throw new Error("Prompt message id uses Paseo's reserved internal prefix");
+  }
   const unarchive = params.unarchive ?? true;
 
   const record = await params.agentStorage.get(params.agentId);
@@ -406,6 +493,21 @@ export async function sendPromptToAgent(
 
   return await runPromptAdmission(params.agentManager, params.agentId, async () => {
     const snapshot = params.agentManager.getAgent(params.agentId);
+    const hasInFlightRun = params.agentManager.hasInFlightRun(params.agentId);
+    // Out-of-band controls are local session state changes; they never enter
+    // the model context. Classify them before provider prompt admission. Once
+    // a provider-bound prompt is assigned to the durable FIFO below, it cannot
+    // escape through this side channel or reorder around a synthetic compact.
+    if (
+      hasInFlightRun &&
+      params.agentManager.tryRunOutOfBand(params.agentId, params.prompt, runOptions)
+    ) {
+      return { disposition: "out_of_band" as const };
+    }
+    const promptAdmission = params.agentManager.planPromptAdmission(params.agentId, params.prompt);
+    if (promptAdmission.type === "reject") {
+      throw new Error(promptAdmission.message);
+    }
     // A provider must explicitly prove that pushing input cannot open a second
     // upstream request. Otherwise the durable FIFO is the sole turn owner even
     // during the brief idle edge between two queued prompts.
@@ -414,47 +516,19 @@ export async function sendPromptToAgent(
       snapshot?.capabilities.supportsInFlightSteering !== true &&
       params.clearPendingPermissions === true &&
       Boolean(snapshot?.pendingPermissions.size);
-    const shouldQueue =
-      params.activeTurnBehavior === "queue" ||
-      (params.activeTurnBehavior === "steer" &&
-        snapshot?.capabilities.supportsInFlightSteering !== true &&
-        !replaceBlockedPermission);
+    const latestRecord = await params.agentStorage.get(params.agentId);
+    const shouldQueue = promptMustUseDurableQueue({
+      hasInFlightRun,
+      pendingPrompts: latestRecord?.pendingPrompts ?? [],
+      preflightRequired: promptAdmission.type === "preflight",
+      requestedQueue: params.activeTurnBehavior === "queue",
+      unsafeSteer:
+        params.activeTurnBehavior === "steer" &&
+        snapshot?.capabilities.supportsInFlightSteering !== true,
+      replaceBlockedPermission,
+    });
     if (shouldQueue) {
-      if (
-        params.agentManager.hasInFlightRun(params.agentId) &&
-        params.agentManager.tryRunOutOfBand(params.agentId, params.prompt, runOptions)
-      ) {
-        return { disposition: "out_of_band" as const };
-      }
-      const promptId = params.messageId ?? randomUUID();
-      if (params.agentManager.hasSubmittedPrompt(params.agentId, promptId)) {
-        params.logger.info(
-          { agentId: params.agentId, messageId: promptId },
-          "Ignored duplicate prompt that was already accepted",
-        );
-        return { disposition: "queued" as const };
-      }
-
-      const queued = await params.agentStorage.enqueuePendingPrompt(params.agentId, {
-        id: promptId,
-        prompt: params.prompt,
-      });
-      params.logger.info(
-        { agentId: params.agentId, messageId: promptId, position: queued.position },
-        "Persisted prompt in agent FIFO",
-      );
-      void drainNextPendingPrompt({
-        agentManager: params.agentManager,
-        agentStorage: params.agentStorage,
-        agentId: params.agentId,
-        logger: params.logger,
-      }).catch((error) => {
-        params.logger.error(
-          { err: error, agentId: params.agentId },
-          "Failed to start durable prompt drain",
-        );
-      });
-      return { disposition: "queued" as const };
+      return await enqueuePromptForDrain(params);
     }
 
     return await startAgentRun(params.agentManager, params.agentId, params.prompt, params.logger, {

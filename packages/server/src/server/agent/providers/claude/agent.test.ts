@@ -17,7 +17,12 @@ import {
 } from "./agent.js";
 import { claudeProjectDirSync } from "./project-dir.js";
 import { streamSession } from "../test-utils/session-stream-adapter.js";
-import type { AgentSession, AgentTimelineItem, AgentStreamEvent } from "../../agent-sdk-types.js";
+import type {
+  AgentRunOptions,
+  AgentSession,
+  AgentTimelineItem,
+  AgentStreamEvent,
+} from "../../agent-sdk-types.js";
 
 interface TestClaudeSession {
   translateMessageToEvents(message: SDKMessage): AgentStreamEvent[];
@@ -125,6 +130,44 @@ describe("convertClaudeHistoryEntry", () => {
         type: "user_message",
         text: "Run npm test",
       },
+    ]);
+  });
+
+  test("hides Paseo's internal context preflight while retaining compact boundaries", () => {
+    const entry = {
+      type: "user",
+      uuid: "f17ecafe-1234-5678-abcd-123456789abc",
+      message: {
+        role: "user",
+        content:
+          "/compact [PASEO_INTERNAL_CONTEXT_PREFLIGHT] Preserve the active goal and next steps.",
+      },
+    };
+
+    expect(convertClaudeHistoryEntry(entry, () => [])).toEqual([]);
+  });
+
+  test("does not hide a user message that merely quotes the internal preflight marker", () => {
+    const text =
+      "This log says /compact [PASEO_INTERNAL_CONTEXT_PREFLIGHT], but keep my message visible.";
+    const entry = {
+      type: "user",
+      message: { role: "user", content: text },
+    };
+
+    expect(convertClaudeHistoryEntry(entry, () => [])).toEqual([{ type: "user_message", text }]);
+  });
+
+  test("uses reserved message identity rather than text to hide an exact marker", () => {
+    const text = "/compact [PASEO_INTERNAL_CONTEXT_PREFLIGHT] typed by a user";
+    const entry = {
+      type: "user",
+      uuid: "12345678-1234-5678-abcd-123456789abc",
+      message: { role: "user", content: text },
+    };
+
+    expect(convertClaudeHistoryEntry(entry, () => [])).toEqual([
+      { type: "user_message", text, messageId: entry.uuid },
     ]);
   });
 
@@ -643,7 +686,11 @@ describe("ClaudeAgentSession features", () => {
       logger,
       queryFactory,
       resolveBinary: async () => "/test/claude/bin",
-    }).createSession({ provider: "claude", cwd: process.cwd(), modeId: "default" });
+    }).createSession({
+      provider: "claude",
+      cwd: process.cwd(),
+      modeId: "default",
+    });
     const events: AgentStreamEvent[] = [];
     const unsubscribe = session.subscribe((event) => events.push(event));
 
@@ -664,7 +711,10 @@ describe("ClaudeAgentSession features", () => {
         type: "permission_resolved",
         provider: "claude",
         requestId: expect.any(String),
-        resolution: { behavior: "deny", message: "Permission request canceled" },
+        resolution: {
+          behavior: "deny",
+          message: "Permission request canceled",
+        },
       });
       expect(session.getPendingPermissions()).toEqual([]);
     } finally {
@@ -679,7 +729,11 @@ describe("ClaudeAgentSession features", () => {
       logger,
       queryFactory,
       resolveBinary: async () => "/test/claude/bin",
-    }).createSession({ provider: "claude", cwd: process.cwd(), modeId: "default" });
+    }).createSession({
+      provider: "claude",
+      cwd: process.cwd(),
+      modeId: "default",
+    });
     const events: AgentStreamEvent[] = [];
     const unsubscribe = session.subscribe((event) => events.push(event));
 
@@ -701,7 +755,10 @@ describe("ClaudeAgentSession features", () => {
       expect(events.filter(isPermissionResolvedEvent)).toEqual([
         expect.objectContaining({
           provider: "claude",
-          resolution: { behavior: "deny", message: "Permission request canceled" },
+          resolution: {
+            behavior: "deny",
+            message: "Permission request canceled",
+          },
         }),
       ]);
       expect(session.getPendingPermissions()).toEqual([]);
@@ -773,7 +830,10 @@ describe("ClaudeAgentSession features", () => {
   });
 
   test("lists fast mode only for supported Opus models", async () => {
-    const client = new ClaudeAgentClient({ logger, resolveBinary: async () => "/test/claude/bin" });
+    const client = new ClaudeAgentClient({
+      logger,
+      resolveBinary: async () => "/test/claude/bin",
+    });
 
     await expect(
       client.listFeatures({
@@ -854,8 +914,12 @@ describe("ClaudeAgentSession features", () => {
       ).ensureQuery(),
     ).resolves.toBeDefined();
 
-    expect(queryFactory.mock.calls[0]?.[0].options.settings).toMatchObject({ fastMode: true });
-    expect(queryMock.applyFlagSettings).toHaveBeenCalledWith({ fastMode: true });
+    expect(queryFactory.mock.calls[0]?.[0].options.settings).toMatchObject({
+      fastMode: true,
+    });
+    expect(queryMock.applyFlagSettings).toHaveBeenCalledWith({
+      fastMode: true,
+    });
 
     await session.close();
   });
@@ -918,14 +982,19 @@ describe("ClaudeAgentSession features", () => {
       queryFactory,
       resolveBinary: async () => "/test/claude/bin",
     });
-    const session = await client.createSession({ provider: "claude", cwd: process.cwd() });
+    const session = await client.createSession({
+      provider: "claude",
+      cwd: process.cwd(),
+    });
     const events: AgentStreamEvent[] = [];
     const unsubscribe = session.subscribe((event) => events.push(event));
     try {
       const { turnId } = await session.startTurn("first turn");
       const input = queryFactory.mock.calls[0]?.[0].prompt as AsyncIterable<SDKUserMessage>;
       const iterator = input[Symbol.asyncIterator]();
-      await expect(iterator.next()).resolves.toMatchObject({ value: { type: "user" } });
+      await expect(iterator.next()).resolves.toMatchObject({
+        value: { type: "user" },
+      });
 
       await expect(
         session.steerActiveTurn?.("same turn follow-up", {
@@ -943,7 +1012,9 @@ describe("ClaudeAgentSession features", () => {
       expect(events.filter((event) => event.type === "turn_started")).toHaveLength(1);
 
       await expect(
-        session.steerActiveTurn?.("/rewind submitted-message-id", { expectedTurnId: turnId }),
+        session.steerActiveTurn?.("/rewind submitted-message-id", {
+          expectedTurnId: turnId,
+        }),
       ).resolves.toEqual({ status: "unavailable" });
       let rewindReachedLiveInput = false;
       void iterator.next().then(() => {
@@ -966,7 +1037,10 @@ describe("ClaudeAgentSession features", () => {
       queryFactory,
       resolveBinary: async () => "/test/claude/bin",
     });
-    const session = await client.createSession({ provider: "claude", cwd: process.cwd() });
+    const session = await client.createSession({
+      provider: "claude",
+      cwd: process.cwd(),
+    });
     const internal = session as unknown as {
       handlePermissionRequest(
         name: string,
@@ -1025,8 +1099,13 @@ describe("ClaudeAgentSession features", () => {
       );
       expect(session.getPendingPermissions()).toHaveLength(1);
       const requestId = session.getPendingPermissions()[0]!.id;
-      await session.respondToPermission(requestId, { behavior: "deny", message: "test cleanup" });
-      await expect(laterPermission).resolves.toMatchObject({ behavior: "deny" });
+      await session.respondToPermission(requestId, {
+        behavior: "deny",
+        message: "test cleanup",
+      });
+      await expect(laterPermission).resolves.toMatchObject({
+        behavior: "deny",
+      });
     } finally {
       await session.close();
     }
@@ -1039,7 +1118,10 @@ describe("ClaudeAgentSession features", () => {
       queryFactory,
       resolveBinary: async () => "/test/claude/bin",
     });
-    const session = await client.createSession({ provider: "claude", cwd: process.cwd() });
+    const session = await client.createSession({
+      provider: "claude",
+      cwd: process.cwd(),
+    });
     const internal = session as unknown as {
       handlePermissionRequest(
         name: string,
@@ -1052,11 +1134,16 @@ describe("ClaudeAgentSession features", () => {
       const { turnId } = await session.startTurn("first turn");
       const permission = internal.handlePermissionRequest("Write", {}, { toolUseID: "tool-1" });
       await expect(
-        session.steerActiveTurn?.("system notification", { expectedTurnId: turnId }),
+        session.steerActiveTurn?.("system notification", {
+          expectedTurnId: turnId,
+        }),
       ).resolves.toEqual({ status: "accepted" });
       expect(session.getPendingPermissions()).toHaveLength(1);
       const requestId = session.getPendingPermissions()[0]!.id;
-      await session.respondToPermission(requestId, { behavior: "deny", message: "test cleanup" });
+      await session.respondToPermission(requestId, {
+        behavior: "deny",
+        message: "test cleanup",
+      });
       await expect(permission).resolves.toMatchObject({ behavior: "deny" });
     } finally {
       await session.close();
@@ -1175,7 +1262,9 @@ describe("ClaudeAgentSession features", () => {
     await session.setFeature?.("fast_mode", true);
 
     expect(queryFactory).toHaveBeenCalledTimes(1);
-    expect(queryMock.applyFlagSettings).toHaveBeenLastCalledWith({ fastMode: true });
+    expect(queryMock.applyFlagSettings).toHaveBeenLastCalledWith({
+      fastMode: true,
+    });
     expect(queryMock.close).not.toHaveBeenCalled();
     expect(queryMock.return).not.toHaveBeenCalled();
 
@@ -1498,8 +1587,12 @@ describe("ClaudeAgentClient.listImportableSessions", () => {
       const busyCwd = path.join(tmpConfigDir, "busy-project");
       await fs.mkdir(requestedCwd, { recursive: true });
       await fs.mkdir(busyCwd, { recursive: true });
-      const requestedProjectDir = claudeProjectDirSync(requestedCwd, { configDir: tmpConfigDir });
-      const busyProjectDir = claudeProjectDirSync(busyCwd, { configDir: tmpConfigDir });
+      const requestedProjectDir = claudeProjectDirSync(requestedCwd, {
+        configDir: tmpConfigDir,
+      });
+      const busyProjectDir = claudeProjectDirSync(busyCwd, {
+        configDir: tmpConfigDir,
+      });
       await fs.mkdir(requestedProjectDir, { recursive: true });
       await fs.mkdir(busyProjectDir, { recursive: true });
 
@@ -1657,7 +1750,10 @@ describe("ClaudeAgentSession context window usage", () => {
   }
 
   async function createSessionForTest(): Promise<TestClaudeSession> {
-    const client = new ClaudeAgentClient({ logger, resolveBinary: async () => "/test/claude/bin" });
+    const client = new ClaudeAgentClient({
+      logger,
+      resolveBinary: async () => "/test/claude/bin",
+    });
     const session = await client.createSession({
       provider: "claude",
       cwd: process.cwd(),
@@ -1692,7 +1788,10 @@ describe("ClaudeAgentSession context window usage", () => {
               type: "tool_use",
               id: "task-create-1",
               name: "TaskCreate",
-              input: { subject: "Inspect provider", activeForm: "Inspecting provider" },
+              input: {
+                subject: "Inspect provider",
+                activeForm: "Inspecting provider",
+              },
             },
           ],
         },
@@ -1701,7 +1800,13 @@ describe("ClaudeAgentSession context window usage", () => {
       const events = session.translateMessageToEvents({
         type: "user",
         message: {
-          content: [{ type: "tool_result", tool_use_id: "task-create-1", content: "created" }],
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "task-create-1",
+              content: "created",
+            },
+          ],
         },
         toolUseResult: { task: { id: "1", subject: "Inspect provider" } },
       } as unknown as SDKMessage);
@@ -1727,9 +1832,13 @@ describe("ClaudeAgentSession context window usage", () => {
     }
   });
 
-  async function collectStreamEvents(session: AgentSession, prompt = "turn") {
+  async function collectStreamEvents(
+    session: AgentSession,
+    prompt = "turn",
+    options?: AgentRunOptions,
+  ) {
     const events: AgentStreamEvent[] = [];
-    for await (const event of streamSession(session, prompt)) {
+    for await (const event of streamSession(session, prompt, options)) {
       events.push(event);
     }
     return events;
@@ -1945,6 +2054,72 @@ describe("ClaudeAgentSession context window usage", () => {
     await session.close();
   });
 
+  test("hides a live internal compact prompt and its summary but emits the compact boundary", async () => {
+    const compactSummary = {
+      type: "user",
+      isCompactSummary: true,
+      uuid: "compact-summary-1",
+      session_id: "session-1",
+      message: {
+        role: "user",
+        content: [{ type: "text", text: "Internal compact summary that must stay hidden" }],
+      },
+    };
+    const session = await createSessionForTurns([
+      [createCompactBoundary(), compactSummary, createSuccessResult()],
+    ]);
+
+    const events = await collectStreamEvents(
+      session,
+      "/compact [PASEO_INTERNAL_CONTEXT_PREFLIGHT] preserve state",
+      { clientMessageId: "paseo-internal-preflight:test:claude_context_compaction" },
+    );
+
+    expect(
+      events.filter(
+        (event) =>
+          event.type === "timeline" &&
+          (event.item.type === "user_message" || event.item.type === "assistant_message"),
+      ),
+    ).toEqual([]);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "timeline",
+        item: expect.objectContaining({ type: "compaction", status: "completed" }),
+      }),
+    );
+    expect(events).toContainEqual(expect.objectContaining({ type: "turn_completed" }));
+    await session.close();
+  });
+
+  test("does not let a user-supplied reserved UUID hide a direct prompt", async () => {
+    const session = await createSessionForTurns([[]]);
+    const events: AgentStreamEvent[] = [];
+    const unsubscribe = session.subscribe((event) => events.push(event));
+    await session.startTurn("keep this user turn visible", {
+      clientMessageId: "f17ecafe-1234-5678-abcd-123456789abc",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    unsubscribe();
+
+    const userMessage = events.find(
+      (event) => event.type === "timeline" && event.item.type === "user_message",
+    );
+    expect(userMessage).toMatchObject({
+      type: "timeline",
+      item: {
+        type: "user_message",
+        text: "keep this user turn visible",
+        clientMessageId: "f17ecafe-1234-5678-abcd-123456789abc",
+      },
+    });
+    if (userMessage?.type !== "timeline" || userMessage.item.type !== "user_message") {
+      throw new Error("Expected visible user message");
+    }
+    expect(userMessage.item.messageId).not.toMatch(/^f17ecafe-/);
+    await session.close();
+  });
+
   test("passes persistSession through to the Claude SDK query options", async () => {
     const createResultTurn = (sessionId: string) => [
       {
@@ -2054,7 +2229,10 @@ describe("ClaudeAgentSession context window usage", () => {
       queryFactory,
       resolveBinary: async () => "/test/claude/bin",
     });
-    const session = await client.createSession({ provider: "claude", cwd: process.cwd() });
+    const session = await client.createSession({
+      provider: "claude",
+      cwd: process.cwd(),
+    });
 
     const commands = await session.listCommands();
     await session.close();
@@ -3007,7 +3185,10 @@ describe("Claude question permission notifications", () => {
       logger: createTestLogger(),
       resolveBinary: async () => "/test/claude/bin",
     });
-    const session = await client.createSession({ provider: "claude", cwd: process.cwd() });
+    const session = await client.createSession({
+      provider: "claude",
+      cwd: process.cwd(),
+    });
     const events: AgentStreamEvent[] = [];
     session.subscribe((event) => events.push(event));
 

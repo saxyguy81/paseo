@@ -96,6 +96,8 @@ export function toStoredAgentRecord(
     internal: options?.internal,
     owner: agent.owner,
     pendingPrompts: [],
+    completedPromptPreflightIds: [],
+    lastUsage: sanitizeUsage(agent.lastUsage),
   } satisfies StoredAgentRecord;
 }
 
@@ -465,7 +467,11 @@ function assignFiniteNumber(
   field: UsageNumericField,
 ): boolean {
   const raw = source[field];
-  if (typeof raw === "number" && Number.isFinite(raw)) {
+  if (
+    typeof raw === "number" &&
+    Number.isFinite(raw) &&
+    (field !== "contextWindowUsedTokens" || raw >= 0)
+  ) {
     target[field] = raw;
     return true;
   }

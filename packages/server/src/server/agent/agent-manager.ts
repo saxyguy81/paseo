@@ -38,6 +38,7 @@ import {
   type AgentPermissionResponse,
   type AgentPermissionResult,
   type AgentPersistenceHandle,
+  type AgentPromptAdmissionDecision,
   type AgentProviderNotice,
   type AgentPromptInput,
   type AgentProvider,
@@ -56,7 +57,8 @@ import {
   type ListImportableSessionsOptions,
 } from "./agent-sdk-types.js";
 import { buildArchivedAgentRecord, type ArchivedStoredAgentRecord } from "./agent-archive.js";
-import type { StoredAgentRecord, AgentStorage } from "./agent-storage.js";
+import { isStoredPendingPromptPreflight } from "./agent-storage.js";
+import type { StoredAgentRecord, StoredPendingAgentPrompt, AgentStorage } from "./agent-storage.js";
 import type { AgentOwner } from "./agent-owner.js";
 import {
   InMemoryAgentTimelineStore,
@@ -1042,7 +1044,17 @@ export class AgentManager {
   }
 
   hasSubmittedPrompt(agentId: string, clientMessageId: string): boolean {
-    return Boolean(this.timelineStore.getSubmittedUserMessage(agentId, clientMessageId));
+    const row = this.timelineStore.getSubmittedUserMessage(agentId, clientMessageId);
+    return row?.item.type === "user_message" && row.item.deliveryStatus !== "rejected";
+  }
+
+  planPromptAdmission(agentId: string, prompt: AgentPromptInput): AgentPromptAdmissionDecision {
+    const agent = this.requireSessionAgent(agentId);
+    return (
+      agent.session.planPromptAdmission?.(prompt, agent.lastUsage) ?? {
+        type: "dispatch",
+      }
+    );
   }
 
   /**
@@ -1071,66 +1083,225 @@ export class AgentManager {
     while (!this.hasInFlightRun(agentId)) {
       const pending = await registry.claimPendingPrompt(agentId);
       if (!pending) return;
+      const admission = await this.prepareStoredPromptAdmission(agentId, pending, registry);
+      if (admission === "continue") continue;
+      if (admission === "stop") return;
 
-      const replayingSubmittedPrompt =
-        pending.attemptCount > 1 && this.hasSubmittedPrompt(agentId, pending.id);
-      const prompt = replayingSubmittedPrompt ? TRANSIENT_PROMPT_RECOVERY_PROMPT : pending.prompt;
-
-      let started = false;
-      let terminal: "completed" | "failed" | "canceled" | null = null;
-      let failureKind: Extract<AgentStreamEvent, { type: "turn_failed" }>["failureKind"];
-      try {
-        // A recovery prompt is a system continuation of a user message already in both
-        // timelines. Do not reuse that message's provider UUID or append a second user row.
-        const runOptions = replayingSubmittedPrompt ? undefined : { clientMessageId: pending.id };
-        for await (const event of this.streamAgent(agentId, prompt, runOptions)) {
-          if (event.type === "turn_started") started = true;
-          if (event.type === "turn_completed") terminal = "completed";
-          if (event.type === "turn_canceled") terminal = "canceled";
-          if (event.type === "turn_failed") {
-            terminal = "failed";
-            failureKind = event.failureKind;
-          }
-        }
-      } catch (error) {
-        if (!started) {
-          await registry.releasePendingPrompt(agentId, pending.id);
-        } else {
-          await registry.completePendingPrompt(agentId, pending.id);
-        }
-        this.logger.error(
-          { err: error, agentId, messageId: pending.id, started },
-          "Durable queued prompt failed to settle",
-        );
-        if (!started) return;
-        continue;
-      }
-
-      if (!started) {
-        await registry.releasePendingPrompt(agentId, pending.id);
-        return;
-      }
-      if (failureKind === "retryable_api") {
-        await registry.releasePendingPrompt(agentId, pending.id);
-        this.scheduleTransientPromptRetry(agentId, pending.attemptCount);
-        return;
-      }
-      await registry.completePendingPrompt(agentId, pending.id);
-      if (terminal === null) {
-        this.logger.error(
-          { agentId, messageId: pending.id },
-          "Durable queued prompt ended without a terminal event",
-        );
-        continue;
-      }
-      if (isConversationRolloverFailureKind(failureKind)) {
-        // The rollover task transfers the remaining FIFO to the fresh family
-        // member and that member drains it after its bounded handoff settles.
-        return;
-      }
-      // A failed or canceled prompt is terminal too. Its error remains in the
-      // timeline; it must not wedge unrelated messages behind it forever.
+      const observation = await this.observeStoredPromptRun(agentId, pending, registry);
+      const shouldContinue = isStoredPendingPromptPreflight(pending)
+        ? await this.settleStoredPreflight(agentId, pending, observation, registry)
+        : await this.settleStoredUserPrompt(agentId, pending, observation, registry);
+      if (!shouldContinue) return;
     }
+  }
+
+  private async prepareStoredPromptAdmission(
+    agentId: string,
+    pending: StoredPendingAgentPrompt,
+    registry: AgentStorage,
+  ): Promise<"ready" | "continue" | "stop"> {
+    if (isStoredPendingPromptPreflight(pending)) return "ready";
+    let admission: AgentPromptAdmissionDecision;
+    try {
+      admission = this.planPromptAdmission(agentId, pending.prompt);
+      if (admission.type === "preflight") {
+        await registry.insertPendingPromptPreflight(agentId, pending.id, admission);
+      }
+    } catch (error) {
+      // No provider request was opened. Restore the durable claim so a later
+      // daemon recovery or explicit send can retry it exactly once.
+      await registry.releasePendingPrompt(agentId, pending.id);
+      this.logger.error(
+        { err: error, agentId, messageId: pending.id },
+        "Failed to prepare durable prompt admission",
+      );
+      return "stop";
+    }
+    if (admission.type === "dispatch") return "ready";
+    if (admission.type === "preflight") return "continue";
+
+    // This item can never become dispatchable without changing the message.
+    // Persist it as locally rejected before removing its FIFO claim. The
+    // rejected delivery status is deliberately not provider-submission proof.
+    const agent = this.requireSessionAgent(agentId);
+    try {
+      this.recordSubmittedPrompt(agent, pending.prompt, pending.id, {
+        deliveryStatus: "rejected",
+      });
+      await this.flush();
+      await registry.completePendingPrompt(agentId, pending.id);
+    } catch (error) {
+      await registry.releasePendingPrompt(agentId, pending.id);
+      this.logger.error(
+        { err: error, agentId, messageId: pending.id },
+        "Failed to persist rejected durable prompt",
+      );
+      return "stop";
+    }
+    try {
+      await this.handleStreamEvent(agent, {
+        type: "turn_failed",
+        provider: agent.provider,
+        error: admission.message,
+        code: "prompt_admission_rejected",
+      });
+    } catch (error) {
+      // The durable rejected user row is the authoritative record. A
+      // notification failure must not resurrect it as provider work.
+      this.logger.error(
+        { err: error, agentId, messageId: pending.id },
+        "Failed to publish prompt admission rejection",
+      );
+    }
+    return "continue";
+  }
+
+  private async observeStoredPromptRun(
+    agentId: string,
+    pending: StoredPendingAgentPrompt,
+    registry: AgentStorage,
+  ): Promise<{
+    started: boolean;
+    terminal: "completed" | "failed" | "canceled" | null;
+    failureKind?: Extract<AgentStreamEvent, { type: "turn_failed" }>["failureKind"];
+    preflightBoundaryObserved: boolean;
+    error?: unknown;
+  }> {
+    const preflight = isStoredPendingPromptPreflight(pending);
+    const replayingSubmittedPrompt = !preflight && this.hasSubmittedPrompt(agentId, pending.id);
+    const prompt = replayingSubmittedPrompt ? TRANSIENT_PROMPT_RECOVERY_PROMPT : pending.prompt;
+    const observation: {
+      started: boolean;
+      terminal: "completed" | "failed" | "canceled" | null;
+      failureKind?: Extract<AgentStreamEvent, { type: "turn_failed" }>["failureKind"];
+      preflightBoundaryObserved: boolean;
+      error?: unknown;
+    } = {
+      started: false,
+      terminal: null,
+      preflightBoundaryObserved: false,
+    };
+    // A recovery prompt is a system continuation of a user message already in both
+    // timelines. Do not reuse that message's provider UUID or append a second user row.
+    const runOptions = replayingSubmittedPrompt ? undefined : { clientMessageId: pending.id };
+    try {
+      for await (const event of this.streamAgent(agentId, prompt, runOptions)) {
+        if (event.type === "turn_started") observation.started = true;
+        if (event.type === "turn_completed") observation.terminal = "completed";
+        if (event.type === "turn_canceled") observation.terminal = "canceled";
+        if (event.type === "turn_failed") {
+          observation.terminal = "failed";
+          observation.failureKind = event.failureKind;
+        }
+        if (
+          preflight &&
+          event.type === "timeline" &&
+          event.item.type === "compaction" &&
+          event.item.status === "completed"
+        ) {
+          observation.preflightBoundaryObserved = true;
+          await registry.recordPendingPromptPreflightBoundary(agentId, pending.id);
+        }
+      }
+    } catch (error) {
+      observation.error = error;
+    }
+    return observation;
+  }
+
+  private async settleStoredPreflight(
+    agentId: string,
+    pending: StoredPendingAgentPrompt,
+    observation: Awaited<ReturnType<AgentManager["observeStoredPromptRun"]>>,
+    registry: AgentStorage,
+  ): Promise<boolean> {
+    const { error, failureKind, preflightBoundaryObserved, started, terminal } = observation;
+    if (error) {
+      if (preflightBoundaryObserved) {
+        await registry.settlePendingPromptPreflight(agentId, pending.id, {
+          clearContextUsage: true,
+        });
+        this.clearPromptAdmissionContextUsage(agentId);
+      } else if (!started) {
+        await registry.releasePendingPrompt(agentId, pending.id);
+      } else {
+        await registry.settlePendingPromptPreflight(agentId, pending.id);
+      }
+      this.logger.error(
+        { err: error, agentId, preflightId: pending.id, started },
+        "Context preflight failed to settle",
+      );
+      // A thrown stream error without a clean terminal event has no reliable
+      // failure classification. Continue only when the stream also delivered
+      // a clean completion; otherwise stop rather than race rollover/recovery.
+      return preflightBoundaryObserved && terminal === "completed";
+    }
+    if (preflightBoundaryObserved || terminal === "completed") {
+      await registry.settlePendingPromptPreflight(agentId, pending.id, {
+        clearContextUsage: true,
+      });
+      this.clearPromptAdmissionContextUsage(agentId);
+      return !isConversationRolloverFailureKind(failureKind);
+    }
+    if (failureKind === "retryable_api" && pending.attemptCount < 2) {
+      await registry.releasePendingPrompt(agentId, pending.id);
+      this.scheduleTransientPromptRetry(agentId, pending.attemptCount);
+      return false;
+    }
+    await registry.settlePendingPromptPreflight(agentId, pending.id);
+    // The original user item remains queued, and the measured high-context
+    // usage stays intact. A later explicit send or daemon recovery must run a
+    // fresh preflight before dispatching it; it must not silently bypass the
+    // safety margin after authentication, model, quota, or cancellation errors.
+    return false;
+  }
+
+  clearPromptAdmissionContextUsage(agentId: string): void {
+    const agent = this.agents.get(agentId);
+    if (!agent) return;
+    if (agent.lastUsage?.contextWindowUsedTokens === undefined) return;
+    const remainingUsage = { ...agent.lastUsage };
+    delete remainingUsage.contextWindowUsedTokens;
+    agent.lastUsage = Object.keys(remainingUsage).length ? remainingUsage : undefined;
+    this.emitState(agent);
+  }
+
+  private async settleStoredUserPrompt(
+    agentId: string,
+    pending: StoredPendingAgentPrompt,
+    observation: Awaited<ReturnType<AgentManager["observeStoredPromptRun"]>>,
+    registry: AgentStorage,
+  ): Promise<boolean> {
+    const { error, failureKind, started, terminal } = observation;
+    if (error) {
+      if (started) await registry.completePendingPrompt(agentId, pending.id);
+      else await registry.releasePendingPrompt(agentId, pending.id);
+      this.logger.error(
+        { err: error, agentId, messageId: pending.id, started },
+        "Durable queued prompt failed to settle",
+      );
+      return started;
+    }
+    if (!started) {
+      await registry.releasePendingPrompt(agentId, pending.id);
+      return false;
+    }
+    if (failureKind === "retryable_api") {
+      await registry.releasePendingPrompt(agentId, pending.id);
+      this.scheduleTransientPromptRetry(agentId, pending.attemptCount);
+      return false;
+    }
+    await registry.completePendingPrompt(agentId, pending.id);
+    if (terminal === null) {
+      this.logger.error(
+        { agentId, messageId: pending.id },
+        "Durable queued prompt ended without a terminal event",
+      );
+      return true;
+    }
+    // The rollover task transfers the remaining FIFO to the fresh family
+    // member and that member drains it after its bounded handoff settles.
+    return !isConversationRolloverFailureKind(failureKind);
   }
 
   private scheduleTransientPromptRetry(agentId: string, attemptCount: number): void {
@@ -1781,6 +1952,7 @@ export class AgentManager {
       labels?: Record<string, string>;
       workspaceId?: string;
       owner?: AgentOwner;
+      lastUsage?: AgentUsage;
       lastError?: string;
       lastFailureKind?: ConversationRolloverFailureKind;
     },
@@ -1802,6 +1974,7 @@ export class AgentManager {
       labels?: Record<string, string>;
       workspaceId?: string;
       owner?: AgentOwner;
+      lastUsage?: AgentUsage;
       lastError?: string;
       lastFailureKind?: ConversationRolloverFailureKind;
     },
@@ -2295,7 +2468,7 @@ export class AgentManager {
         persistence: record.persistence ?? null,
         historyPrimed: true,
         lastUserMessageAt: record.lastUserMessageAt ? new Date(record.lastUserMessageAt) : null,
-        lastUsage: undefined,
+        lastUsage: record.lastUsage,
         lastError: record.lastError ?? undefined,
         lastFailureKind: record.lastFailureKind ?? undefined,
         attention: { requiresAttention: false },
@@ -5100,9 +5273,22 @@ export class AgentManager {
       messageId?: string;
       providerMessageId?: string;
       turnId?: string;
+      deliveryStatus?: "rejected";
     },
   ): void {
-    if (this.timelineStore.getSubmittedUserMessage(agent.id, clientMessageId)) {
+    const existing = this.timelineStore.getSubmittedUserMessage(agent.id, clientMessageId);
+    if (existing) {
+      if (
+        existing.item.type === "user_message" &&
+        existing.item.deliveryStatus === "rejected" &&
+        options?.deliveryStatus !== "rejected"
+      ) {
+        const submitted = this.timelineStore.markUserMessageProviderSubmitted(
+          agent.id,
+          clientMessageId,
+        );
+        if (submitted) this.enqueueDurableTimelineUpdate(agent.id, submitted);
+      }
       return;
     }
     this.touchUpdatedAt(agent);
@@ -5111,6 +5297,7 @@ export class AgentManager {
       type: "user_message",
       text: submittedPromptText(prompt),
       clientMessageId,
+      ...(options?.deliveryStatus ? { deliveryStatus: options.deliveryStatus } : {}),
       ...(options?.messageId ? { messageId: options.messageId } : {}),
     };
     this.recordAndDispatchTimelineItem(agent.id, item, agent.provider, options?.turnId, options);
