@@ -2092,6 +2092,47 @@ describe("ClaudeAgentSession context window usage", () => {
     await session.close();
   });
 
+  test("emits one loading item for repeated compaction status frames", async () => {
+    const session = await createSessionForTest();
+    const compactingStatus = {
+      type: "system",
+      subtype: "status",
+      status: "compacting",
+      session_id: "session-1",
+    } as unknown as SDKMessage;
+
+    try {
+      const firstStatusEvents = session.translateMessageToEvents(compactingStatus);
+      const repeatedStatusEvents = session.translateMessageToEvents(compactingStatus);
+      const boundaryEvents = session.translateMessageToEvents(createCompactBoundary());
+      const nextCompactionEvents = session.translateMessageToEvents(compactingStatus);
+
+      expect(firstStatusEvents).toContainEqual({
+        type: "timeline",
+        provider: "claude",
+        item: { type: "compaction", status: "loading" },
+      });
+      expect(
+        repeatedStatusEvents.filter(
+          (event) => event.type === "timeline" && event.item.type === "compaction",
+        ),
+      ).toEqual([]);
+      expect(boundaryEvents).toContainEqual(
+        expect.objectContaining({
+          type: "timeline",
+          item: expect.objectContaining({ type: "compaction", status: "completed" }),
+        }),
+      );
+      expect(nextCompactionEvents).toContainEqual({
+        type: "timeline",
+        provider: "claude",
+        item: { type: "compaction", status: "loading" },
+      });
+    } finally {
+      await session.close();
+    }
+  });
+
   test("does not let a user-supplied reserved UUID hide a direct prompt", async () => {
     const session = await createSessionForTurns([[]]);
     const events: AgentStreamEvent[] = [];

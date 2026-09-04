@@ -440,6 +440,36 @@ function removeUserMessageAt(items: UserMessageItem[], index: number): UserMessa
   return [...items.slice(0, index), ...items.slice(index + 1)];
 }
 
+function mergeCompactionLoadingState(
+  state: StreamItem[],
+  item: Pick<CompactionItem, "status" | "trigger" | "preTokens">,
+  timelineCursor?: TimelinePosition,
+): StreamItem[] | null {
+  const loadingIdx = state.findIndex(
+    (candidate) => candidate.kind === "compaction" && candidate.status === "loading",
+  );
+  const existing = loadingIdx >= 0 ? state[loadingIdx] : undefined;
+  if (loadingIdx < 0 || !existing || existing.kind !== "compaction") {
+    return null;
+  }
+
+  const updated: CompactionItem = {
+    ...existing,
+    ...(timelineCursor ? { timelineCursor } : {}),
+    status: item.status,
+    trigger: item.trigger ?? existing.trigger,
+    preTokens: item.preTokens ?? existing.preTokens,
+  };
+  return state.reduce<StreamItem[]>((next, candidate, index) => {
+    if (index === loadingIdx) {
+      next.push(updated);
+    } else if (candidate.kind !== "compaction" || candidate.status !== "loading") {
+      next.push(candidate);
+    }
+    return next;
+  }, []);
+}
+
 function mergeRetainedLifecycleItem(tail: StreamItem[], retained: StreamItem): StreamItem[] | null {
   if (!retained.timelineCursor) {
     return null;
@@ -475,22 +505,7 @@ function mergeRetainedLifecycleItem(tail: StreamItem[], retained: StreamItem): S
     return next;
   }
   if (retained.kind === "compaction" && retained.status === "completed") {
-    const tailIndex = tail.findIndex(
-      (item) => item.kind === "compaction" && item.status === "loading",
-    );
-    const existing = tail[tailIndex];
-    if (tailIndex < 0 || !existing || existing.kind !== "compaction") {
-      return null;
-    }
-    const next = [...tail];
-    next[tailIndex] = {
-      ...existing,
-      timelineCursor: retained.timelineCursor,
-      status: "completed",
-      trigger: retained.trigger ?? existing.trigger,
-      preTokens: retained.preTokens ?? existing.preTokens,
-    };
-    return next;
+    return mergeCompactionLoadingState(tail, retained, retained.timelineCursor);
   }
   return null;
 }
@@ -1394,22 +1409,9 @@ function reduceTimelineCompaction(
   timestamp: Date,
   timelineCursor?: TimelinePosition,
 ): StreamItem[] {
-  if (item.status === "completed") {
-    const loadingIdx = state.findIndex((s) => s.kind === "compaction" && s.status === "loading");
-    const existing = loadingIdx >= 0 ? state[loadingIdx] : undefined;
-    if (loadingIdx >= 0 && existing && existing.kind === "compaction") {
-      const updated: CompactionItem = {
-        ...existing,
-        ...(timelineCursor ? { timelineCursor } : {}),
-        status: "completed",
-        trigger: item.trigger ?? existing.trigger,
-        preTokens: item.preTokens ?? existing.preTokens,
-      };
-      return [...state.slice(0, loadingIdx), updated, ...state.slice(loadingIdx + 1)];
-    }
-    if (loadingIdx >= 0) {
-      return state;
-    }
+  const merged = mergeCompactionLoadingState(state, item, timelineCursor);
+  if (merged) {
+    return merged;
   }
   const compaction: CompactionItem = {
     kind: "compaction",

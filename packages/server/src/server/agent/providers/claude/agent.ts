@@ -2284,6 +2284,7 @@ class ClaudeAgentSession implements AgentSession {
   private lastOptionsModel: string | null = null;
   private lastRuntimeModel: string | null = null;
   private compacting = false;
+  private compactionLoadingEmitted = false;
   private queryPumpPromise: Promise<void> | null = null;
   private queryRestartNeeded = false;
   private pendingInterruptAbort = false;
@@ -3863,6 +3864,7 @@ class ClaudeAgentSession implements AgentSession {
     this.activeForegroundQuery = null;
     this.activeForegroundInput = null;
     this.cancelCurrentTurn = null;
+    this.compactionLoadingEmitted = false;
     this.activeTurnHasAssistantText = false;
     this.foregroundHasProviderActivity = false;
     this.foregroundApiRecoveryAttempts = 0;
@@ -4833,15 +4835,19 @@ class ClaudeAgentSession implements AgentSession {
       const status = toObjectRecord(message)?.status;
       if (status === "compacting") {
         this.compacting = true;
-        events.push({
-          type: "timeline",
-          item: { type: "compaction", status: "loading" },
-          provider: "claude",
-        });
+        if (!this.compactionLoadingEmitted) {
+          this.compactionLoadingEmitted = true;
+          events.push({
+            type: "timeline",
+            item: { type: "compaction", status: "loading" },
+            provider: "claude",
+          });
+        }
       }
       return;
     }
     if (message.subtype === "compact_boundary") {
+      this.compactionLoadingEmitted = false;
       const compactMetadata = readCompactionMetadata(message);
       events.push({
         type: "timeline",

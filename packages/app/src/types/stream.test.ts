@@ -1150,22 +1150,31 @@ describe("stream reducer canonical tool calls", () => {
     ]);
   });
 
-  it("terminalizes the loading compaction before a completed turn", () => {
-    const state = hydrateStreamState([
+  it("coalesces repeated loading compaction events through completion", () => {
+    const loadingState = hydrateStreamState([
       {
         event: compactionTimeline("loading", "auto"),
         timestamp: new Date("2025-01-01T10:50:00Z"),
       },
       {
-        event: compactionTimeline("completed"),
+        event: compactionTimeline("loading"),
         timestamp: new Date("2025-01-01T10:50:01Z"),
       },
       {
-        event: { type: "turn_completed", provider: "codex" },
+        event: compactionTimeline("loading"),
         timestamp: new Date("2025-01-01T10:50:02Z"),
       },
     ]);
 
+    expect(
+      loadingState.filter((item) => item.kind === "compaction" && item.status === "loading"),
+    ).toHaveLength(1);
+
+    const state = reduceStreamUpdate(
+      loadingState,
+      compactionTimeline("completed"),
+      new Date("2025-01-01T10:50:03Z"),
+    );
     const compactions = state.filter(
       (item): item is Extract<StreamItem, { kind: "compaction" }> => item.kind === "compaction",
     );
