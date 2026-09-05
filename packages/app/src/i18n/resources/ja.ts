@@ -1956,6 +1956,7 @@ export const ja: TranslationResources = {
       sentTitle: "テスト通知を送信しました",
       sentDescription: "Paseo が通知をオペレーティングシステムに渡しました。",
       sendFailedTitle: "テスト通知を送信できません",
+      background: en.settings.notifications.background,
     },
     hostSections: {
       projects: "プロジェクト",

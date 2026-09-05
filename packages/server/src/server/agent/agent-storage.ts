@@ -431,6 +431,11 @@ export class AgentStorage {
       const completedPromptPreflightIds = existing.completedPromptPreflightIds.filter(
         (id) => id !== preflightId,
       );
+      // Once the compact boundary is proven, keep a one-use receipt on the
+      // target user message. This survives a daemon restart and prevents the
+      // now-unknown occupancy from scheduling the same compact indefinitely.
+      // Reuse the existing string array so rollback builds can still parse the
+      // record even though they do not understand the target-id receipt.
       if (
         options?.clearContextUsage &&
         target &&

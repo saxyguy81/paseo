@@ -1983,6 +1983,23 @@ export const en = {
       sentTitle: "Test notification sent",
       sentDescription: "Paseo handed the notification to the operating system.",
       sendFailedTitle: "Unable to send test notification",
+      background: {
+        title: "Background notifications",
+        noHost: "Connect to an updated Paseo host to enable notifications.",
+        unsupported:
+          "This browser does not support background notifications. On iPhone, install Paseo to your Home Screen first.",
+        unavailable: "This host has not enabled Web Push yet.",
+        selectedElsewhere:
+          "Background notifications are assigned to another host. Open that host's settings and turn them off before switching.",
+        denied:
+          "Notifications are blocked in this browser. Allow them in browser settings, then return here.",
+        enabled: "Paseo will alert you when an agent needs attention, finishes, or fails.",
+        disabled: "Turn this on to receive background alerts when Paseo is not open.",
+        enable: "Turn on",
+        disable: "Turn off",
+        working: "Working...",
+        updateFailed: "Notifications could not be updated",
+      },
     },
     hostSections: {
       projects: "Projects",

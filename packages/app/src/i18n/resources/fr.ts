@@ -1989,6 +1989,7 @@ export const fr: TranslationResources = {
       sentTitle: "Notification de test envoyée",
       sentDescription: "Paseo a transmis la notification au système d’exploitation.",
       sendFailedTitle: "Impossible d’envoyer la notification de test",
+      background: en.settings.notifications.background,
     },
     hostSections: {
       projects: "Projets",

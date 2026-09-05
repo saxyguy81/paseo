@@ -1809,6 +1809,62 @@ test("push token revocation only acknowledges durable removal", async () => {
   });
 });
 
+test("web push registration and possession-bound revocation are durable RPCs", async () => {
+  const renewed: Array<{ endpoint: string; revocationToken?: string }> = [];
+  const revoked: Array<{ endpoint: string; revocationToken: string }> = [];
+  const messages: SessionOutboundMessage[] = [];
+  const revocationToken = "r".repeat(43);
+  const session = createSessionForTest({
+    messages,
+    pushNotifications: asPushNotifications({
+      renewWeb: (subscription: { endpoint: string }, authority?: string) => {
+        renewed.push({ endpoint: subscription.endpoint, revocationToken: authority });
+        return revocationToken;
+      },
+      revokeWeb: (endpoint: string, authority: string) =>
+        revoked.push({ endpoint, revocationToken: authority }),
+    }),
+  });
+  const subscription = {
+    endpoint: "https://fcm.googleapis.com/wp/web-device",
+    expirationTime: null,
+    keys: { p256dh: "public-key", auth: "auth-secret" },
+  };
+
+  await session.handleMessage({
+    type: "push.web.subscribe.request",
+    requestId: "subscribe-web-1",
+    subscription,
+  });
+  await session.handleMessage({
+    type: "client_heartbeat",
+    deviceType: "web",
+    focusedAgentId: null,
+    lastActivityAt: "2026-09-05T12:00:00.000Z",
+    appVisible: false,
+  });
+  await session.handleMessage({
+    type: "push.web.unsubscribe.request",
+    requestId: "unsubscribe-web-1",
+    endpoint: subscription.endpoint,
+    revocationToken,
+  });
+
+  expect(renewed).toEqual([
+    { endpoint: subscription.endpoint, revocationToken: undefined },
+    { endpoint: subscription.endpoint, revocationToken },
+  ]);
+  expect(revoked).toEqual([{ endpoint: subscription.endpoint, revocationToken }]);
+  expect(messages).toContainEqual({
+    type: "push.web.subscribe.response",
+    payload: { requestId: "subscribe-web-1", revocationToken },
+  });
+  expect(messages).toContainEqual({
+    type: "push.web.unsubscribe.response",
+    payload: { requestId: "unsubscribe-web-1" },
+  });
+});
+
 describe("daemon status + pairing RPC", () => {
   const tempDirs: string[] = [];
 

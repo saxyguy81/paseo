@@ -1947,6 +1947,7 @@ export const ko: TranslationResources = {
       sentTitle: "테스트 알림을 보냈습니다",
       sentDescription: "Paseo가 알림을 운영 체제에 전달했습니다.",
       sendFailedTitle: "테스트 알림을 보낼 수 없음",
+      background: en.settings.notifications.background,
     },
     hostSections: {
       projects: "프로젝트",

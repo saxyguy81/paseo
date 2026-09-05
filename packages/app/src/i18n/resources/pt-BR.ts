@@ -1970,6 +1970,7 @@ export const ptBR: TranslationResources = {
       sentTitle: "Notificação de teste enviada",
       sentDescription: "O Paseo entregou a notificação ao sistema operacional.",
       sendFailedTitle: "Não foi possível enviar a notificação de teste",
+      background: en.settings.notifications.background,
     },
     hostSections: {
       projects: "Projetos",

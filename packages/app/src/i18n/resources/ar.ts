@@ -1937,6 +1937,7 @@ export const ar: TranslationResources = {
       sentTitle: "تم إرسال إشعار الاختبار",
       sentDescription: "سلّم Paseo الإشعار إلى نظام التشغيل.",
       sendFailedTitle: "تعذر إرسال إشعار الاختبار",
+      background: en.settings.notifications.background,
     },
     hostSections: {
       projects: "المشاريع",

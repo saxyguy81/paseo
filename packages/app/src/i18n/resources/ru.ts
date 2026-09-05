@@ -1969,6 +1969,7 @@ export const ru: TranslationResources = {
       sentTitle: "Тестовое уведомление отправлено",
       sentDescription: "Paseo передал уведомление операционной системе.",
       sendFailedTitle: "Не удалось отправить тестовое уведомление",
+      background: en.settings.notifications.background,
     },
     hostSections: {
       projects: "Проекты",

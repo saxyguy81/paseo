@@ -66,7 +66,8 @@ $PASEO_HOME/
 ├── plugins/
 │   ├── sources.json                      # Git origin, ref, commit, and managed checkout ownership
 │   └── {pluginId}/{version}/checkout/    # Source checkout for one installed Git commit
-└── push-tokens.json                     # Expo push notification tokens
+├── push-tokens.json                     # Expo push notification tokens
+└── web-push-subscriptions.json          # Leased browser/PWA PushSubscriptions
 ```
 
 The `agents/{sanitized-cwd}/` directory name is derived from the agent's `cwd` by stripping the filesystem root and replacing path separators with `-` (Windows drive letters become a `C-` style prefix). Persistent server stores write atomically by writing a temp file in the target directory and then renaming it into place.
@@ -503,6 +504,17 @@ than treating it as valid.
 ```
 
 Simple set of Expo push notification tokens. Loaded with permissive parsing (filters non-string entries). Persisted with atomic temp-file rename.
+
+**Path:** `$PASEO_HOME/web-push-subscriptions.json`
+
+Browser and installed-PWA Web Push subscriptions are keyed by endpoint and stored
+with a 24-hour lease. The one Settings-selected host renews its lease while connected.
+Expired subscriptions become inactive but retain their hashed renewal authority so a
+long-suspended PWA can resume; the oldest inactive record may be evicted at the bounded
+store limit. Explicitly revoked and HTTP 404/410 subscriptions are removed. All mutations use private
+atomic writes. Per-tab revocation credentials are stored only as SHA-256 digests and
+are capped per subscription. The VAPID private key is never stored here; it belongs
+in the daemon's secret launch environment.
 
 ---
 

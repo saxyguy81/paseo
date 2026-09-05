@@ -2807,6 +2807,48 @@ export const PushUnregisterResponseSchema = z.object({
   }),
 });
 
+export const WebPushSubscriptionSchema = z.object({
+  endpoint: z.string().trim().min(1).max(4096),
+  expirationTime: z.number().nullable(),
+  keys: z.object({
+    p256dh: z.string().trim().min(1).max(4096),
+    auth: z.string().trim().min(1).max(4096),
+  }),
+});
+
+const WebPushRevocationTokenSchema = z
+  .string()
+  .min(43)
+  .max(128)
+  .regex(/^[A-Za-z0-9_-]+$/);
+
+export const WebPushSubscribeRequestSchema = z.object({
+  type: z.literal("push.web.subscribe.request"),
+  subscription: WebPushSubscriptionSchema,
+  revocationToken: WebPushRevocationTokenSchema.optional(),
+  requestId: z.string(),
+});
+
+export const WebPushSubscribeResponseSchema = z.object({
+  type: z.literal("push.web.subscribe.response"),
+  payload: z.object({
+    requestId: z.string(),
+    revocationToken: WebPushRevocationTokenSchema,
+  }),
+});
+
+export const WebPushUnsubscribeRequestSchema = z.object({
+  type: z.literal("push.web.unsubscribe.request"),
+  endpoint: z.string().trim().min(1).max(4096),
+  revocationToken: WebPushRevocationTokenSchema,
+  requestId: z.string(),
+});
+
+export const WebPushUnsubscribeResponseSchema = z.object({
+  type: z.literal("push.web.unsubscribe.response"),
+  payload: z.object({ requestId: z.string() }),
+});
+
 // ============================================================================
 // Terminal Messages
 // ============================================================================
@@ -3179,6 +3221,8 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   ListCommandsRequestSchema,
   RegisterPushTokenMessageSchema,
   PushUnregisterRequestSchema,
+  WebPushSubscribeRequestSchema,
+  WebPushUnsubscribeRequestSchema,
   ListTerminalsRequestSchema,
   SubscribeTerminalsRequestSchema,
   UnsubscribeTerminalsRequestSchema,
@@ -3418,6 +3462,12 @@ export const ServerInfoStatusPayloadSchema = z
         relayConfig: z.boolean().optional(),
         // COMPAT(pushTokenRevocation): added in v0.3.2, remove gate after 2027-02-10.
         pushTokenRevocation: z.boolean().optional(),
+        // COMPAT(webPushNotifications): added in v0.7.2, remove gate after 2027-09-05.
+        webPushNotifications: z
+          .object({
+            vapidPublicKey: z.string().trim().min(1),
+          })
+          .optional(),
         // COMPAT(plugins): added in v0.3.0, remove gate after 2027-08-07.
         plugins: z.boolean().optional(),
         // COMPAT(pluginManagement): added in v0.4.0, remove gate after 2027-08-14.
@@ -6368,6 +6418,8 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   StatusMessageSchema,
   PongMessageSchema,
   PushUnregisterResponseSchema,
+  WebPushSubscribeResponseSchema,
+  WebPushUnsubscribeResponseSchema,
   RpcErrorMessageSchema,
   ArtifactMessageSchema,
   AgentUpdateMessageSchema,
@@ -6952,6 +7004,11 @@ export type ListCommandsResponse = z.infer<typeof ListCommandsResponseSchema>;
 export type RegisterPushTokenMessage = z.infer<typeof RegisterPushTokenMessageSchema>;
 export type PushUnregisterRequest = z.infer<typeof PushUnregisterRequestSchema>;
 export type PushUnregisterResponse = z.infer<typeof PushUnregisterResponseSchema>;
+export type WebPushSubscription = z.infer<typeof WebPushSubscriptionSchema>;
+export type WebPushSubscribeRequest = z.infer<typeof WebPushSubscribeRequestSchema>;
+export type WebPushSubscribeResponse = z.infer<typeof WebPushSubscribeResponseSchema>;
+export type WebPushUnsubscribeRequest = z.infer<typeof WebPushUnsubscribeRequestSchema>;
+export type WebPushUnsubscribeResponse = z.infer<typeof WebPushUnsubscribeResponseSchema>;
 
 // Terminal message types
 export type ListTerminalsRequest = z.infer<typeof ListTerminalsRequestSchema>;

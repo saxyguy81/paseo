@@ -56,6 +56,7 @@ import {
   type PushNotifications,
   type PushNotificationSender,
 } from "./push/index.js";
+import { resolveWebPushConfig } from "./push/web-push-config.js";
 import type { ScriptHealthState } from "./script-health-monitor.js";
 import type { ServiceProxySubsystem } from "./service-proxy.js";
 import type { WorkspaceScriptRuntimeStore } from "./workspace-script-runtime-store.js";
@@ -528,6 +529,20 @@ function requireWebSocketServices(params: {
   return { scheduleService, checkoutDiffManager };
 }
 
+function createConfiguredPushNotifications(
+  logger: pino.Logger,
+  paseoHome: string,
+): PushNotifications {
+  const pushLogger = logger.child({ module: "push" });
+  const webPushConfig = resolveWebPushConfig(process.env, paseoHome);
+  if (webPushConfig.warning) pushLogger.warn(webPushConfig.warning);
+  return createPushNotifications({
+    logger: pushLogger,
+    filePath: join(paseoHome, "push-tokens.json"),
+    ...(webPushConfig.config ? { webPush: webPushConfig.config } : {}),
+  });
+}
+
 /**
  * WebSocket server that only accepts sockets + parses/forwards messages to the session layer.
  */
@@ -719,11 +734,7 @@ export class VoiceAssistantWebSocketServer {
       unsubscribeChange();
     };
 
-    const pushLogger = this.logger.child({ module: "push" });
-    this.pushNotifications = createPushNotifications({
-      logger: pushLogger,
-      filePath: join(paseoHome, "push-tokens.json"),
-    });
+    this.pushNotifications = createConfiguredPushNotifications(this.logger, paseoHome);
     this.pushNotificationSender = pushNotificationSender ?? this.pushNotifications;
 
     this.agentManager.setAgentAttentionCallback((params) => {
@@ -1664,6 +1675,10 @@ export class VoiceAssistantWebSocketServer {
         ...(this.advertiseRelayConfig ? { relayConfig: true } : {}),
         // COMPAT(pushTokenRevocation): added in v0.3.2, remove gate after 2027-02-10.
         pushTokenRevocation: true,
+        // COMPAT(webPushNotifications): added in v0.7.2, remove gate after 2027-09-05.
+        ...(this.pushNotifications.webPushCapability
+          ? { webPushNotifications: this.pushNotifications.webPushCapability }
+          : {}),
         // COMPAT(plugins): added in v0.3.0, remove gate after 2027-08-07.
         plugins: true,
         pluginManagement: true,

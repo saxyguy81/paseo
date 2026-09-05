@@ -1916,6 +1916,7 @@ export const zhCN: TranslationResources = {
       sentTitle: "测试通知已发送",
       sentDescription: "Paseo 已将通知交给操作系统。",
       sendFailedTitle: "无法发送测试通知",
+      background: en.settings.notifications.background,
     },
     hostSections: {
       projects: "项目",

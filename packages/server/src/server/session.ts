@@ -22,6 +22,7 @@ import {
   type ProjectPlacementPayload,
   type WorkspaceSetupSnapshot,
   type WorkspaceDescriptorPayload,
+  type WebPushSubscription,
 } from "./messages.js";
 import type {
   TerminalManager,
@@ -714,6 +715,10 @@ export class Session {
     appVisibilityChangedAt: Date;
   } | null = null;
   private registeredPushToken: string | null = null;
+  private registeredWebPushSubscription: {
+    subscription: WebPushSubscription;
+    revocationToken: string;
+  } | null = null;
   private readonly terminalManager: TerminalManager | null;
   private readonly providerSnapshotManager: ProviderSnapshotManager;
   private readonly serviceProxy: ServiceProxySubsystem | null;
@@ -2662,6 +2667,31 @@ export class Session {
           payload: { requestId: msg.requestId },
         });
         return;
+      case "push.web.subscribe.request": {
+        const revocationToken = this.pushNotifications.renewWeb(
+          msg.subscription,
+          msg.revocationToken,
+        );
+        this.registeredWebPushSubscription = {
+          subscription: msg.subscription,
+          revocationToken,
+        };
+        this.emit({
+          type: "push.web.subscribe.response",
+          payload: { requestId: msg.requestId, revocationToken },
+        });
+        return;
+      }
+      case "push.web.unsubscribe.request":
+        this.pushNotifications.revokeWeb(msg.endpoint, msg.revocationToken);
+        if (this.registeredWebPushSubscription?.subscription.endpoint === msg.endpoint) {
+          this.registeredWebPushSubscription = null;
+        }
+        this.emit({
+          type: "push.web.unsubscribe.response",
+          payload: { requestId: msg.requestId },
+        });
+        return;
     }
   }
 
@@ -4197,6 +4227,12 @@ export class Session {
     }
     if (this.registeredPushToken) {
       this.pushNotifications.renew(this.registeredPushToken);
+    }
+    if (this.registeredWebPushSubscription) {
+      this.pushNotifications.renewWeb(
+        this.registeredWebPushSubscription.subscription,
+        this.registeredWebPushSubscription.revocationToken,
+      );
     }
   }
 

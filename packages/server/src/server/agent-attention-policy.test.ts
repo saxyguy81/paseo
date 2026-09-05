@@ -155,15 +155,15 @@ describe("computeNotificationPlan", () => {
     ).toEqual({ inAppRecipientIndex: null, shouldPush: true });
   });
 
-  it("does not push error attention when no clients are present", () => {
+  it("pushes error attention when no clients are present", () => {
     expect(
       computeNotificationPlan({
         allStates: [state({ lastActivityAtMs: staleAtMs })],
         focusTarget: { kind: "agent", id: "agent-1" },
-        pushEligible: false,
+        pushEligible: true,
         nowMs,
       }),
-    ).toEqual({ inAppRecipientIndex: null, shouldPush: false });
+    ).toEqual({ inAppRecipientIndex: null, shouldPush: true });
   });
 
   it("lets a foreground mobile-style client with recent activity win as most recent", () => {
@@ -226,9 +226,9 @@ describe("computeNotificationPlan", () => {
 });
 
 describe("isPushEligibleAttentionReason", () => {
-  it("allows push for finished and permission but not error", () => {
+  it("allows push for finished, permission, and error attention", () => {
     expect(isPushEligibleAttentionReason("finished")).toBe(true);
     expect(isPushEligibleAttentionReason("permission")).toBe(true);
-    expect(isPushEligibleAttentionReason("error")).toBe(false);
+    expect(isPushEligibleAttentionReason("error")).toBe(true);
   });
 });

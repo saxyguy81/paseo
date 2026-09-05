@@ -1984,6 +1984,7 @@ export const es: TranslationResources = {
       sentTitle: "Notificación de prueba enviada",
       sentDescription: "Paseo entregó la notificación al sistema operativo.",
       sendFailedTitle: "No se pudo enviar la notificación de prueba",
+      background: en.settings.notifications.background,
     },
     hostSections: {
       projects: "Proyectos",

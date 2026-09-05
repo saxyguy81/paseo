@@ -1020,6 +1020,69 @@ test("bounds the wait for push token revocation", async () => {
   expect(client.getConnectionState().status).toBe("connected");
 });
 
+test("waits for the daemon to persist a Web Push subscription", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_web_push_subscription",
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+  const connectPromise = client.connect();
+  mock.triggerOpen({ features: { webPushNotifications: { vapidPublicKey: "public-key" } } });
+  await connectPromise;
+
+  const subscription = {
+    endpoint: "https://fcm.googleapis.com/wp/subscription",
+    expirationTime: null,
+    keys: { p256dh: "p256dh-key", auth: "auth-key" },
+  };
+  const registration = client.subscribeWebPush(subscription);
+  const request = parseSentFrame(mock.sent.at(-1));
+  expect(request).toMatchObject({ type: "push.web.subscribe.request", subscription });
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "push.web.subscribe.response",
+      payload: { requestId: request.requestId, revocationToken: "r".repeat(43) },
+    }),
+  );
+
+  await expect(registration).resolves.toBe("r".repeat(43));
+});
+
+test("waits for the daemon to revoke a Web Push subscription with its authority", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_web_push_revocation",
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+  const connectPromise = client.connect();
+  mock.triggerOpen({ features: { webPushNotifications: { vapidPublicKey: "public-key" } } });
+  await connectPromise;
+
+  const endpoint = "https://fcm.googleapis.com/wp/subscription";
+  const revocationToken = "r".repeat(43);
+  const revocation = client.unsubscribeWebPush(endpoint, revocationToken);
+  const request = parseSentFrame(mock.sent.at(-1));
+  expect(request).toMatchObject({
+    type: "push.web.unsubscribe.request",
+    endpoint,
+    revocationToken,
+  });
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "push.web.unsubscribe.response",
+      payload: { requestId: request.requestId },
+    }),
+  );
+
+  await revocation;
+});
+
 test("defaults session RPC waiters to sixty seconds", async () => {
   useHeartbeatClock();
   const logger = createMockLogger();
