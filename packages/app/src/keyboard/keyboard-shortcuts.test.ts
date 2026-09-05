@@ -36,7 +36,7 @@ function shortcutContext(
 ): KeyboardShortcutContext {
   return {
     isMac: false,
-    isDesktop: false,
+    isDesktop: true,
     focusScope: "other",
     commandCenterOpen: false,
     ...overrides,
@@ -168,8 +168,8 @@ describe("keyboard-shortcuts", () => {
       action: "shortcuts.dialog.toggle",
     },
     {
-      name: "matches workspace index jump on web via Alt+digit",
-      event: { key: "2", code: "Digit2", altKey: true },
+      name: "matches workspace index jump on web via Ctrl+Shift+digit",
+      event: { key: "@", code: "Digit2", ctrlKey: true, shiftKey: true },
       context: { isDesktop: false },
       action: "workspace.navigate.index",
       payload: { index: 2 },
@@ -196,15 +196,15 @@ describe("keyboard-shortcuts", () => {
       payload: { index: 2 },
     },
     {
-      name: "matches tab index jump on web via Alt+Shift+digit",
-      event: { key: "@", code: "Digit2", altKey: true, shiftKey: true },
+      name: "matches tab index jump on web via Ctrl+digit",
+      event: { key: "2", code: "Digit2", ctrlKey: true },
       context: { isDesktop: false },
       action: "workspace.tab.navigate.index",
       payload: { index: 2 },
     },
     {
-      name: "matches workspace relative navigation on web via Alt+[",
-      event: { key: "[", code: "BracketLeft", altKey: true },
+      name: "matches workspace relative navigation on web via Ctrl+Shift+[",
+      event: { key: "{", code: "BracketLeft", ctrlKey: true, shiftKey: true },
       context: { isDesktop: false },
       action: "workspace.navigate.relative",
       payload: { delta: -1 },
@@ -223,14 +223,14 @@ describe("keyboard-shortcuts", () => {
       payload: { delta: 1 },
     },
     {
-      name: "matches Mod+T to open new tab",
-      event: { key: "t", code: "KeyT", metaKey: true },
-      context: { isMac: true },
+      name: "matches Ctrl+T to open a new tab in macOS web",
+      event: { key: "t", code: "KeyT", ctrlKey: true },
+      context: { isMac: true, isDesktop: false },
       action: "workspace.tab.menu.open",
     },
     {
-      name: "matches Alt+Shift+W to close current tab on web",
-      event: { key: "W", code: "KeyW", altKey: true, shiftKey: true },
+      name: "matches Ctrl+W to close current tab on web",
+      event: { key: "w", code: "KeyW", ctrlKey: true },
       context: { isDesktop: false },
       action: "workspace.tab.close.current",
     },
@@ -257,6 +257,19 @@ describe("keyboard-shortcuts", () => {
       event: { key: "k", code: "KeyK", ctrlKey: true },
       context: { isMac: false },
       action: "command-center.toggle",
+    },
+    {
+      name: "matches Ctrl+K for command center in macOS web",
+      event: { key: "k", code: "KeyK", ctrlKey: true },
+      context: { isMac: true, isDesktop: false },
+      action: "command-center.toggle",
+    },
+    {
+      name: "matches Ctrl+L to focus the message input in macOS web",
+      event: { key: "l", code: "KeyL", ctrlKey: true },
+      context: { isMac: true, isDesktop: false },
+      action: "message-input.action",
+      payload: { kind: "focus" },
     },
     {
       name: "matches Cmd+Backslash to split pane right on macOS",
@@ -365,8 +378,8 @@ describe("keyboard-shortcuts", () => {
       payload: { delta: 1 },
     },
     {
-      name: "matches Alt+[ to previous workspace on macOS web when Option substitutes event.key",
-      event: { key: "\u201C", code: "BracketLeft", altKey: true },
+      name: "matches Ctrl+Shift+[ to previous workspace on macOS web",
+      event: { key: "{", code: "BracketLeft", ctrlKey: true, shiftKey: true },
       context: { isMac: true, isDesktop: false },
       action: "workspace.navigate.relative",
       payload: { delta: -1 },
@@ -374,8 +387,8 @@ describe("keyboard-shortcuts", () => {
       stopPropagation: true,
     },
     {
-      name: "matches Alt+] to next workspace on macOS web when Option substitutes event.key",
-      event: { key: "\u2018", code: "BracketRight", altKey: true },
+      name: "matches Ctrl+Shift+] to next workspace on macOS web",
+      event: { key: "}", code: "BracketRight", ctrlKey: true, shiftKey: true },
       context: { isMac: true, isDesktop: false },
       action: "workspace.navigate.relative",
       payload: { delta: 1 },
@@ -383,10 +396,11 @@ describe("keyboard-shortcuts", () => {
       stopPropagation: true,
     },
     {
-      name: "matches Alt+Shift+W to close current tab on macOS web when Option substitutes event.key",
-      event: { key: "\u201E", code: "KeyW", altKey: true, shiftKey: true },
+      name: "matches Ctrl+] to next tab on macOS web",
+      event: { key: "]", code: "BracketRight", ctrlKey: true },
       context: { isMac: true, isDesktop: false },
-      action: "workspace.tab.close.current",
+      action: "workspace.tab.navigate.relative",
+      payload: { delta: 1 },
     },
   ];
 
@@ -457,9 +471,39 @@ describe("keyboard-shortcuts", () => {
       context: { isMac: false, isDesktop: true, focusScope: "terminal" },
     },
     {
-      name: "does not match Ctrl+T on mac (Cmd only)",
+      name: "does not match Ctrl+T in the macOS desktop app (Cmd only)",
       event: { key: "t", code: "KeyT", ctrlKey: true },
-      context: { isMac: true },
+      context: { isMac: true, isDesktop: true },
+    },
+    {
+      name: "leaves Cmd+T to Chrome on macOS web",
+      event: { key: "t", code: "KeyT", metaKey: true },
+      context: { isMac: true, isDesktop: false },
+    },
+    {
+      name: "leaves Cmd+K to Chrome on macOS web",
+      event: { key: "k", code: "KeyK", metaKey: true },
+      context: { isMac: true, isDesktop: false },
+    },
+    {
+      name: "leaves Cmd+L to Chrome on macOS web",
+      event: { key: "l", code: "KeyL", metaKey: true },
+      context: { isMac: true, isDesktop: false },
+    },
+    {
+      name: "does not navigate tabs from an editable field in macOS web",
+      event: { key: "]", code: "BracketRight", ctrlKey: true },
+      context: { isMac: true, isDesktop: false, focusScope: "editable" },
+    },
+    {
+      name: "does not open a Paseo tab from the message input in macOS web",
+      event: { key: "t", code: "KeyT", ctrlKey: true },
+      context: { isMac: true, isDesktop: false, focusScope: "message-input" },
+    },
+    {
+      name: "leaves Ctrl+B to an editable field in macOS web",
+      event: { key: "b", code: "KeyB", ctrlKey: true },
+      context: { isMac: true, isDesktop: false, focusScope: "editable" },
     },
     {
       name: "keeps mac Option+digit available for international text input",
@@ -632,16 +676,19 @@ describe("keyboard-shortcut help sections", () => {
 
   const helpCases: HelpSectionCase[] = [
     {
-      name: "uses web defaults for workspace and tab jump",
+      name: "uses Control for Paseo shortcuts in macOS web",
       context: { isMac: true, isDesktop: false },
       expectedKeys: {
-        "new-agent": ["mod", "O"],
-        "workspace-tab-new": ["mod", "T"],
-        "workspace-jump-index": ["alt", "1-9"],
-        "workspace-tab-jump-index": ["alt", "shift", "1-9"],
-        "workspace-tab-close-current": ["alt", "shift", "W"],
-        "workspace-pane-split-right": ["mod", "\\"],
-        "workspace-pane-close": ["mod", "shift", "W"],
+        "new-agent": ["ctrl", "O"],
+        "new-workspace": ["ctrl", "N"],
+        "toggle-command-center": ["ctrl", "K"],
+        "workspace-tab-new": ["ctrl", "T"],
+        "workspace-jump-index": ["ctrl", "shift", "1-9"],
+        "workspace-tab-jump-index": ["ctrl", "1-9"],
+        "workspace-tab-close-current": ["ctrl", "W"],
+        "workspace-tab-prev": ["ctrl", "["],
+        "workspace-tab-next": ["ctrl", "]"],
+        "focus-message-input": ["ctrl", "L"],
         "cycle-agent-mode": ["shift", "Tab"],
       },
     },
@@ -691,6 +738,51 @@ describe("keyboard-shortcut help sections", () => {
     for (const [id, keys] of Object.entries(expectedKeys)) {
       expect(findRow(sections, id)?.chord).toEqual([keys]);
     }
+  });
+
+  it("does not advertise Command bindings in macOS web", () => {
+    const sections = buildKeyboardShortcutHelpSections({ isMac: true, isDesktop: false });
+    const keys: string[] = [];
+    for (const section of sections) {
+      for (const row of section.rows) {
+        keys.push(...(row.chord?.flat() ?? []));
+      }
+    }
+
+    expect(keys).not.toContain("mod");
+    expect(keys).not.toContain("meta");
+  });
+
+  it("migrates a saved macOS-web override to its Control counterpart", () => {
+    const overrides = { "workspace-tab-new-cmd-t-mac": "Cmd+Shift+Y" };
+    const bindings = buildEffectiveBindings(overrides);
+    const result = resolveShortcut({
+      event: { key: "Y", code: "KeyY", ctrlKey: true, shiftKey: true },
+      context: { isMac: true, isDesktop: false },
+      bindings,
+    });
+
+    expect(result.match?.action).toBe("workspace.tab.menu.open");
+    expect(
+      resolveShortcutKeysForAction("workspace-tab-new", overrides, {
+        isMac: true,
+        isDesktop: false,
+      }),
+    ).toEqual([["ctrl", "shift", "Y"]]);
+  });
+
+  it("prefers an explicit Control override over a migrated macOS-web override", () => {
+    const overrides = {
+      "workspace-tab-new-cmd-t-mac": "Cmd+Shift+Y",
+      "workspace-tab-new-ctrl-t-non-mac": "Ctrl+Shift+U",
+    };
+
+    expect(
+      resolveShortcutKeysForAction("workspace-tab-new", overrides, {
+        isMac: true,
+        isDesktop: false,
+      }),
+    ).toEqual([["ctrl", "shift", "U"]]);
   });
 
   describe("rows derive their keys from the binding that fires", () => {
@@ -863,9 +955,9 @@ describe("keyboard-shortcut help sections", () => {
 describe("getWorkspaceIndexJumpModifierKey", () => {
   const MAC_INDEX_BINDING = "workspace-navigate-index-cmd-digit-mac";
 
-  it("uses Alt on web, regardless of OS", () => {
-    expect(getWorkspaceIndexJumpModifierKey({ isMac: true, isDesktop: false })).toBe("Alt");
-    expect(getWorkspaceIndexJumpModifierKey({ isMac: false, isDesktop: false })).toBe("Alt");
+  it("does not show workspace badges for the two-modifier web shortcut", () => {
+    expect(getWorkspaceIndexJumpModifierKey({ isMac: true, isDesktop: false })).toBeNull();
+    expect(getWorkspaceIndexJumpModifierKey({ isMac: false, isDesktop: false })).toBeNull();
   });
 
   it("uses Cmd (Meta) on desktop Mac, not Control or Alt", () => {

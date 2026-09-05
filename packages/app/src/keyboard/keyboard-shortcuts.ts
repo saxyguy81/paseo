@@ -66,7 +66,11 @@ interface KeyboardShortcutPlatformContext {
 }
 
 interface ShortcutWhen {
-  /** true = mac only, false = non-mac only */
+  /**
+   * Selects the app-shortcut modifier surface. `true` is the macOS desktop app,
+   * where Command belongs to Paseo. `false` is every Control surface: non-macOS
+   * platforms plus browser web on macOS, where Command belongs to the browser.
+   */
   mac?: boolean;
   /** true = desktop only, false = web only */
   desktop?: boolean;
@@ -253,6 +257,18 @@ const SHORTCUT_HELP_NOTE_KEYS: Record<string, string> = {
   "show-shortcuts": "settings.shortcuts.helpNotes.showKeyboardShortcuts",
 };
 
+function matchesAppShortcutSurface(
+  mac: boolean | undefined,
+  context: KeyboardShortcutPlatformContext,
+): boolean {
+  if (mac === undefined) return true;
+  // Binding ids retain their historical `mac` / `non-mac` names because saved
+  // overrides use them as stable keys. The selection itself follows ownership:
+  // Command belongs to the native macOS app; Control belongs to every other app
+  // surface, including Paseo running in a macOS browser.
+  return mac ? context.isMac && context.isDesktop : !context.isMac || !context.isDesktop;
+}
+
 // --- Binding definitions ---
 
 const SHORTCUT_BINDINGS: readonly ShortcutBinding[] = [
@@ -400,7 +416,7 @@ const SHORTCUT_BINDINGS: readonly ShortcutBinding[] = [
     id: "workspace-tab-new-ctrl-t-non-mac",
     action: "workspace.tab.menu.open",
     combo: "Ctrl+T",
-    when: { mac: false, commandCenter: false, terminal: false },
+    when: { mac: false, commandCenter: false, editable: false, terminal: false },
     help: {
       id: "workspace-tab-new",
       section: "tabs-panes",
@@ -522,8 +538,8 @@ const SHORTCUT_BINDINGS: readonly ShortcutBinding[] = [
   {
     id: "workspace-tab-close-current-alt-shift-w-web",
     action: "workspace.tab.close.current",
-    combo: "Alt+Shift+W",
-    when: { desktop: false, commandCenter: false },
+    combo: "Ctrl+W",
+    when: { desktop: false, commandCenter: false, editable: false, terminal: false },
     help: {
       id: "workspace-tab-close-current",
       section: "tabs-panes",
@@ -561,14 +577,14 @@ const SHORTCUT_BINDINGS: readonly ShortcutBinding[] = [
   {
     id: "workspace-navigate-index-alt-digit-web",
     action: "workspace.navigate.index",
-    combo: "Alt+Digit",
-    when: { desktop: false, commandCenter: false },
+    combo: "Ctrl+Shift+Digit",
+    when: { desktop: false, commandCenter: false, editable: false, terminal: false },
     payload: { type: "index" },
     help: {
       id: "workspace-jump-index",
       section: "workspaces",
       label: "Jump to workspace",
-      defaultDisplayKeys: ["alt", "1-9"],
+      defaultDisplayKeys: ["ctrl", "shift", "1-9"],
     },
   },
 
@@ -602,14 +618,14 @@ const SHORTCUT_BINDINGS: readonly ShortcutBinding[] = [
   {
     id: "workspace-tab-navigate-index-alt-shift-digit-web",
     action: "workspace.tab.navigate.index",
-    combo: "Alt+Shift+Digit",
-    when: { desktop: false, commandCenter: false },
+    combo: "Ctrl+Digit",
+    when: { desktop: false, commandCenter: false, editable: false, terminal: false },
     payload: { type: "index" },
     help: {
       id: "workspace-tab-jump-index",
       section: "tabs-panes",
       label: "Jump to tab",
-      defaultDisplayKeys: ["alt", "shift", "1-9"],
+      defaultDisplayKeys: ["ctrl", "1-9"],
     },
   },
 
@@ -665,8 +681,8 @@ const SHORTCUT_BINDINGS: readonly ShortcutBinding[] = [
   {
     id: "workspace-navigate-relative-alt-left-web",
     action: "workspace.navigate.relative",
-    combo: "Alt+[",
-    when: { desktop: false, commandCenter: false },
+    combo: "Ctrl+Shift+[",
+    when: { desktop: false, commandCenter: false, editable: false, terminal: false },
     payload: { type: "delta", delta: -1 },
     help: {
       id: "workspace-prev",
@@ -677,8 +693,8 @@ const SHORTCUT_BINDINGS: readonly ShortcutBinding[] = [
   {
     id: "workspace-navigate-relative-alt-right-web",
     action: "workspace.navigate.relative",
-    combo: "Alt+]",
-    when: { desktop: false, commandCenter: false },
+    combo: "Ctrl+Shift+]",
+    when: { desktop: false, commandCenter: false, editable: false, terminal: false },
     payload: { type: "delta", delta: 1 },
     help: {
       id: "workspace-next",
@@ -692,7 +708,7 @@ const SHORTCUT_BINDINGS: readonly ShortcutBinding[] = [
     id: "workspace-tab-navigate-relative-alt-shift-left",
     action: "workspace.tab.navigate.relative",
     combo: "Alt+Shift+[",
-    when: { commandCenter: false },
+    when: { desktop: true, commandCenter: false },
     payload: { type: "delta", delta: -1 },
     help: {
       id: "workspace-tab-prev",
@@ -704,7 +720,31 @@ const SHORTCUT_BINDINGS: readonly ShortcutBinding[] = [
     id: "workspace-tab-navigate-relative-alt-shift-right",
     action: "workspace.tab.navigate.relative",
     combo: "Alt+Shift+]",
-    when: { commandCenter: false },
+    when: { desktop: true, commandCenter: false },
+    payload: { type: "delta", delta: 1 },
+    help: {
+      id: "workspace-tab-next",
+      section: "tabs-panes",
+      label: "Next tab",
+    },
+  },
+  {
+    id: "workspace-tab-navigate-relative-ctrl-left-web",
+    action: "workspace.tab.navigate.relative",
+    combo: "Ctrl+[",
+    when: { desktop: false, commandCenter: false, editable: false, terminal: false },
+    payload: { type: "delta", delta: -1 },
+    help: {
+      id: "workspace-tab-prev",
+      section: "tabs-panes",
+      label: "Previous tab",
+    },
+  },
+  {
+    id: "workspace-tab-navigate-relative-ctrl-right-web",
+    action: "workspace.tab.navigate.relative",
+    combo: "Ctrl+]",
+    when: { desktop: false, commandCenter: false, editable: false, terminal: false },
     payload: { type: "delta", delta: 1 },
     help: {
       id: "workspace-tab-next",
@@ -875,7 +915,7 @@ const SHORTCUT_BINDINGS: readonly ShortcutBinding[] = [
     id: "command-center-toggle-ctrl-k-non-mac",
     action: "command-center.toggle",
     combo: "Ctrl+K",
-    when: { mac: false, terminal: false },
+    when: { mac: false, editable: false, terminal: false },
     help: {
       id: "toggle-command-center",
       section: "general",
@@ -948,7 +988,7 @@ const SHORTCUT_BINDINGS: readonly ShortcutBinding[] = [
     id: "sidebar-toggle-right-ctrl-backquote",
     action: "sidebar.toggle.right",
     combo: "Ctrl+`",
-    when: { commandCenter: false },
+    when: { commandCenter: false, editable: false, terminal: false },
   },
 
   // --- Toggle both sidebars ---
@@ -1064,7 +1104,7 @@ const SHORTCUT_BINDINGS: readonly ShortcutBinding[] = [
     id: "message-input-focus-ctrl-l-non-mac",
     action: "message-input.action",
     combo: "Ctrl+L",
-    when: { mac: false, commandCenter: false, terminal: false },
+    when: { mac: false, commandCenter: false, editable: false, terminal: false },
     payload: { type: "message-input", kind: "focus" },
     help: {
       id: "focus-message-input",
@@ -1209,9 +1249,35 @@ export const DEFAULT_BINDINGS: readonly ParsedShortcutBinding[] =
 
 export type ShortcutOverrides = Record<string, string | null>;
 
+function resolveStoredOverride(
+  binding: ParsedShortcutBinding,
+  overrides: ShortcutOverrides,
+): string | null | undefined {
+  const directOverride = overrides[binding.id];
+  if (directOverride !== undefined || binding.when?.mac !== false || !binding.help) {
+    return directOverride;
+  }
+
+  // COMPAT(macWebControlShortcuts): added in v0.7.2; remove after 2027-09-04.
+  // Before browser web yielded Command to the browser, macOS-web preferences
+  // were stored under the paired `*-mac` binding id. Inherit that value only
+  // until the Control binding is customized, translating its modifier so the
+  // migrated preference cannot reclaim a browser-owned Command chord.
+  const formerMacWebBinding = DEFAULT_BINDINGS.find(
+    (candidate) =>
+      candidate.when?.mac === true &&
+      candidate.action === binding.action &&
+      candidate.help?.id === binding.help?.id,
+  );
+  const formerOverride = formerMacWebBinding ? overrides[formerMacWebBinding.id] : undefined;
+  return typeof formerOverride === "string"
+    ? formerOverride.replace(/\bCmd\b/g, "Ctrl")
+    : formerOverride;
+}
+
 export function buildEffectiveBindings(overrides: ShortcutOverrides): ParsedShortcutBinding[] {
   return DEFAULT_BINDINGS.map(function (binding) {
-    const override = overrides[binding.id];
+    const override = resolveStoredOverride(binding, overrides);
     if (override === UNASSIGNED_COMBO) {
       return { ...binding, combo: "", parsedChord: [] };
     }
@@ -1302,8 +1368,16 @@ export function matchesKeyboardShortcutContext(
   context: KeyboardShortcutContext,
 ): boolean {
   if (!when) return true;
-  if (when.mac !== undefined && when.mac !== context.isMac) return false;
+  if (!matchesAppShortcutSurface(when.mac, context)) return false;
   if (when.desktop !== undefined && when.desktop !== context.isDesktop) return false;
+  if (
+    !context.isDesktop &&
+    context.isMac &&
+    when.mac === false &&
+    (context.focusScope === "message-input" || context.focusScope === "editable")
+  ) {
+    return false;
+  }
   if (
     when.editable === false &&
     (context.focusScope === "message-input" || context.focusScope === "editable")
@@ -1367,7 +1441,7 @@ function helpMatchesPlatform(
   when: ShortcutWhen | undefined,
   context: KeyboardShortcutPlatformContext,
 ): boolean {
-  if (when?.mac !== undefined && when.mac !== context.isMac) return false;
+  if (!matchesAppShortcutSurface(when?.mac, context)) return false;
   if (when?.desktop !== undefined && when.desktop !== context.isDesktop) return false;
   return true;
 }
@@ -1596,26 +1670,8 @@ export function resolveShortcutKeysForAction(
   if (bindingId === null) {
     return null;
   }
-
-  const defaultChord = getDefaultKeysForAction(actionId, platform);
-
-  const override = overrides[bindingId];
-  if (override === UNASSIGNED_COMBO || override === "") {
-    return null;
-  }
-  // Storage is unvalidated JSON: a missing key and a corrupt value both mean
-  // "fall back to the default".
-  if (typeof override !== "string") {
-    return defaultChord;
-  }
-  try {
-    parseBindingChord(override);
-  } catch {
-    // Matching falls back to the default for an unparseable override, so the
-    // display has to as well or it would advertise keys that do nothing.
-    return defaultChord;
-  }
-  return chordStringToShortcutKeys(override);
+  const binding = buildEffectiveBindings(overrides).find((candidate) => candidate.id === bindingId);
+  return binding ? displayChordForBinding(binding) : null;
 }
 
 /**

@@ -10,4 +10,13 @@ describe("resolveWorkspaceCommandCenterShortcuts", () => {
       }).newAgent,
     ).toEqual([["mod", "shift", "A"]]);
   });
+
+  it("uses Control for New agent in macOS web", () => {
+    expect(
+      resolveWorkspaceCommandCenterShortcuts({
+        overrides: {},
+        platform: { isMac: true, isDesktop: false },
+      }).newAgent,
+    ).toEqual([["ctrl", "shift", "A"]]);
+  });
 });
