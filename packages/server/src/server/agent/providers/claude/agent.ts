@@ -2288,6 +2288,11 @@ class ClaudeAgentSession implements AgentSession {
   private queryPumpPromise: Promise<void> | null = null;
   private queryRestartNeeded = false;
   private pendingInterruptAbort = false;
+  private interruptedTurnGeneration: {
+    query: Query;
+    sessionId: string | null;
+    turnId: string;
+  } | null = null;
   private foregroundHasVisibleActivity = false;
   private activeTurnHasAssistantText = false;
   private foregroundHasProviderActivity = false;
@@ -2296,6 +2301,14 @@ class ClaudeAgentSession implements AgentSession {
   private pendingConversationRolloverFailure: {
     kind?: AgentFailureKind;
     error: string;
+  } | null = null;
+  private invalidSessionAfterInterruptedFailure: {
+    failure: {
+      kind: "context_overflow";
+      error: string;
+    };
+    query: Query;
+    sessionId: string | null;
   } | null = null;
   /**
    * True once this native conversation is known to be a continuation. Fresh
@@ -2484,6 +2497,30 @@ class ClaudeAgentSession implements AgentSession {
     this.cancelCurrentTurn = requestCancel;
 
     this.notifySubscribers({ type: "turn_started", provider: "claude" });
+
+    const invalidSessionFailure = this.readInvalidInterruptedSessionFailure();
+    if (invalidSessionFailure) {
+      this.logger.warn(
+        {
+          error: invalidSessionFailure.error,
+          failureKind: invalidSessionFailure.kind,
+          sessionId: this.claudeSessionId ?? undefined,
+        },
+        "Rejecting Claude prompt because the interrupted native session overflowed",
+      );
+      this.finishForegroundTurn(
+        this.buildTurnFailedEvent(invalidSessionFailure.error, invalidSessionFailure.kind),
+      );
+      return { turnId };
+    }
+
+    // A terminal abort result can clear pendingInterruptAbort while trailing
+    // frames from that request are still possible. Never admit new work onto
+    // the generation whose late failures we are tracking: otherwise a genuine
+    // failure from the new turn could be mistaken for canceled-turn output.
+    if (this.interruptedTurnGeneration) {
+      this.queryRestartNeeded = true;
+    }
 
     try {
       // A cancellation belongs to the old query, not the next user request.
@@ -3206,6 +3243,7 @@ class ClaudeAgentSession implements AgentSession {
 
   private rebindConversationSession(sessionId: string): void {
     const oldSessionId = this.claudeSessionId;
+    this.retireInterruptedStateForSessionChange(oldSessionId, sessionId);
     this.claudeSessionId = sessionId;
     this.pendingFreshSessionId = null;
     this.persistence = null;
@@ -3237,6 +3275,7 @@ class ClaudeAgentSession implements AgentSession {
 
   private startFreshConversationSession(): void {
     const sessionId = randomUUID();
+    this.retireInterruptedStateForSessionChange(this.claudeSessionId, sessionId);
     this.claudeSessionId = sessionId;
     this.pendingFreshSessionId = sessionId;
     this.persistence = null;
@@ -3356,6 +3395,9 @@ class ClaudeAgentSession implements AgentSession {
     if (this.queryRestartNeeded && this.query) {
       const oldQuery = this.query;
       const oldInput = this.input;
+      if (this.interruptedTurnGeneration?.query === oldQuery) {
+        this.interruptedTurnGeneration = null;
+      }
       // Null out query/input BEFORE awaiting the old iterator's return so the
       // old pump sees this.query !== activeQuery and skips failActiveTurns.
       this.query = null;
@@ -4025,6 +4067,47 @@ class ClaudeAgentSession implements AgentSession {
     });
   }
 
+  private async handleQueryPumpMessage(message: SDKMessage, activeQuery: Query): Promise<boolean> {
+    this.logger.trace(
+      {
+        agentId: this.agentId,
+        provider: "claude",
+        sessionId: this.claudeSessionId,
+        turnId: this.activeForegroundTurnId ?? this.autonomousTurn?.id ?? undefined,
+        messageType: message.type,
+        messageSubtype: "subtype" in message ? message.subtype : undefined,
+        messageUuid: "uuid" in message ? message.uuid : undefined,
+        rawEvent: message,
+      },
+      "provider.claude.raw_event",
+    );
+    if (this.query !== activeQuery) {
+      this.logger.debug("Suppressing a trailing message from a retired Claude provider query");
+      return false;
+    }
+    if (await this.handleMissingResumedConversation(message, activeQuery)) {
+      return true;
+    }
+    await this.routeSdkMessageFromPump(message, activeQuery);
+    return false;
+  }
+
+  private async drainQueryPump(activeQuery: Query, onMessage: () => void): Promise<boolean> {
+    for await (const message of activeQuery) {
+      onMessage();
+      if (await this.handleQueryPumpMessage(message, activeQuery)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private failTurnIfQueryIsCurrent(activeQuery: Query, error: string): void {
+    if (!this.closed && this.query === activeQuery) {
+      this.failActiveTurns(error);
+    }
+  }
+
   private async runQueryPump(): Promise<void> {
     let activeQuery: Query;
     try {
@@ -4045,47 +4128,16 @@ class ClaudeAgentSession implements AgentSession {
     }
 
     let consecutiveInterruptAbortRecoveries = 0;
-    const logRawMessage = (message: SDKMessage): void => {
-      this.logger.trace(
-        {
-          agentId: this.agentId,
-          provider: "claude",
-          sessionId: this.claudeSessionId,
-          turnId: this.activeForegroundTurnId ?? this.autonomousTurn?.id ?? undefined,
-          messageType: message.type,
-          messageSubtype: "subtype" in message ? message.subtype : undefined,
-          messageUuid: "uuid" in message ? message.uuid : undefined,
-          rawEvent: message,
-        },
-        "provider.claude.raw_event",
-      );
-    };
-    const handlePumpedMessage = async (message: SDKMessage): Promise<boolean> => {
-      logRawMessage(message);
+    const resetInterruptAbortRecoveries = (): void => {
       consecutiveInterruptAbortRecoveries = 0;
-      if (await this.handleMissingResumedConversation(message, activeQuery)) {
-        return true;
-      }
-      await this.routeSdkMessageFromPump(message, activeQuery);
-      return false;
-    };
-    const drainActiveQuery = async (): Promise<boolean> => {
-      for await (const message of activeQuery) {
-        if (await handlePumpedMessage(message)) {
-          return true;
-        }
-      }
-      return false;
     };
     try {
       while (!this.closed && this.query === activeQuery) {
         try {
-          if (await drainActiveQuery()) {
+          if (await this.drainQueryPump(activeQuery, resetInterruptAbortRecoveries)) {
             return;
           }
-          if (!this.closed && this.query === activeQuery) {
-            this.failActiveTurns("Claude stream ended before terminal result");
-          }
+          this.failTurnIfQueryIsCurrent(activeQuery, "Claude stream ended before terminal result");
           return;
         } catch (error) {
           if (
@@ -4109,6 +4161,9 @@ class ClaudeAgentSession implements AgentSession {
       }
     } finally {
       if (this.query === activeQuery) {
+        if (this.interruptedTurnGeneration?.query === activeQuery) {
+          this.interruptedTurnGeneration = null;
+        }
         this.query = null;
         this.input = null;
       }
@@ -4385,9 +4440,92 @@ class ClaudeAgentSession implements AgentSession {
     }
   }
 
+  private captureInvalidInterruptedSessionFailure(
+    message: SDKMessage,
+    sourceQuery: Query,
+  ): boolean {
+    // A sidechain failure belongs to the child agent, not the interrupted
+    // parent conversation's native-session health.
+    if (readClaudeParentToolUseId(message)) {
+      return false;
+    }
+    const interrupted = this.interruptedTurnGeneration;
+    if (!interrupted || interrupted.query !== sourceQuery) {
+      return false;
+    }
+    if (interrupted.sessionId && interrupted.sessionId !== this.claudeSessionId) {
+      this.interruptedTurnGeneration = null;
+      return false;
+    }
+    const contextOverflow = readClaudeContextOverflowError(message);
+    if (!contextOverflow) {
+      return false;
+    }
+    const messageRecord = toObjectRecord(message) ?? {};
+    const messageSessionId = extractSessionIdRaw({
+      session_id: messageRecord.session_id,
+      sessionId: messageRecord.sessionId,
+      session: isObjectRecord(messageRecord.session) ? { id: messageRecord.session.id } : null,
+    }).trim();
+    if (messageSessionId && interrupted.sessionId && messageSessionId !== interrupted.sessionId) {
+      return false;
+    }
+    this.invalidSessionAfterInterruptedFailure = {
+      failure: {
+        kind: "context_overflow",
+        error: contextOverflow,
+      },
+      query: sourceQuery,
+      sessionId: this.claudeSessionId,
+    };
+    this.logger.warn(
+      {
+        error: contextOverflow,
+        sessionId: this.claudeSessionId ?? undefined,
+      },
+      "Claude reported context overflow after an interrupted turn",
+    );
+    return true;
+  }
+
+  private readInvalidInterruptedSessionFailure(): {
+    kind: "context_overflow";
+    error: string;
+  } | null {
+    const invalid = this.invalidSessionAfterInterruptedFailure;
+    if (!invalid) {
+      return null;
+    }
+    const sameSessionGeneration = invalid.sessionId
+      ? invalid.sessionId === this.claudeSessionId
+      : invalid.query === this.query && this.claudeSessionId === null;
+    if (sameSessionGeneration) {
+      return invalid.failure;
+    }
+    this.invalidSessionAfterInterruptedFailure = null;
+    return null;
+  }
+
+  private retireInterruptedStateForSessionChange(
+    previousSessionId: string | null,
+    nextSessionId: string,
+  ): void {
+    if (!previousSessionId || previousSessionId === nextSessionId) {
+      return;
+    }
+    this.interruptedTurnGeneration = null;
+    this.invalidSessionAfterInterruptedFailure = null;
+  }
+
   private async routeSdkMessageFromPump(message: SDKMessage, sourceQuery: Query): Promise<void> {
-    if (this.query && this.query !== sourceQuery) {
+    if (this.query !== sourceQuery) {
       this.logger.debug("Suppressing a trailing message from a retired Claude provider query");
+      return;
+    }
+    if (this.captureInvalidInterruptedSessionFailure(message, sourceQuery)) {
+      // Cancellation already owns the interrupted turn's terminal event. Keep
+      // the overflow only as native-session health so it cannot open an
+      // autonomous turn or emit a second terminal event.
       return;
     }
     if (this.shouldSuppressStaleResult(message)) {
@@ -4540,6 +4678,9 @@ class ClaudeAgentSession implements AgentSession {
       });
     }
     if (this.query === activeQuery) {
+      if (this.interruptedTurnGeneration?.query === activeQuery) {
+        this.interruptedTurnGeneration = null;
+      }
       this.query = null;
       this.input = null;
     }
@@ -4571,12 +4712,23 @@ class ClaudeAgentSession implements AgentSession {
       );
       return;
     }
+    const interruptedTurnId = this.activeForegroundTurnId ?? this.autonomousTurn?.id ?? null;
+    if (interruptedTurnId) {
+      this.interruptedTurnGeneration = {
+        query: queryToInterrupt,
+        sessionId: this.claudeSessionId,
+        turnId: interruptedTurnId,
+      };
+    }
     this.pendingInterruptAbort = true;
     await this.discardQueuedSteers(queryToInterrupt);
     try {
       await withTimeout(queryToInterrupt.interrupt(), 3_000, "Claude interrupt timed out");
     } catch (error) {
       this.pendingInterruptAbort = false;
+      if (this.interruptedTurnGeneration?.query === queryToInterrupt) {
+        this.interruptedTurnGeneration = null;
+      }
       this.logger.warn({ err: error }, "Failed to interrupt active turn");
       throw error;
     }
@@ -5075,6 +5227,7 @@ class ClaudeAgentSession implements AgentSession {
       { existingSessionId: this.claudeSessionId, newSessionId: sessionId },
       "Claude session ID changed in message; accepting new session",
     );
+    this.retireInterruptedStateForSessionChange(oldSessionId, sessionId);
     this.claudeSessionId = sessionId;
     this.pendingFreshSessionId = null;
     this.persistence = null;
@@ -5120,6 +5273,7 @@ class ClaudeAgentSession implements AgentSession {
         { existingSessionId, newSessionId },
         "Claude session ID changed in init message; accepting new session",
       );
+      this.retireInterruptedStateForSessionChange(existingSessionId, newSessionId);
       this.claudeSessionId = newSessionId;
       this.pendingFreshSessionId = null;
       threadStartedSessionId = newSessionId;

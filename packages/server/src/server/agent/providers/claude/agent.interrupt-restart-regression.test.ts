@@ -494,6 +494,21 @@ function buildAbortedResult(sessionId: string) {
   };
 }
 
+function buildContextOverflowAssistant(sessionId: string, uuid: string) {
+  return {
+    type: "assistant",
+    uuid,
+    session_id: sessionId,
+    is_api_error_message: true,
+    error: "invalid_request",
+    message: {
+      role: "assistant",
+      model: "<synthetic>",
+      content: [{ type: "text", text: "Prompt is too long" }],
+    },
+  };
+}
+
 function buildRejectedToolResult(sessionId: string) {
   return {
     type: "user",
@@ -627,7 +642,7 @@ test("Claude can still wake into an autonomous turn once the interrupted request
   await session.close();
 });
 
-test("reuses the existing query after interrupt before starting the next prompt", async () => {
+test("recreates the provider query after interrupt before starting the next prompt", async () => {
   const logger = createTestLogger();
   const queries: ScriptedQuery[] = [];
 
@@ -670,13 +685,11 @@ test("reuses the existing query after interrupt before starting the next prompt"
 
   const secondTurnEvents = await collectUntilTerminal(streamSession(session, "second prompt"));
 
-  expect(queryFactory).toHaveBeenCalledTimes(1);
-  expect(queries[0]?.prompts.map((prompt) => prompt.text)).toEqual([
-    "first prompt",
-    "second prompt",
-  ]);
+  expect(queryFactory).toHaveBeenCalledTimes(2);
+  expect(queries[0]?.prompts.map((prompt) => prompt.text)).toEqual(["first prompt"]);
+  expect(queries[1]?.prompts.map((prompt) => prompt.text)).toEqual(["second prompt"]);
   expect(queries[0]?.interrupt).toHaveBeenCalledTimes(1);
-  expect(queries[0]?.return).not.toHaveBeenCalled();
+  expect(queries[0]?.return).toHaveBeenCalledTimes(1);
   expect(collectAssistantText(secondTurnEvents)).toContain("SECOND_PROMPT_RESPONSE");
 
   await session.close();
@@ -732,13 +745,13 @@ test("emits an assistant system notice when Claude changes session id mid-turn",
   await session.close();
 });
 
-test("recovers when the query pump sees a single interrupt abort before the next prompt", async () => {
+test("recreates the query after the pump sees an interrupt abort before the next prompt", async () => {
   const logger = createTestLogger();
-  const output = createAsyncQueue<Record<string, unknown>>();
   const prompts: PromptRecord[] = [];
-  let throwAbortOnNext = false;
 
   queryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    const output = createAsyncQueue<Record<string, unknown>>();
+    let throwAbortOnNext = false;
     const scriptedQuery = {
       next: vi.fn(async () => {
         if (throwAbortOnNext) {
@@ -820,7 +833,7 @@ test("recovers when the query pump sees a single interrupt abort before the next
 
   const secondTurnEvents = await collectUntilTerminal(streamSession(session, "second prompt"));
 
-  expect(queryFactory).toHaveBeenCalledTimes(1);
+  expect(queryFactory).toHaveBeenCalledTimes(2);
   expect(prompts.map((prompt) => prompt.text)).toEqual(["first prompt", "second prompt"]);
   expect(collectAssistantText(secondTurnEvents)).toContain("SECOND_PROMPT_RESPONSE");
   expect(secondTurnEvents.some((event) => event.type === "turn_completed")).toBe(true);
@@ -830,14 +843,15 @@ test("recovers when the query pump sees a single interrupt abort before the next
 
 test("stale abort result after replacement start does not poison the new foreground turn", async () => {
   const logger = createTestLogger();
-  let queryRef: ScriptedQuery | null = null;
+  const queries: ScriptedQuery[] = [];
 
   queryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
-    queryRef = createScriptedQuery({
+    const query = createScriptedQuery({
       prompt,
       sessionId: "interrupt-stale-result-session",
     });
-    return queryRef;
+    queries.push(query);
+    return query;
   });
 
   const client = new ClaudeAgentClient({
@@ -852,7 +866,7 @@ test("stale abort result after replacement start does not poison the new foregro
 
   const firstTurn = streamSession(session, "first prompt");
   const firstStarted = await firstTurn.next();
-  await waitFor(() => queryRef?.prompts.length === 1);
+  await waitFor(() => queries[0]?.prompts.length === 1);
 
   await session.interrupt();
   const firstTurnEvents = [firstStarted.value!, ...(await collectUntilTerminal(firstTurn))];
@@ -865,20 +879,20 @@ test("stale abort result after replacement start does not poison the new foregro
 
   const secondTurn = streamSession(session, "second prompt");
   const secondStarted = await secondTurn.next();
-  await waitFor(() => queryRef?.prompts.length === 2);
+  await waitFor(() => queries[1]?.prompts.length === 1);
 
-  queryRef?.emit({
+  queries[0]?.emit({
     type: "result",
     subtype: "error_during_execution",
     errors: ["Request was aborted."],
     session_id: "interrupt-stale-result-session",
   });
-  queryRef?.emit({
+  queries[1]?.emit({
     type: "assistant",
     message: { content: "SECOND_PROMPT_RESPONSE" },
     session_id: "interrupt-stale-result-session",
   });
-  queryRef?.emit(buildSuccessResult("interrupt-stale-result-session"));
+  queries[1]?.emit(buildSuccessResult("interrupt-stale-result-session"));
 
   const secondTurnEvents = [secondStarted.value!, ...(await collectUntilTerminal(secondTurn))];
   unsubscribe();
@@ -893,6 +907,388 @@ test("stale abort result after replacement start does not poison the new foregro
       (event) => event.type === "turn_failed" || event.type === "turn_canceled",
     ),
   ).toBe(false);
+
+  await session.close();
+});
+
+test("late context overflow after cancel fails the next prompt before provider submission", async () => {
+  const sessionId = "interrupt-late-overflow-session";
+  const queries: ScriptedQuery[] = [];
+
+  queryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    const scriptedQuery = createScriptedQuery({
+      prompt,
+      sessionId,
+      async handlePrompt({ promptRecord, query }) {
+        if (promptRecord.text !== "replacement prompt") {
+          return;
+        }
+        query.emit({
+          type: "assistant",
+          message: { content: "REPLACEMENT_WAS_SUBMITTED" },
+          session_id: sessionId,
+        });
+        query.emit(buildSuccessResult(sessionId));
+      },
+    });
+    queries.push(scriptedQuery);
+    return scriptedQuery;
+  });
+
+  const session = await new ClaudeAgentClient({
+    logger: createTestLogger(),
+    queryFactory,
+    resolveBinary: async () => "/test/claude/bin",
+  }).createSession({ provider: "claude", cwd: process.cwd() });
+
+  const canceledTurn = streamSession(session, "oversized slash command");
+  await canceledTurn.next();
+  await waitFor(() => queries[0]?.prompts.length === 1);
+  await session.interrupt();
+  expect(await collectUntilTerminal(canceledTurn)).toContainEqual(
+    expect.objectContaining({ type: "turn_canceled" }),
+  );
+
+  const trailingEvents: AgentStreamEvent[] = [];
+  const unsubscribe = session.subscribe((event) => {
+    trailingEvents.push(event);
+  });
+  const nextCallsBeforeTrailingFrames = queries[0]?.next.mock.calls.length ?? 0;
+  queries[0]?.emit(buildContextOverflowAssistant(sessionId, "late-overflow-assistant"));
+  queries[0]?.emit({
+    type: "result",
+    subtype: "error_during_execution",
+    uuid: "late-overflow-result",
+    errors: ["Request was aborted."],
+    session_id: sessionId,
+  });
+  await waitFor(
+    () => (queries[0]?.next.mock.calls.length ?? 0) >= nextCallsBeforeTrailingFrames + 2,
+  );
+  expect(trailingEvents.some((event) => event.type === "turn_started")).toBe(false);
+
+  const replacementEvents = await collectUntilTerminal(
+    streamSession(session, "replacement prompt"),
+  );
+  unsubscribe();
+
+  expect(replacementEvents).toContainEqual(
+    expect.objectContaining({
+      type: "turn_failed",
+      provider: "claude",
+      error: "Prompt is too long",
+      failureKind: "context_overflow",
+    }),
+  );
+  expect(collectAssistantText(replacementEvents)).not.toContain("REPLACEMENT_WAS_SUBMITTED");
+  expect(queryFactory).toHaveBeenCalledTimes(1);
+  expect(queries[0]?.prompts.map((prompt) => prompt.text)).toEqual(["oversized slash command"]);
+
+  await session.close();
+});
+
+test("late child context overflow after cancel does not invalidate the parent session", async () => {
+  const sessionId = "interrupt-child-overflow-session";
+  const queries: ScriptedQuery[] = [];
+
+  queryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    const scriptedQuery = createScriptedQuery({
+      prompt,
+      sessionId,
+      async handlePrompt({ promptRecord, query }) {
+        if (promptRecord.text !== "replacement prompt") {
+          return;
+        }
+        query.emit({
+          type: "assistant",
+          message: { content: "parent session remained usable" },
+          session_id: sessionId,
+        });
+        query.emit(buildSuccessResult(sessionId));
+      },
+    });
+    queries.push(scriptedQuery);
+    return scriptedQuery;
+  });
+
+  const session = await new ClaudeAgentClient({
+    logger: createTestLogger(),
+    queryFactory,
+    resolveBinary: async () => "/test/claude/bin",
+  }).createSession({ provider: "claude", cwd: process.cwd() });
+
+  const canceledTurn = streamSession(session, "parent slash command");
+  await canceledTurn.next();
+  await waitFor(() => queries[0]?.prompts.length === 1);
+  await session.interrupt();
+  await collectUntilTerminal(canceledTurn);
+
+  const nextCallsBeforeTrailingFrames = queries[0]?.next.mock.calls.length ?? 0;
+  queries[0]?.emit({
+    ...buildContextOverflowAssistant(sessionId, "late-child-overflow"),
+    parent_tool_use_id: "toolu_team_child",
+  });
+  queries[0]?.emit(buildAbortedResult(sessionId));
+  await waitFor(
+    () => (queries[0]?.next.mock.calls.length ?? 0) >= nextCallsBeforeTrailingFrames + 2,
+  );
+
+  const replacementEvents = await collectUntilTerminal(
+    streamSession(session, "replacement prompt"),
+  );
+  expect(replacementEvents).toContainEqual(expect.objectContaining({ type: "turn_completed" }));
+  expect(replacementEvents).not.toContainEqual(
+    expect.objectContaining({ failureKind: "context_overflow" }),
+  );
+  expect(collectAssistantText(replacementEvents)).toContain("parent session remained usable");
+
+  await session.close();
+});
+
+test("context overflow during interrupt acknowledgement invalidates the canceled session", async () => {
+  const sessionId = "interrupt-await-overflow-session";
+  const queries: ScriptedQuery[] = [];
+  let acknowledgeInterrupt: (() => void) | null = null;
+
+  queryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    const scriptedQuery = createScriptedQuery({ prompt, sessionId });
+    scriptedQuery.interrupt.mockImplementation(
+      async () =>
+        await new Promise<void>((resolve) => {
+          acknowledgeInterrupt = resolve;
+        }),
+    );
+    queries.push(scriptedQuery);
+    return scriptedQuery;
+  });
+
+  const session = await new ClaudeAgentClient({
+    logger: createTestLogger(),
+    queryFactory,
+    resolveBinary: async () => "/test/claude/bin",
+  }).createSession({ provider: "claude", cwd: process.cwd() });
+
+  const canceledTurn = streamSession(session, "oversized slash command");
+  await canceledTurn.next();
+  await waitFor(() => queries[0]?.prompts.length === 1);
+
+  const interrupt = session.interrupt();
+  await waitFor(() => queries[0]?.interrupt.mock.calls.length === 1);
+  const nextCallsBeforeTrailingFrames = queries[0]?.next.mock.calls.length ?? 0;
+  queries[0]?.emit(buildContextOverflowAssistant(sessionId, "interrupt-await-overflow"));
+  queries[0]?.emit(buildAbortedResult(sessionId));
+  await waitFor(
+    () => (queries[0]?.next.mock.calls.length ?? 0) >= nextCallsBeforeTrailingFrames + 2,
+  );
+
+  acknowledgeInterrupt?.();
+  await interrupt;
+  const canceledEvents = await collectUntilTerminal(canceledTurn);
+  expect(canceledEvents.filter((event) => event.type === "turn_canceled")).toHaveLength(1);
+  expect(canceledEvents.some((event) => event.type === "turn_failed")).toBe(false);
+
+  const replacementEvents = await collectUntilTerminal(
+    streamSession(session, "replacement prompt"),
+  );
+  expect(replacementEvents).toContainEqual(
+    expect.objectContaining({
+      type: "turn_failed",
+      error: "Prompt is too long",
+      failureKind: "context_overflow",
+    }),
+  );
+  expect(queries[0]?.prompts.map((prompt) => prompt.text)).toEqual(["oversized slash command"]);
+
+  await session.close();
+});
+
+test("context overflow after stale abort result does not open an autonomous turn", async () => {
+  const sessionId = "interrupt-result-before-overflow-session";
+  const queries: ScriptedQuery[] = [];
+
+  queryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    const scriptedQuery = createScriptedQuery({ prompt, sessionId });
+    queries.push(scriptedQuery);
+    return scriptedQuery;
+  });
+
+  const session = await new ClaudeAgentClient({
+    logger: createTestLogger(),
+    queryFactory,
+    resolveBinary: async () => "/test/claude/bin",
+  }).createSession({ provider: "claude", cwd: process.cwd() });
+
+  const canceledTurn = streamSession(session, "oversized slash command");
+  await canceledTurn.next();
+  await waitFor(() => queries[0]?.prompts.length === 1);
+  await session.interrupt();
+  expect(await collectUntilTerminal(canceledTurn)).toContainEqual(
+    expect.objectContaining({ type: "turn_canceled" }),
+  );
+
+  const trailingEvents: AgentStreamEvent[] = [];
+  const unsubscribe = session.subscribe((event) => {
+    trailingEvents.push(event);
+  });
+  const nextCallsBeforeTrailingFrames = queries[0]?.next.mock.calls.length ?? 0;
+  queries[0]?.emit(buildAbortedResult(sessionId));
+  queries[0]?.emit(buildContextOverflowAssistant(sessionId, "overflow-after-abort-result"));
+  await waitFor(
+    () => (queries[0]?.next.mock.calls.length ?? 0) >= nextCallsBeforeTrailingFrames + 2,
+  );
+
+  expect(trailingEvents).toEqual([]);
+  const replacementEvents = await collectUntilTerminal(
+    streamSession(session, "replacement prompt"),
+  );
+  unsubscribe();
+
+  expect(replacementEvents).toContainEqual(
+    expect.objectContaining({
+      type: "turn_failed",
+      error: "Prompt is too long",
+      failureKind: "context_overflow",
+    }),
+  );
+  expect(queries[0]?.prompts.map((prompt) => prompt.text)).toEqual(["oversized slash command"]);
+
+  await session.close();
+});
+
+test("next-turn overflow is not swallowed by a settled interrupt generation", async () => {
+  const sessionId = "interrupt-generation-retirement-session";
+  const queries: ScriptedQuery[] = [];
+
+  queryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    const scriptedQuery = createScriptedQuery({
+      prompt,
+      sessionId,
+      async handlePrompt({ promptRecord, query }) {
+        if (promptRecord.text !== "replacement prompt") {
+          return;
+        }
+        query.emit(buildContextOverflowAssistant(sessionId, "replacement-overflow"));
+        query.emit({
+          type: "result",
+          subtype: "error_during_execution",
+          errors: [],
+          session_id: sessionId,
+        });
+      },
+    });
+    queries.push(scriptedQuery);
+    return scriptedQuery;
+  });
+
+  const session = await new ClaudeAgentClient({
+    logger: createTestLogger(),
+    queryFactory,
+    resolveBinary: async () => "/test/claude/bin",
+  }).createSession({ provider: "claude", cwd: process.cwd() });
+
+  const canceledTurn = streamSession(session, "first prompt");
+  await canceledTurn.next();
+  await waitFor(() => queries[0]?.prompts.length === 1);
+  await session.interrupt();
+  await collectUntilTerminal(canceledTurn);
+
+  const nextCallsBeforeAbortResult = queries[0]?.next.mock.calls.length ?? 0;
+  queries[0]?.emit(buildAbortedResult(sessionId));
+  await waitFor(() => (queries[0]?.next.mock.calls.length ?? 0) >= nextCallsBeforeAbortResult + 1);
+
+  const replacementEvents = await collectUntilTerminal(
+    streamSession(session, "replacement prompt"),
+  );
+
+  expect(queryFactory).toHaveBeenCalledTimes(2);
+  expect(queries[0]?.prompts.map((prompt) => prompt.text)).toEqual(["first prompt"]);
+  expect(queries[1]?.prompts.map((prompt) => prompt.text)).toEqual(["replacement prompt"]);
+  expect(replacementEvents).toContainEqual(
+    expect.objectContaining({
+      type: "turn_failed",
+      error: "Prompt is too long",
+      failureKind: "context_overflow",
+    }),
+  );
+
+  await session.close();
+});
+
+test("late retired-query overflow during restart cannot poison the replacement turn", async () => {
+  const sessionId = "interrupt-restart-window-session";
+  const queries: ScriptedQuery[] = [];
+  let releaseRetiredQuery: (() => void) | null = null;
+
+  queryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    const scriptedQuery = createScriptedQuery({
+      prompt,
+      sessionId,
+      async handlePrompt({ promptRecord, query }) {
+        if (promptRecord.text !== "replacement prompt") {
+          return;
+        }
+        query.emit({
+          type: "assistant",
+          message: { content: "replacement completed" },
+          session_id: sessionId,
+        });
+        query.emit(buildSuccessResult(sessionId));
+      },
+    });
+    if (queries.length === 0) {
+      scriptedQuery.return.mockImplementation(
+        async () =>
+          await new Promise<void>((resolve) => {
+            releaseRetiredQuery = () => {
+              scriptedQuery.end();
+              resolve();
+            };
+          }),
+      );
+    }
+    queries.push(scriptedQuery);
+    return scriptedQuery;
+  });
+
+  const session = await new ClaudeAgentClient({
+    logger: createTestLogger(),
+    queryFactory,
+    resolveBinary: async () => "/test/claude/bin",
+  }).createSession({ provider: "claude", cwd: process.cwd() });
+
+  const canceledTurn = streamSession(session, "first prompt");
+  await canceledTurn.next();
+  await waitFor(() => queries[0]?.prompts.length === 1);
+  await session.interrupt();
+  await collectUntilTerminal(canceledTurn);
+  const nextCallsBeforeAbortResult = queries[0]?.next.mock.calls.length ?? 0;
+  queries[0]?.emit(buildAbortedResult(sessionId));
+  await waitFor(() => (queries[0]?.next.mock.calls.length ?? 0) > nextCallsBeforeAbortResult);
+
+  const replacementTurn = streamSession(session, "replacement prompt");
+  const replacementFirstEvent = replacementTurn.next();
+  await waitFor(() => queries[0]?.return.mock.calls.length === 1);
+
+  const oldNextCalls = queries[0]?.next.mock.calls.length ?? 0;
+  queries[0]?.emit(buildContextOverflowAssistant(sessionId, "retired-query-overflow"));
+  await waitFor(() => (queries[0]?.next.mock.calls.length ?? 0) > oldNextCalls);
+  releaseRetiredQuery?.();
+
+  expect((await replacementFirstEvent).value).toEqual(
+    expect.objectContaining({ type: "turn_started" }),
+  );
+  const replacementEvents = await collectUntilTerminal(replacementTurn);
+  expect(queryFactory).toHaveBeenCalledTimes(2);
+  expect(queries[0]?.prompts.map((prompt) => prompt.text)).toEqual(["first prompt"]);
+  expect(queries[1]?.prompts.map((prompt) => prompt.text)).toEqual(["replacement prompt"]);
+  expect(replacementEvents).toContainEqual(expect.objectContaining({ type: "turn_completed" }));
+  expect(replacementEvents).not.toContainEqual(
+    expect.objectContaining({
+      type: "turn_failed",
+      failureKind: "context_overflow",
+    }),
+  );
+  expect(collectAssistantText(replacementEvents)).toContain("replacement completed");
 
   await session.close();
 });
