@@ -1340,6 +1340,61 @@ test("daemon recovery does not repeat a compact whose exact boundary receipt was
   }
 });
 
+test("daemon recovery consumes a settled slash-command preflight receipt exactly once", async () => {
+  const scenario = await createContextPreflightScenario({ retryDelayMs: 5 });
+  let recoveredManager: AgentManager | undefined;
+  try {
+    await scenario.agentManager.flush();
+    await scenario.storage.enqueuePendingPrompt(scenario.agentId, {
+      id: "team-after-settled-boundary",
+      prompt: "/team go ahead",
+    });
+    await scenario.storage.claimPendingPrompt(scenario.agentId);
+    await scenario.storage.insertPendingPromptPreflight(
+      scenario.agentId,
+      "team-after-settled-boundary",
+      {
+        key: "claude_context_compaction",
+        prompt: "/compact [PASEO_INTERNAL_CONTEXT_PREFLIGHT] preserve state",
+      },
+    );
+    const preflight = await scenario.storage.claimPendingPrompt(scenario.agentId);
+    if (!preflight) throw new Error("Expected claimed preflight");
+    await scenario.storage.recordPendingPromptPreflightBoundary(scenario.agentId, preflight.id);
+    await scenario.storage.settlePendingPromptPreflight(scenario.agentId, preflight.id, {
+      clearContextUsage: true,
+    });
+    await scenario.storage.flush();
+
+    const reloaded = new AgentStorage(join(scenario.workdir, "agents"), scenario.logger);
+    const recoveredClient = new QueuedPromptAgentClient();
+    recoveredManager = new AgentManager({
+      clients: { "claude-acc": recoveredClient },
+      registry: reloaded,
+      logger: scenario.logger,
+    });
+    await resumePendingAgentPrompts({
+      agentManager: recoveredManager,
+      agentStorage: reloaded,
+      logger: scenario.logger,
+    });
+
+    await vi.waitFor(() => expect(recoveredClient.session.prompts).toEqual(["/team go ahead"]));
+    expect(recoveredClient.session.prompts.some(isClaudeContextPreflightPrompt)).toBe(false);
+    recoveredClient.session.complete();
+    await vi.waitFor(async () => {
+      await expect(reloaded.listPendingPrompts(scenario.agentId)).resolves.toEqual([]);
+    });
+    await expect(reloaded.get(scenario.agentId)).resolves.toMatchObject({
+      completedPromptPreflightIds: [],
+    });
+  } finally {
+    await recoveredManager?.closeAgent(scenario.agentId).catch(() => undefined);
+    await recoveredManager?.flush().catch(() => undefined);
+    await scenario.cleanup();
+  }
+});
+
 test("daemon recovery never infers a compact boundary from a stale low usage value", async () => {
   const scenario = await createContextPreflightScenario({ retryDelayMs: 5 });
   let recoveredManager: AgentManager | undefined;
@@ -1395,6 +1450,34 @@ test("daemon recovery never infers a compact boundary from a stale low usage val
   } finally {
     await recoveredManager?.closeAgent(scenario.agentId).catch(() => undefined);
     await recoveredManager?.flush().catch(() => undefined);
+    await scenario.cleanup();
+  }
+});
+
+test("a verified compact boundary admits one slash command when occupancy remains unknown", async () => {
+  const scenario = await createContextPreflightScenario({ retryDelayMs: 5 });
+  try {
+    scenario.client.session.reportUsage({ contextWindowMaxTokens: 200_000 });
+    await scenario.storage.enqueuePendingPrompt(scenario.agentId, {
+      id: "team-after-unknown-usage",
+      prompt: "/team ok go ahead and do all this",
+    });
+
+    const drain = scenario.agentManager.drainStoredPendingPrompts(scenario.agentId);
+    await vi.waitFor(() => expect(scenario.client.session.prompts).toHaveLength(1));
+    expect(isClaudeContextPreflightPrompt(scenario.client.session.prompts[0]!)).toBe(true);
+    scenario.client.session.reportCompactionBoundary(25_000);
+    scenario.client.session.complete({ contextWindowMaxTokens: 200_000 });
+
+    await vi.waitFor(() =>
+      expect(scenario.client.session.prompts[1]).toBe("/team ok go ahead and do all this"),
+    );
+    scenario.client.session.complete();
+    await drain;
+    await expect(scenario.storage.listPendingPrompts(scenario.agentId)).resolves.toEqual([]);
+  } finally {
+    await scenario.agentManager.closeAgent(scenario.agentId).catch(() => undefined);
+    await scenario.agentManager.flush().catch(() => undefined);
     await scenario.cleanup();
   }
 });

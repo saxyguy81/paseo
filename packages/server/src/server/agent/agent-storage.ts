@@ -421,17 +421,28 @@ export class AgentStorage {
     await this.load();
     await this.queueRecordMutation(agentId, (existing) => {
       if (!existing) throw new Error(`Agent ${agentId} not found`);
-      const preflight = existing.pendingPrompts.find((item) => item.id === preflightId);
+      const preflightIndex = existing.pendingPrompts.findIndex((item) => item.id === preflightId);
+      const preflight = existing.pendingPrompts[preflightIndex];
       if (!preflight || !isStoredPendingPromptPreflight(preflight)) return existing;
+      const target = existing.pendingPrompts[preflightIndex + 1];
       const lastUsage = options?.clearContextUsage
         ? clearContextWindowUsedTokens(existing.lastUsage)
         : existing.lastUsage;
+      const completedPromptPreflightIds = existing.completedPromptPreflightIds.filter(
+        (id) => id !== preflightId,
+      );
+      if (
+        options?.clearContextUsage &&
+        target &&
+        !isStoredPendingPromptPreflight(target) &&
+        !completedPromptPreflightIds.includes(target.id)
+      ) {
+        completedPromptPreflightIds.push(target.id);
+      }
       return {
         ...existing,
         pendingPrompts: existing.pendingPrompts.filter((item) => item.id !== preflightId),
-        completedPromptPreflightIds: existing.completedPromptPreflightIds.filter(
-          (id) => id !== preflightId,
-        ),
+        completedPromptPreflightIds,
         ...(lastUsage ? { lastUsage } : { lastUsage: undefined }),
       };
     });
@@ -460,6 +471,9 @@ export class AgentStorage {
       return {
         ...existing,
         pendingPrompts: existing.pendingPrompts.filter((item) => item.id !== promptId),
+        completedPromptPreflightIds: existing.completedPromptPreflightIds.filter(
+          (id) => id !== promptId,
+        ),
       };
     });
   }

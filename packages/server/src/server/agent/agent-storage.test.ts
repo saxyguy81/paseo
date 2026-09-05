@@ -335,11 +335,15 @@ describe("AgentStorage", () => {
       "contextWindowUsedTokens",
     );
     await expect(storage.get("agent-preflight")).resolves.toMatchObject({
-      completedPromptPreflightIds: [],
+      completedPromptPreflightIds: ["message-after-compact"],
     });
     await expect(storage.claimPendingPrompt("agent-preflight")).resolves.toMatchObject({
       id: "message-after-compact",
       attemptCount: 2,
+    });
+    await storage.completePendingPrompt("agent-preflight", "message-after-compact");
+    await expect(storage.get("agent-preflight")).resolves.toMatchObject({
+      completedPromptPreflightIds: [],
     });
   });
 

@@ -355,6 +355,100 @@ second line'`,
     expect(result).not.toContain("Prompt is too long");
   });
 
+  it("preserves the goal and plan referenced by a short slash-command follow-up", () => {
+    const result = buildAgentFreshSessionContinuationPrompt({
+      failureKind: "context_overflow",
+      maxChars: 4_000,
+      rows: [
+        row(1, {
+          type: "user_message",
+          text: "Implement the durable admission queue, preserve active goals, and deploy it safely.",
+        }),
+        row(2, {
+          type: "assistant_message",
+          text: "Plan: add durable admission state, regression tests, rollback-safe storage, and canary verification.",
+        }),
+        row(3, { type: "user_message", text: "/team ok go ahead and do all this" }),
+        row(4, { type: "assistant_message", text: "Prompt is too long" }),
+      ],
+    });
+
+    expect(result).toContain("Outstanding user request:\n/team ok go ahead and do all this");
+    expect(result).toContain("Implement the durable admission queue");
+    expect(result).toContain("Plan: add durable admission state");
+    expect(result).not.toContain("Prompt is too long");
+  });
+
+  it("does not evict referenced goal context behind newer working-state entries", () => {
+    const laterState = Array.from({ length: 40 }, (_, index) => [
+      row(index * 2 + 4, {
+        type: "assistant_message" as const,
+        text: `later-state-${index}-${"x".repeat(900)}`,
+      }),
+      row(
+        index * 2 + 5,
+        toolCallItem({
+          callId: `later-${index}`,
+          name: "Bash",
+          detail: {
+            type: "shell",
+            command: `check-${index}`,
+            output: "done",
+            exitCode: 0,
+          },
+        }),
+      ),
+    ]).flat();
+    const result = buildAgentFreshSessionContinuationPrompt({
+      failureKind: "context_overflow",
+      maxChars: 4_000,
+      rows: [
+        row(1, { type: "user_message", text: "Implement the durable goal-preserving repair." }),
+        row(2, {
+          type: "assistant_message",
+          text: "Plan: preserve antecedents before recent logs.",
+        }),
+        row(3, { type: "user_message", text: "/team go ahead" }),
+        ...laterState,
+      ],
+    });
+
+    expect(result).toContain("Implement the durable goal-preserving repair");
+    expect(result).toContain("Plan: preserve antecedents before recent logs");
+    expect(result).toContain("later-state-39");
+  });
+
+  it("preserves antecedents for a short approval without a slash command", () => {
+    const result = buildAgentFreshSessionContinuationPrompt({
+      failureKind: "conversation_unresolved",
+      rows: [
+        row(1, { type: "user_message", text: "Apply the reviewed repair and deploy it." }),
+        row(2, { type: "assistant_message", text: "I can deploy after the canary passes." }),
+        row(3, { type: "user_message", text: "Sounds good" }),
+      ],
+    });
+
+    expect(result).toContain("Apply the reviewed repair and deploy it");
+    expect(result).toContain("I can deploy after the canary passes");
+  });
+
+  it("walks through chained acknowledgments to the substantive goal", () => {
+    const result = buildAgentFreshSessionContinuationPrompt({
+      failureKind: "context_overflow",
+      rows: [
+        row(1, { type: "user_message", text: "Implement durable queue and preserve active goal." }),
+        row(2, { type: "assistant_message", text: "Plan: add restart-safe admission." }),
+        row(3, { type: "user_message", text: "Yes" }),
+        row(4, { type: "assistant_message", text: "I will begin now." }),
+        row(5, { type: "user_message", text: "/team do this" }),
+      ],
+    });
+
+    expect(result).toContain("Implement durable queue and preserve active goal");
+    expect(result).toContain("Plan: add restart-safe admission");
+    expect(result).toContain("I will begin now");
+  });
+
   it("explains unresolved delivery state without copying the failed error", () => {
     const result = buildAgentFreshSessionContinuationPrompt({
       failureKind: "conversation_unresolved",

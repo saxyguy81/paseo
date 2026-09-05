@@ -148,6 +148,86 @@ function formatContextOverflowStateEntry(item: AgentTimelineItem): string | null
   }
 }
 
+function requestNeedsPriorContext(request: string): boolean {
+  const normalized = request.trim();
+  if (/^\/[^\s/]+(?:\s|$)/.test(normalized)) return true;
+  if (normalized.length > 240) return false;
+  return /\b(?:yes|ok(?:ay)?|sounds good|approved|continue|go ahead|do (?:it|all|that|this)|proceed|same|above|previous)\b/i.test(
+    normalized,
+  );
+}
+
+function referencedPriorContextEntries(
+  projected: ReturnType<typeof projectTimelineRows>,
+  latestUserIndex: number,
+): string[] {
+  if (latestUserIndex <= 0) return [];
+  let priorUser: string | null = null;
+  const priorAssistants: string[] = [];
+  for (let index = latestUserIndex - 1; index >= 0; index -= 1) {
+    const item = projected[index]?.item;
+    if (!item) continue;
+    if (
+      !priorUser &&
+      item.type === "user_message" &&
+      item.text.trim() &&
+      !isSystemInjectedEnvelope(item.text) &&
+      !requestNeedsPriorContext(item.text)
+    ) {
+      priorUser = normalizeBoundedText(item.text, MAX_CONTEXT_STATE_ENTRY_CHARS);
+    } else if (priorAssistants.length < 2 && item.type === "assistant_message") {
+      const candidate = formatContextOverflowStateEntry(item);
+      if (candidate) priorAssistants.unshift(candidate);
+    }
+    if (priorUser && priorAssistants.length >= 2) break;
+  }
+  return [
+    priorUser ? `[Prior user request]\n${priorUser}` : null,
+    ...priorAssistants.map((entry) => `[Prior assistant plan or status]\n${entry}`),
+  ].filter((entry): entry is string => Boolean(entry));
+}
+
+function continuationStateGroups(
+  projected: ReturnType<typeof projectTimelineRows>,
+  latestUserIndex: number,
+  request: string,
+): { prior: string[]; later: string[] } {
+  const prior = requestNeedsPriorContext(request)
+    ? referencedPriorContextEntries(projected, latestUserIndex)
+    : [];
+  const later = projected
+    .slice(latestUserIndex >= 0 ? latestUserIndex + 1 : 0)
+    .map((entry) => formatContextOverflowStateEntry(entry.item))
+    .filter((entry): entry is string => Boolean(entry));
+  return { prior, later };
+}
+
+function selectContinuationStateEntries(input: {
+  prior: readonly string[];
+  later: readonly string[];
+  budget: number;
+}): string[] {
+  const selectedPrior: string[] = [];
+  let remaining = input.budget;
+  for (const entry of input.prior) {
+    const separatorLength = selectedPrior.length > 0 ? 2 : 0;
+    if (entry.length + separatorLength > remaining) continue;
+    selectedPrior.push(entry);
+    remaining -= entry.length + separatorLength;
+  }
+
+  const selectedLater: string[] = [];
+  for (let index = input.later.length - 1; index >= 0; index -= 1) {
+    const entry = input.later[index];
+    if (!entry) continue;
+    const separatorLength = selectedPrior.length + selectedLater.length > 0 ? 2 : 0;
+    if (entry.length + separatorLength > remaining) continue;
+    selectedLater.unshift(entry);
+    remaining -= entry.length + separatorLength;
+  }
+  return [...selectedPrior, ...selectedLater];
+}
+
 /**
  * Build a deliberately small handoff for a fresh native session after the
  * previous one becomes unsafe to continue. The latest user request is preserved
@@ -191,29 +271,16 @@ export function buildAgentFreshSessionContinuationPrompt(input: {
     return null;
   }
 
-  const stateEntries = projected
-    .slice(latestUserIndex >= 0 ? latestUserIndex + 1 : 0)
-    .map((entry) => formatContextOverflowStateEntry(entry.item))
-    .filter((entry): entry is string => Boolean(entry));
-  if (stateEntries.length === 0) {
+  const stateGroups = continuationStateGroups(projected, latestUserIndex, request);
+  if (stateGroups.prior.length === 0 && stateGroups.later.length === 0) {
     return minimum;
   }
 
   const fixedLength = prefix.length + request.length + stateHeader.length + suffix.length;
-  const selected: string[] = [];
-  let remaining = maxChars - fixedLength;
-  for (let index = stateEntries.length - 1; index >= 0; index -= 1) {
-    const entry = stateEntries[index];
-    if (!entry) {
-      continue;
-    }
-    const separatorLength = selected.length > 0 ? 2 : 0;
-    if (entry.length + separatorLength > remaining) {
-      continue;
-    }
-    selected.unshift(entry);
-    remaining -= entry.length + separatorLength;
-  }
+  const selected = selectContinuationStateEntries({
+    ...stateGroups,
+    budget: maxChars - fixedLength,
+  });
 
   const state = selected.length > 0 ? selected.join("\n\n") : "No bounded state fit.";
   const prompt = `${prefix}${request}${stateHeader}${state}${suffix}`;

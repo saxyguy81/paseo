@@ -1101,6 +1101,10 @@ export class AgentManager {
     registry: AgentStorage,
   ): Promise<"ready" | "continue" | "stop"> {
     if (isStoredPendingPromptPreflight(pending)) return "ready";
+    const stored = await registry.get(agentId);
+    if (stored?.completedPromptPreflightIds.includes(pending.id)) {
+      return "ready";
+    }
     let admission: AgentPromptAdmissionDecision;
     try {
       admission = this.planPromptAdmission(agentId, pending.prompt);

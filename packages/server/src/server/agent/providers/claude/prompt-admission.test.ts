@@ -126,8 +126,29 @@ describe("Claude prompt admission", () => {
   });
 
   test("dispatches when trustworthy context usage is unavailable", () => {
-    expect(planClaudePromptAdmission({ prompt: "/team continue", usage: undefined })).toEqual({
+    expect(planClaudePromptAdmission({ prompt: "continue", usage: undefined })).toEqual({
       type: "dispatch",
     });
+  });
+
+  test("precompacts an expansion-bearing slash command when occupancy is unknown", () => {
+    expect(
+      planClaudePromptAdmission({
+        prompt: "/team ok go ahead and do all this",
+        usage: { contextWindowMaxTokens: 200_000 },
+      }),
+    ).toMatchObject({
+      type: "preflight",
+      key: CLAUDE_CONTEXT_PREFLIGHT_KEY,
+    });
+  });
+
+  test("rejects an intrinsically oversized prompt even when occupancy is unknown", () => {
+    expect(
+      planClaudePromptAdmission({
+        prompt: "x".repeat(500_000),
+        usage: { contextWindowMaxTokens: 200_000 },
+      }),
+    ).toMatchObject({ type: "reject" });
   });
 });

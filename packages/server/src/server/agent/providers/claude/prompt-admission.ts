@@ -73,14 +73,7 @@ export function planClaudePromptAdmission(input: {
 
   const maxTokens = input.usage?.contextWindowMaxTokens;
   const usedTokens = input.usage?.contextWindowUsedTokens;
-  if (
-    typeof maxTokens !== "number" ||
-    !Number.isFinite(maxTokens) ||
-    maxTokens <= 0 ||
-    typeof usedTokens !== "number" ||
-    !Number.isFinite(usedTokens) ||
-    usedTokens < 0
-  ) {
+  if (typeof maxTokens !== "number" || !Number.isFinite(maxTokens) || maxTokens <= 0) {
     return { type: "dispatch" };
   }
 
@@ -101,6 +94,16 @@ export function planClaudePromptAdmission(input: {
         `for this ${maxTokens.toLocaleString()}-token model. Shorten the message or attach ` +
         "the large content as files.",
     };
+  }
+
+  // A resumed or newly hydrated native session can know its model capacity
+  // before Claude reports current occupancy. Expansion-bearing slash commands
+  // are unsafe to guess about in that state, so compact once and let the
+  // durable queue record that boundary before dispatching the original item.
+  if (typeof usedTokens !== "number" || !Number.isFinite(usedTokens) || usedTokens < 0) {
+    return isSlashCommand(input.prompt)
+      ? { type: "preflight", ...buildContextPreflight() }
+      : { type: "dispatch" };
   }
 
   if (usedTokens + estimatedPromptTokens + reserveTokens >= maxTokens) {
