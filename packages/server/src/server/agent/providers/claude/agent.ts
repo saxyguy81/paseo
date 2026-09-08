@@ -3864,7 +3864,11 @@ class ClaudeAgentSession implements AgentSession {
           text: this.buildRewindSuccessMessage(rewindAttempt.messageId, rewindAttempt.result),
         },
       });
-      this.finishForegroundTurn({ type: "turn_completed", provider: "claude" });
+      this.finishForegroundTurn({
+        type: "turn_completed",
+        provider: "claude",
+        outputProvenance: "local",
+      });
     } catch (error) {
       this.finishForegroundTurn({
         type: "turn_failed",
@@ -3968,7 +3972,11 @@ class ClaudeAgentSession implements AgentSession {
     if (!this.autonomousTurn) {
       return;
     }
-    this.notifySubscribers({ type: "turn_completed", provider: "claude" });
+    this.notifySubscribers({
+      type: "turn_completed",
+      provider: "claude",
+      outputProvenance: "provider",
+    });
     this.modelUnavailableRolloverEligible = true;
     this.autonomousTurn = null;
     this.activeForegroundQuery = null;
@@ -5173,7 +5181,12 @@ class ClaudeAgentSession implements AgentSession {
           },
         });
       }
-      events.push({ type: "turn_completed", provider: "claude", usage });
+      events.push({
+        type: "turn_completed",
+        provider: "claude",
+        outputProvenance: this.getResultOutputProvenance(outputTokens),
+        usage,
+      });
       return;
     }
     const resultErrorMessage =
@@ -5184,6 +5197,14 @@ class ClaudeAgentSession implements AgentSession {
     const errorMessage = captured?.error ?? resultErrorMessage;
     events.push(...this.sidechainTracker.finishAll("failed"));
     events.push(this.buildTurnFailedEvent(errorMessage, captured?.kind));
+  }
+
+  private getResultOutputProvenance(outputTokens: number | undefined): "provider" | "local" {
+    return this.foregroundHasProviderActivity ||
+      this.activeTurnHasAssistantText ||
+      (outputTokens ?? 0) > 0
+      ? "provider"
+      : "local";
   }
 
   private createClaudeSessionChangedNotice(

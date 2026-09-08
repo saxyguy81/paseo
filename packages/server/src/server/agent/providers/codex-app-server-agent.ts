@@ -5883,6 +5883,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.emitEvent({
         type: "turn_completed",
         provider: CODEX_PROVIDER,
+        outputProvenance: "provider",
         usage: this.latestUsage,
       });
     }

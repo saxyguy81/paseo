@@ -24,6 +24,10 @@ import {
   CONVERSATION_FAMILY_POSITION_LABEL,
   CONVERSATION_FAMILY_PREDECESSOR_LABEL,
   CONVERSATION_FAMILY_RESUME_MODEL_ROLLOVER_LABEL,
+  CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL,
+  CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL,
+  CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL,
+  CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL,
   getOpenAgentTabLabel,
   PARENT_AGENT_ID_LABEL,
 } from "@getpaseo/protocol/agent-labels";
@@ -530,6 +534,52 @@ class TestAgentSession implements AgentSession {
   }
 
   async close(): Promise<void> {}
+}
+
+class ControlledCompletionSession extends TestAgentSession {
+  private activeTurnId: string | null = null;
+
+  override async startTurn(): Promise<{ turnId: string }> {
+    const turnId = randomUUID();
+    this.activeTurnId = turnId;
+    setTimeout(() => this.pushEvent({ type: "turn_started", provider: this.provider, turnId }), 0);
+    return { turnId };
+  }
+
+  complete(options?: {
+    text?: string;
+    provider?: AgentProvider;
+    outputProvenance?: "provider" | "local";
+  }): void {
+    const turnId = this.activeTurnId;
+    if (!turnId) throw new Error("No active test turn");
+    const provider = options?.provider ?? this.provider;
+    if (options?.text !== undefined) {
+      this.pushEvent({
+        type: "timeline",
+        provider,
+        turnId,
+        item: { type: "assistant_message", text: options.text },
+      });
+    }
+    this.pushEvent({
+      type: "turn_completed",
+      provider,
+      turnId,
+      outputProvenance: options?.outputProvenance ?? "provider",
+    });
+    this.activeTurnId = null;
+  }
+}
+
+class ControlledCompletionClient extends TestAgentClient {
+  readonly sessions: ControlledCompletionSession[] = [];
+
+  override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+    const session = new ControlledCompletionSession(config);
+    this.sessions.push(session);
+    return session;
+  }
 }
 
 class McpCapableTestAgentSession extends TestAgentSession {
@@ -8845,6 +8895,7 @@ test.each([
         this.pushEvent({
           type: "turn_completed",
           provider: this.provider,
+          outputProvenance: "provider",
           turnId: this.lastTurnId,
         });
       }
@@ -8919,6 +8970,8 @@ test.each([
     expect(successor.persistence?.sessionId).toBe("fresh-native-session");
     expect(predecessor.labels[CONVERSATION_FAMILY_CURRENT_LABEL]).toBe(successorAgentId);
     expect(predecessor.labels[CONVERSATION_FAMILY_POSITION_LABEL]).toBe("0");
+    expect(successor.labels[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]).toBe("1");
+    expect(successor.labels[CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL]).toBeTruthy();
     expect(client.resumeOverrides).toHaveLength(0);
     expect(startedPrompts).toHaveLength(2);
     const continuationPrompt = startedPrompts[1];
@@ -8937,6 +8990,14 @@ test.each([
     (createdSessions[1] as OverflowSession).complete();
     await vi.waitFor(() => expect(startedPrompts).toHaveLength(3));
     await vi.waitFor(() => expect(manager.getAgent(successorAgentId)?.lifecycle).toBe("idle"));
+    await vi.waitFor(async () => {
+      expect(
+        (await storage.get(oldAgentId))?.labels[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL],
+      ).toBeUndefined();
+      expect(
+        (await storage.get(successorAgentId))?.labels[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL],
+      ).toBeUndefined();
+    });
     expect(startedPrompts[2]).toBe(queuedPrompt);
     await expect(manager.ensureAgentFailureContinuation(oldAgentId, failureKind)).resolves.toBe(
       successorAgentId,
@@ -9028,6 +9089,402 @@ test.each([
     }
   },
 );
+
+test("rollover budget survives a daemon restart and parks the current failed family", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-rollover-budget-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const agentId = "00000000-0000-4000-8000-000000000291";
+  const familyId = "family-budget-survives-restart";
+  const firstManager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    registry: storage,
+    logger,
+  });
+  await firstManager.createAgent({ provider: "codex", cwd: workdir, model: "gpt-5.4" }, agentId, {
+    workspaceId: undefined,
+    labels: {
+      [CONVERSATION_FAMILY_ID_LABEL]: familyId,
+      [CONVERSATION_FAMILY_CURRENT_LABEL]: agentId,
+      [CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]: "2",
+      [CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL]: new Date(
+        Date.now() - 61 * 60 * 1_000,
+      ).toISOString(),
+    },
+  });
+
+  const restartClient = new TestAgentClient();
+  const restartedManager = new AgentManager({
+    clients: { codex: restartClient },
+    registry: storage,
+    logger,
+  });
+  await ensureAgentLoaded(agentId, {
+    agentManager: restartedManager,
+    agentStorage: storage,
+    logger,
+  });
+  await storage.upsert({
+    ...(await storage.get(agentId))!,
+    lastError: "API Error: 409 Conversation already has an active request",
+  });
+  await restartedManager.appendTimelineItem(agentId, {
+    type: "user_message",
+    text: "Continue once the provider is available.",
+  });
+
+  await expect(
+    restartedManager.ensureAgentFailureContinuation(agentId, "conversation_unresolved"),
+  ).resolves.toBeNull();
+  // The one session is only the restart load; no successor was created.
+  expect(restartClient.createdConfigs.length + restartClient.resumeOverrides.length).toBe(1);
+  const parked = (await storage.get(agentId))!;
+  expect(parked.archivedAt).toBeFalsy();
+  expect(parked.labels[CONVERSATION_FAMILY_CURRENT_LABEL]).toBe(agentId);
+  expect(parked.labels[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]).toBe("2");
+});
+
+test.each([
+  {
+    name: "blank provider completion",
+    text: undefined,
+    provider: "codex" as const,
+    outputProvenance: "provider" as const,
+  },
+  {
+    name: "same-provider local command completion",
+    text: "Locally synthesized.",
+    provider: "codex" as const,
+    outputProvenance: "local" as const,
+  },
+])(
+  "$name does not reset the family rollover budget",
+  async ({ text, provider, outputProvenance }) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-manager-rollover-reset-rejected-"));
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const client = new ControlledCompletionClient();
+    const agentId = "00000000-0000-4000-8000-000000000292";
+    const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+    try {
+      await manager.createAgent({ provider: "codex", cwd: workdir }, agentId, {
+        workspaceId: undefined,
+        labels: {
+          [CONVERSATION_FAMILY_ID_LABEL]: "family-rejects-empty-reset",
+          [CONVERSATION_FAMILY_CURRENT_LABEL]: agentId,
+          [CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]: "7",
+          [CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]: "2",
+          [CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL]: new Date().toISOString(),
+        },
+      });
+      const run = manager.runAgent(agentId, "complete without provider-backed output");
+      await vi.waitFor(() => expect(manager.getAgent(agentId)?.lifecycle).toBe("running"));
+      client.sessions[0]!.complete({
+        ...(text === undefined ? {} : { text }),
+        provider,
+        outputProvenance,
+      });
+      await run;
+
+      const record = await storage.get(agentId);
+      expect(record?.labels[CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]).toBe("7");
+      expect(record?.labels[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]).toBe("2");
+    } finally {
+      await manager.closeAgent(agentId).catch(() => undefined);
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
+
+test("a noncanonical family member cannot reset the rollover budget", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-rollover-reset-noncanonical-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new ControlledCompletionClient();
+  const agentId = "00000000-0000-4000-8000-000000000293";
+  const currentId = "00000000-0000-4000-8000-000000000294";
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  try {
+    await manager.createAgent({ provider: "codex", cwd: workdir }, agentId, {
+      workspaceId: undefined,
+      labels: {
+        [CONVERSATION_FAMILY_ID_LABEL]: "family-rejects-noncanonical-reset",
+        [CONVERSATION_FAMILY_CURRENT_LABEL]: currentId,
+        [CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]: "4",
+        [CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]: "1",
+        [CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL]: new Date().toISOString(),
+      },
+    });
+    const run = manager.runAgent(agentId, "complete on an old family member");
+    await vi.waitFor(() => expect(manager.getAgent(agentId)?.lifecycle).toBe("running"));
+    client.sessions[0]!.complete({ text: "This output came from the old member." });
+    await run;
+
+    const record = await storage.get(agentId);
+    expect(record?.labels[CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]).toBe("4");
+    expect(record?.labels[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]).toBe("1");
+  } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("a substantive provider reply on the current member resets the rollover budget", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-rollover-reset-current-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new ControlledCompletionClient();
+  const agentId = "00000000-0000-4000-8000-000000000295";
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  try {
+    await manager.createAgent({ provider: "codex", cwd: workdir }, agentId, {
+      workspaceId: undefined,
+      labels: {
+        [CONVERSATION_FAMILY_ID_LABEL]: "family-accepts-substantive-reset",
+        [CONVERSATION_FAMILY_CURRENT_LABEL]: agentId,
+        [CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]: "9",
+        [CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]: "2",
+        [CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL]: new Date().toISOString(),
+      },
+    });
+    const run = manager.runAgent(agentId, "finish this turn cleanly");
+    await vi.waitFor(() => expect(manager.getAgent(agentId)?.lifecycle).toBe("running"));
+    client.sessions[0]!.complete({ text: "The requested work is complete." });
+    await run;
+
+    await vi.waitFor(async () => {
+      const record = await storage.get(agentId);
+      expect(record?.labels[CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]).toBe("10");
+      expect(record?.labels[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]).toBeUndefined();
+      expect(record?.labels[CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL]).toBeUndefined();
+      expect(record?.labels[CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL]).toBeUndefined();
+    });
+  } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("a delayed clean completion cannot clear a newer failure reservation", async () => {
+  class BlockingListStorage extends AgentStorage {
+    private blockNext = false;
+    private readonly blocked = deferred<void>();
+    private readonly released = deferred<void>();
+
+    blockNextList(): void {
+      this.blockNext = true;
+    }
+
+    waitUntilBlocked(): Promise<void> {
+      return this.blocked.promise;
+    }
+
+    releaseList(): void {
+      this.released.resolve();
+    }
+
+    override async list(): Promise<StoredAgentRecord[]> {
+      if (this.blockNext) {
+        this.blockNext = false;
+        this.blocked.resolve();
+        await this.released.promise;
+      }
+      return await super.list();
+    }
+  }
+
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-rollover-reset-race-"));
+  const storage = new BlockingListStorage(join(workdir, "agents"), logger);
+  const client = new ControlledCompletionClient();
+  const currentId = "00000000-0000-4000-8000-000000000296";
+  const successorId = "00000000-0000-4000-8000-000000000297";
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    idFactory: () => successorId,
+  });
+  try {
+    await manager.createAgent({ provider: "codex", cwd: workdir }, currentId, {
+      workspaceId: undefined,
+      labels: {
+        [CONVERSATION_FAMILY_ID_LABEL]: "family-reset-race",
+        [CONVERSATION_FAMILY_CURRENT_LABEL]: currentId,
+        [CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]: "1",
+        [CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]: "1",
+        [CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL]: new Date().toISOString(),
+      },
+    });
+    await manager.appendTimelineItem(currentId, {
+      type: "user_message",
+      text: "finish while recovery is being reserved",
+    });
+    const run = manager.runAgent(currentId, "finish while recovery is being reserved");
+    await vi.waitFor(() => expect(manager.getAgent(currentId)?.lifecycle).toBe("running"));
+
+    storage.blockNextList();
+    const rollover = manager.ensureAgentFailureContinuation(
+      currentId,
+      "conversation_unresolved",
+      "API Error: 409 Conversation has an unresolved prior request",
+    );
+    await storage.waitUntilBlocked();
+    client.sessions[0]!.complete({ text: "A late reply from the prior native session." });
+    storage.releaseList();
+
+    await run;
+    await expect(rollover).resolves.toBe(successorId);
+    await vi.waitFor(async () => {
+      expect((await storage.get(currentId))?.archivedAt).toBeTruthy();
+    });
+    const successor = await storage.get(successorId);
+    expect(successor?.labels[CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]).toBe("2");
+    expect(successor?.labels[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]).toBe("2");
+  } finally {
+    await manager.closeAgent(successorId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("two rollovers survive restart and the third failure parks the family", async () => {
+  class HangingSession extends TestAgentSession {
+    override async startTurn(): Promise<{ turnId: string }> {
+      const turnId = randomUUID();
+      setTimeout(
+        () => this.pushEvent({ type: "turn_started", provider: this.provider, turnId }),
+        0,
+      );
+      return { turnId };
+    }
+  }
+
+  class HangingClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new HangingSession(config);
+    }
+  }
+
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-rollover-budget-restart-chain-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const allIds = [
+    "00000000-0000-4000-8000-000000000298",
+    "00000000-0000-4000-8000-000000000299",
+    "00000000-0000-4000-8000-000000000300",
+  ];
+  const ids = [...allIds];
+  const manager = new AgentManager({
+    clients: { codex: new HangingClient() },
+    registry: storage,
+    logger,
+    idFactory: () => ids.shift() ?? randomUUID(),
+  });
+  try {
+    const original = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.appendTimelineItem(original.id, {
+      type: "user_message",
+      text: "Finish the queued validation without repeating completed work.",
+    });
+    const failureText = "API Error: 409 Conversation has an unresolved prior request";
+    const generationOne = await manager.ensureAgentFailureContinuation(
+      original.id,
+      "conversation_unresolved",
+      failureText,
+    );
+    expect(generationOne).toBe("00000000-0000-4000-8000-000000000299");
+    const generationTwo = await manager.ensureAgentFailureContinuation(
+      generationOne!,
+      "conversation_unresolved",
+      failureText,
+    );
+    expect(generationTwo).toBe("00000000-0000-4000-8000-000000000300");
+
+    const restartedStorage = new AgentStorage(join(workdir, "agents"), logger);
+    const restartedManager = new AgentManager({
+      clients: { codex: new HangingClient() },
+      registry: restartedStorage,
+      logger,
+      idFactory: () => "00000000-0000-4000-8000-000000000301",
+    });
+    await expect(
+      restartedManager.ensureAgentFailureContinuation(
+        generationTwo!,
+        "conversation_unresolved",
+        failureText,
+      ),
+    ).resolves.toBeNull();
+
+    const records = await restartedStorage.list();
+    expect(records).toHaveLength(3);
+    const current = records.find((record) => record.id === generationTwo);
+    expect(current?.archivedAt).toBeFalsy();
+    expect(current?.labels[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]).toBe("2");
+    expect(current?.labels[CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL]).toBe("true");
+  } finally {
+    for (const id of allIds) await manager.closeAgent(id).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("an expired rollover window starts a new automatic recovery budget", async () => {
+  class HangingSession extends TestAgentSession {
+    override async startTurn(): Promise<{ turnId: string }> {
+      const turnId = randomUUID();
+      setTimeout(
+        () => this.pushEvent({ type: "turn_started", provider: this.provider, turnId }),
+        0,
+      );
+      return { turnId };
+    }
+  }
+
+  class HangingClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new HangingSession(config);
+    }
+  }
+
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-rollover-window-expiry-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const agentId = "00000000-0000-4000-8000-000000000302";
+  const successorId = "00000000-0000-4000-8000-000000000303";
+  const manager = new AgentManager({
+    clients: { codex: new HangingClient() },
+    registry: storage,
+    logger,
+    idFactory: () => successorId,
+  });
+  try {
+    await manager.createAgent({ provider: "codex", cwd: workdir }, agentId, {
+      workspaceId: undefined,
+      labels: {
+        [CONVERSATION_FAMILY_ID_LABEL]: "family-expired-window",
+        [CONVERSATION_FAMILY_CURRENT_LABEL]: agentId,
+        [CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]: "8",
+        [CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]: "2",
+        [CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL]: new Date(
+          Date.now() - 61 * 60 * 1_000,
+        ).toISOString(),
+      },
+    });
+    await manager.appendTimelineItem(agentId, {
+      type: "user_message",
+      text: "Retry after the bounded outage window expires.",
+    });
+    await expect(
+      manager.ensureAgentFailureContinuation(
+        agentId,
+        "conversation_unresolved",
+        "API Error: 409 Conversation has an unresolved prior request",
+      ),
+    ).resolves.toBe(successorId);
+
+    const successor = await storage.get(successorId);
+    expect(successor?.labels[CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]).toBe("9");
+    expect(successor?.labels[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]).toBe("1");
+    expect(successor?.labels[CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL]).toBeUndefined();
+  } finally {
+    await manager.closeAgent(successorId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
 
 test("a repeated rollover consumes the failed queued prompt and transfers only the remaining FIFO", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-repeated-queued-rollover-"));

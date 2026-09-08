@@ -13,6 +13,10 @@ import {
   CONVERSATION_FAMILY_POSITION_LABEL,
   CONVERSATION_FAMILY_PREDECESSOR_LABEL,
   CONVERSATION_FAMILY_RESUME_MODEL_ROLLOVER_LABEL,
+  CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL,
+  CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL,
+  CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL,
+  CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL,
   getParentAgentIdFromLabels,
   hasOpenAgentTab,
   isDelegatedAgent,
@@ -99,6 +103,9 @@ import {
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
+// Constrain correlated provider outages without imposing a lifetime family cap.
+const AUTOMATIC_CONVERSATION_ROLLOVER_LIMIT = 2;
+const AUTOMATIC_CONVERSATION_ROLLOVER_WINDOW_MS = 60 * 60 * 1_000;
 const TRANSIENT_PROMPT_RETRY_BASE_DELAY_MS = 30_000;
 const TRANSIENT_PROMPT_RETRY_MAX_DELAY_MS = 5 * 60_000;
 const TRANSIENT_PROMPT_RECOVERY_PROMPT = `<paseo-system>
@@ -137,6 +144,94 @@ function isProviderTeardownFailure(error: string): boolean {
 function parseFamilyPosition(value: string | null | undefined): number {
   const position = Number(value);
   return Number.isInteger(position) && position >= 0 ? position : 0;
+}
+
+function parseAutomaticRolloverCount(value: string | null | undefined): number {
+  const count = Number(value);
+  return Number.isInteger(count) && count >= 0 ? count : 0;
+}
+
+function parseAutomaticRolloverEpoch(value: string | null | undefined): number {
+  const epoch = Number(value);
+  return Number.isInteger(epoch) && epoch >= 0 ? epoch : 0;
+}
+
+function parseAutomaticRolloverWindowStartedAt(value: string | null | undefined): Date | null {
+  if (!value) return null;
+  const timestamp = new Date(value);
+  return Number.isNaN(timestamp.getTime()) ? null : timestamp;
+}
+
+interface ConversationRolloverState {
+  epoch: number;
+  count: number;
+  windowStartedAt: Date | null;
+  parked: boolean;
+}
+
+function readConversationRolloverState(
+  familyMembers: readonly StoredAgentRecord[],
+  now: Date,
+): ConversationRolloverState {
+  const memberStates = familyMembers.map((member) => ({
+    epoch: parseAutomaticRolloverEpoch(member.labels?.[CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]),
+    count: parseAutomaticRolloverCount(member.labels?.[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]),
+    windowStartedAt: parseAutomaticRolloverWindowStartedAt(
+      member.labels?.[CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL],
+    ),
+    parked: member.labels?.[CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL] === "true",
+  }));
+  const epoch = Math.max(0, ...memberStates.map((state) => state.epoch));
+  const currentEpochStates = memberStates.filter((state) => state.epoch === epoch);
+  const activeStates = currentEpochStates.filter(
+    (state): state is typeof state & { windowStartedAt: Date } =>
+      state.windowStartedAt !== null &&
+      now.getTime() - state.windowStartedAt.getTime() < AUTOMATIC_CONVERSATION_ROLLOVER_WINDOW_MS,
+  );
+  if (activeStates.length === 0) {
+    return { epoch, count: 0, windowStartedAt: null, parked: false };
+  }
+  return {
+    epoch,
+    count: Math.max(...activeStates.map((state) => state.count)),
+    windowStartedAt: new Date(
+      Math.min(...activeStates.map((state) => state.windowStartedAt.getTime())),
+    ),
+    parked: activeStates.some((state) => state.parked),
+  };
+}
+
+function isConversationFamilyDurablyParked(familyMembers: readonly StoredAgentRecord[]): boolean {
+  const epoch = Math.max(
+    0,
+    ...familyMembers.map((member) =>
+      parseAutomaticRolloverEpoch(member.labels?.[CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]),
+    ),
+  );
+  return familyMembers.some(
+    (member) =>
+      parseAutomaticRolloverEpoch(member.labels?.[CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]) ===
+        epoch && member.labels?.[CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL] === "true",
+  );
+}
+
+function conversationRolloverStatePatch(state: ConversationRolloverState): AgentLabelPatch {
+  return {
+    [CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]: String(state.epoch),
+    [CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL]:
+      state.windowStartedAt?.toISOString() ?? null,
+    [CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]: state.count > 0 ? String(state.count) : null,
+    [CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL]: state.parked ? "true" : null,
+  };
+}
+
+function hasSubstantiveAssistantReply(rows: readonly AgentTimelineRow[], turnId: string): boolean {
+  return rows.some(
+    (row) =>
+      row.turnId === turnId &&
+      row.item.type === "assistant_message" &&
+      row.item.text.trim().length > 0,
+  );
 }
 
 function findConversationSuccessor(
@@ -845,6 +940,7 @@ export class AgentManager {
   private readonly inFlightAgentCloses = new Map<string, Promise<void>>();
   private readonly lifecycleMutationTails = new Map<string, Promise<void>>();
   private readonly conversationRollovers = new Map<string, Promise<string | null>>();
+  private readonly conversationFamilyMutationTails = new Map<string, Promise<void>>();
   private readonly pendingPromptDrainTasks = new Map<string, Promise<void>>();
   private readonly pendingPromptRetryTimers = new Map<string, NodeJS.Timeout>();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
@@ -1081,6 +1177,7 @@ export class AgentManager {
   private async consumeStoredPendingPromptQueue(agentId: string): Promise<void> {
     const registry = this.requireRegistry();
     while (!this.hasInFlightRun(agentId)) {
+      if (await this.isAgentPromptRecoveryParked(agentId)) return;
       const pending = await registry.claimPendingPrompt(agentId);
       if (!pending) return;
       const admission = await this.prepareStoredPromptAdmission(agentId, pending, registry);
@@ -1611,10 +1708,11 @@ export class AgentManager {
     if (existing) {
       return existing;
     }
-    const rollover = this.ensureAgentFailureContinuationInternal(
-      agentId,
-      failureKind,
-      persistedFailureText,
+    const record = await this.requireRegistry().get(agentId);
+    if (!record) return null;
+    const familyKey = record.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim() || agentId;
+    const rollover = this.runConversationFamilyMutation(familyKey, () =>
+      this.ensureAgentFailureContinuationUnlocked(agentId, failureKind, persistedFailureText),
     );
     this.conversationRollovers.set(agentId, rollover);
     try {
@@ -1626,7 +1724,7 @@ export class AgentManager {
     }
   }
 
-  private async ensureAgentFailureContinuationInternal(
+  private async ensureAgentFailureContinuationUnlocked(
     agentId: string,
     failureKind: ConversationRolloverFailureKind,
     persistedFailureText?: string,
@@ -1683,21 +1781,24 @@ export class AgentManager {
       successorId,
       failureKind,
     );
-    const successorPosition = parseFamilyPosition(labels[CONVERSATION_FAMILY_POSITION_LABEL]);
-    if (successorPosition >= 2) {
-      this.logger.warn(
-        {
-          agentId,
-          successorId,
-          familyId: labels[CONVERSATION_FAMILY_ID_LABEL],
-          familyName,
-          failureKind,
-          successorPosition,
-        },
-        "Conversation family required a repeated recovery rollover",
-      );
+    const familyId = labels[CONVERSATION_FAMILY_ID_LABEL]!;
+    const familyMembers = records.filter(
+      (record) =>
+        record.id === predecessor.id || record.labels?.[CONVERSATION_FAMILY_ID_LABEL] === familyId,
+    );
+    const automaticRolloverState = await this.reserveConversationRolloverBudget(
+      familyId,
+      familyMembers,
+      agentId,
+    );
+    if (!automaticRolloverState) {
+      return null;
     }
-
+    labels[CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL] = String(automaticRolloverState.epoch);
+    labels[CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL] =
+      automaticRolloverState.windowStartedAt!.toISOString();
+    labels[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL] = String(automaticRolloverState.count);
+    delete labels[CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL];
     const successor = await this.createAgent(buildStoredAgentConfig(predecessor), successorId, {
       labels,
       initialTitle: familyName,
@@ -1718,6 +1819,233 @@ export class AgentManager {
     const continuation = this.consumeFreshSessionContinuation(successor.id, prompt);
     this.trackBackgroundTask(continuation);
     return successor.id;
+  }
+
+  /**
+   * Reserve recovery before creating a successor. The family-wide labels are
+   * the restart-safe circuit breaker; an interrupted repair chooses the most
+   * restrictive active state rather than granting another automatic attempt.
+   */
+  private async reserveConversationRolloverBudget(
+    familyId: string,
+    familyMembers: readonly StoredAgentRecord[],
+    agentId: string,
+  ): Promise<ConversationRolloverState | null> {
+    const now = new Date();
+    const currentState = readConversationRolloverState(familyMembers, now);
+    if (isConversationFamilyDurablyParked(familyMembers)) {
+      this.logger.warn(
+        {
+          agentId,
+          familyId,
+          count: currentState.count,
+          limit: AUTOMATIC_CONVERSATION_ROLLOVER_LIMIT,
+        },
+        "Conversation rollover family remains parked pending explicit user retry",
+      );
+      return null;
+    }
+    if (currentState.count >= AUTOMATIC_CONVERSATION_ROLLOVER_LIMIT) {
+      const parkedState: ConversationRolloverState = {
+        ...currentState,
+        epoch: currentState.epoch + 1,
+        parked: true,
+      };
+      for (const member of familyMembers) {
+        await this.writeLabels(member.id, conversationRolloverStatePatch(parkedState));
+      }
+      this.logger.warn(
+        {
+          agentId,
+          familyId,
+          count: parkedState.count,
+          limit: AUTOMATIC_CONVERSATION_ROLLOVER_LIMIT,
+        },
+        "Conversation rollover budget exhausted; leaving the current conversation failed",
+      );
+      return null;
+    }
+    const nextState: ConversationRolloverState = {
+      epoch: currentState.epoch + 1,
+      count: currentState.count + 1,
+      windowStartedAt: currentState.windowStartedAt ?? now,
+      parked: false,
+    };
+    for (const member of familyMembers) {
+      await this.writeLabels(member.id, conversationRolloverStatePatch(nextState));
+    }
+    return nextState;
+  }
+
+  private async resetConversationRolloverBudget(params: {
+    agentId: string;
+    familyId: string;
+    expectedEpoch: number;
+    turnId: string;
+  }): Promise<void> {
+    await this.runConversationFamilyMutation(params.familyId, async () => {
+      const records = await this.requireRegistry().list();
+      const familyMembers = records.filter(
+        (record) => record.labels?.[CONVERSATION_FAMILY_ID_LABEL] === params.familyId,
+      );
+      const current = familyMembers.find((member) => member.id === params.agentId);
+      if (
+        !current ||
+        current.archivedAt ||
+        current.labels?.[CONVERSATION_FAMILY_CURRENT_LABEL] !== params.agentId ||
+        current.labels?.[CONVERSATION_FAMILY_HIDDEN_LABEL] === "true"
+      ) {
+        return;
+      }
+      const state = readConversationRolloverState(familyMembers, new Date());
+      if (state.epoch !== params.expectedEpoch || state.count === 0) return;
+      if (
+        !hasSubstantiveAssistantReply(this.timelineStore.getRows(params.agentId), params.turnId)
+      ) {
+        return;
+      }
+      const resetState: ConversationRolloverState = {
+        epoch: state.epoch + 1,
+        count: 0,
+        windowStartedAt: null,
+        parked: false,
+      };
+      for (const member of familyMembers) {
+        await this.writeLabels(member.id, conversationRolloverStatePatch(resetState));
+      }
+    });
+  }
+
+  /**
+   * A new user prompt is an explicit decision to retry a family that automatic
+   * recovery parked. Start that prompt on a fresh native session, never on the
+   * session whose repeated failures exhausted the budget.
+   */
+  async prepareAgentPromptTarget(agentId: string): Promise<string> {
+    const registry = this.requireRegistry();
+    const initialRecord = await registry.get(agentId);
+    if (!initialRecord) return agentId;
+    const familyId = initialRecord.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim();
+    if (!familyId) return agentId;
+
+    return await this.runConversationFamilyMutation(familyId, async () => {
+      const records = await registry.list();
+      const requested = records.find((record) => record.id === agentId);
+      if (!requested) return agentId;
+      const currentId =
+        requested.labels?.[CONVERSATION_FAMILY_CURRENT_LABEL]?.trim() || requested.id;
+      const current = records.find((record) => record.id === currentId) ?? requested;
+      const familyMembers = records.filter(
+        (record) =>
+          record.id === current.id || record.labels?.[CONVERSATION_FAMILY_ID_LABEL] === familyId,
+      );
+      const priorSuccessor = findConversationSuccessor(records, current.id);
+      if (priorSuccessor) {
+        await this.repairConversationFamily(current.id, priorSuccessor.id);
+        return priorSuccessor.id;
+      }
+
+      const state = readConversationRolloverState(familyMembers, new Date());
+      if (!isConversationFamilyDurablyParked(familyMembers)) return current.id;
+
+      const successorId = this.idFactory();
+      const fallbackFailureKind: ConversationRolloverFailureKind = "conversation_unresolved";
+      const { familyName, labels } = buildConversationSuccessorMetadata(
+        records,
+        current,
+        successorId,
+        isConversationRolloverFailureKind(current.lastFailureKind)
+          ? current.lastFailureKind
+          : fallbackFailureKind,
+      );
+      const resetState: ConversationRolloverState = {
+        epoch: state.epoch + 1,
+        count: 0,
+        windowStartedAt: null,
+        parked: false,
+      };
+      labels[CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL] = String(resetState.epoch);
+      delete labels[CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL];
+      delete labels[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL];
+      delete labels[CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL];
+
+      const successor = await this.createAgent(buildStoredAgentConfig(current), successorId, {
+        labels,
+        initialTitle: familyName,
+        workspaceId: current.workspaceId,
+        owner: current.owner,
+      });
+      if (current.continuationRequest) {
+        const successorRecord = await registry.get(successor.id);
+        if (!successorRecord) {
+          throw new Error("Explicit conversation retry successor is missing from storage");
+        }
+        await registry.upsert({
+          ...successorRecord,
+          continuationRequest: current.continuationRequest,
+        });
+      }
+      await this.repairConversationFamily(current.id, successor.id);
+      const repairedFamily = (await registry.list()).filter(
+        (record) => record.labels?.[CONVERSATION_FAMILY_ID_LABEL] === familyId,
+      );
+      for (const member of repairedFamily) {
+        await this.writeLabels(member.id, conversationRolloverStatePatch(resetState));
+      }
+      this.logger.info(
+        { agentId: current.id, successorId: successor.id, familyId },
+        "Started explicit retry on a fresh conversation family member",
+      );
+      return successor.id;
+    });
+  }
+
+  /**
+   * Resolve the current family member and perform prompt admission while the
+   * same family mutation lane used by explicit retry and FIFO transfer is held.
+   * This prevents a system notification from enqueueing on a predecessor
+   * after an explicit retry has moved the family to a fresh canonical member.
+   */
+  async withConversationFamilyPromptTarget<T>(
+    agentId: string,
+    operation: (targetAgentId: string, recoveryParked: boolean) => Promise<T>,
+  ): Promise<T> {
+    const registry = this.requireRegistry();
+    const initial = await registry.get(agentId);
+    if (!initial) return await operation(agentId, false);
+    const familyId = initial.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim();
+    if (!familyId) {
+      return await operation(
+        agentId,
+        initial.labels?.[CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL] === "true",
+      );
+    }
+
+    return await this.runConversationFamilyMutation(familyId, async () => {
+      const records = await registry.list();
+      const requested = records.find((record) => record.id === agentId) ?? initial;
+      const currentId =
+        requested.labels?.[CONVERSATION_FAMILY_CURRENT_LABEL]?.trim() || requested.id;
+      const current = records.find((record) => record.id === currentId) ?? requested;
+      const familyMembers = records.filter(
+        (record) => record.labels?.[CONVERSATION_FAMILY_ID_LABEL] === familyId,
+      );
+      return await operation(current.id, isConversationFamilyDurablyParked(familyMembers));
+    });
+  }
+
+  async isAgentPromptRecoveryParked(agentId: string): Promise<boolean> {
+    const records = await this.requireRegistry().list();
+    const requested = records.find((record) => record.id === agentId);
+    if (!requested) return false;
+    const familyId = requested.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim();
+    if (!familyId) {
+      return requested.labels?.[CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL] === "true";
+    }
+    const familyMembers = records.filter(
+      (record) => record.labels?.[CONVERSATION_FAMILY_ID_LABEL] === familyId,
+    );
+    return isConversationFamilyDurablyParked(familyMembers);
   }
 
   private async getConversationFamilyRolloverTimelineRows(
@@ -2814,6 +3142,26 @@ export class AgentManager {
       }
     });
     return result;
+  }
+
+  private async runConversationFamilyMutation<T>(
+    familyKey: string,
+    mutation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = this.conversationFamilyMutationTails.get(familyKey) ?? Promise.resolve();
+    const run = previous.catch(() => undefined).then(mutation);
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.conversationFamilyMutationTails.set(familyKey, tail);
+    try {
+      return await run;
+    } finally {
+      if (this.conversationFamilyMutationTails.get(familyKey) === tail) {
+        this.conversationFamilyMutationTails.delete(familyKey);
+      }
+    }
   }
 
   async runAgent(
@@ -5002,6 +5350,28 @@ export class AgentManager {
     // it from the completion event.
     agent.lastError = undefined;
     agent.lastFailureKind = undefined;
+    const familyId = agent.labels[CONVERSATION_FAMILY_ID_LABEL]?.trim();
+    if (
+      familyId &&
+      event.provider === agent.provider &&
+      event.outputProvenance === "provider" &&
+      eventTurnId
+    ) {
+      const reset = this.resetConversationRolloverBudget({
+        agentId: agent.id,
+        familyId,
+        expectedEpoch: parseAutomaticRolloverEpoch(
+          agent.labels[CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL],
+        ),
+        turnId: eventTurnId,
+      }).catch((error) => {
+        this.logger.error(
+          { err: error, agentId: agent.id },
+          "Failed to reset conversation rollover budget after clean completion",
+        );
+      });
+      this.trackBackgroundTask(reset);
+    }
     if (
       !isForegroundEvent &&
       !agent.activeForegroundTurnId &&

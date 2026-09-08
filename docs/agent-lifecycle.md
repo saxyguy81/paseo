@@ -108,6 +108,30 @@ adopt the already-created successor instead of creating another one. The UI stit
 predecessor and writable successor into one searchable conversation history while keeping future
 prompts on the canonical successor.
 
+Automatic rollover has a family-wide budget of two fresh sessions per rolling hour. Exhaustion parks
+the family and leaves its prompt FIFO on disk. Daemon startup must not resume that native session or
+drain the FIFO. A new user message is an explicit retry: Paseo creates a fresh canonical member,
+transfers the FIFO, and starts the message there. System notifications remain queued while the family
+is parked. The durable park latch does not expire into an unsafe startup resume; only an explicit user
+retry re-arms the family on a fresh native session.
+
+System-notification admission resolves the writable canonical member and enqueues under the same
+family operation boundary as explicit retry and FIFO transfer. If the notification wins the race, the
+retry transfers it; if the retry wins, the notification targets the successor directly. It cannot be
+stranded on the archived predecessor or duplicated across both members.
+
+Prompt entrypoints receive that fresh member's effective agent ID. WebSocket acknowledgements, MCP
+blocking waits, background finish notifications, and status reads must follow that ID instead of the
+archived predecessor supplied by the caller.
+
+The budget expires after one hour or resets after the current writable member ends a provider turn
+with a non-empty assistant reply. The terminal event must explicitly identify its output as
+provider-backed; matching the agent's provider name is not proof because Claude local commands such
+as unknown slash commands and rewind use the same provider identity. Empty completions, local
+synthetic completions, history from an old member, and stale completion events do not reset it.
+Family updates carry a monotonic epoch and run through one serialized operation so a late completion
+cannot clear a newer failure reservation.
+
 Daemon shutdown also preserves any durable rollover failure already recorded for a family member.
 The supervisor can terminate a provider subprocess just before the worker enters its shutdown state;
 the resulting synthetic SIGTERM failure is teardown noise and must not replace the failure that tells

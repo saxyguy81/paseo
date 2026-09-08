@@ -281,6 +281,19 @@ export class OmpHarness {
     return await session.run(input);
   }
 
+  async runPromptWithCustomMessageWithoutTurn(input: string, output: string): Promise<unknown> {
+    const session = this.requireSession();
+    const runtime = this.omp.latestSession();
+    const promptStarted = runtime.nextPrompt();
+    const run = session.run(input);
+    await promptStarted;
+    runtime.emit({
+      type: "message_end",
+      message: { role: "custom", content: output },
+    });
+    return await run;
+  }
+
   async startPromptWithFalseLocalOnlyResult(
     input: string,
   ): Promise<{ completed: () => boolean; completion: Promise<unknown> }> {
@@ -408,6 +421,13 @@ export class OmpHarness {
 
   completedTurnCount(): number {
     return this.events.filter((event) => event.type === "turn_completed").length;
+  }
+
+  turnCompletions() {
+    return this.events.filter(
+      (event): event is Extract<AgentStreamEvent, { type: "turn_completed" }> =>
+        event.type === "turn_completed",
+    );
   }
 
   usageUpdates() {

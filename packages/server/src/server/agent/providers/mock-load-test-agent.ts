@@ -1251,6 +1251,7 @@ export class MockLoadTestAgentSession implements AgentSession {
     this.emit({
       type: "turn_completed",
       provider: this.provider,
+      outputProvenance: "provider",
       turnId: turn.turnId,
     });
     turn.resolve({
@@ -1387,6 +1388,7 @@ export class MockLoadTestAgentSession implements AgentSession {
     this.emit({
       type: "turn_completed",
       provider: this.provider,
+      outputProvenance: "provider",
       turnId: turn.turnId,
       usage,
     });
@@ -1462,6 +1464,7 @@ export class MockLoadTestAgentSession implements AgentSession {
     this.emit({
       type: "turn_completed",
       provider: this.provider,
+      outputProvenance: "provider",
       turnId: turn.turnId,
       usage,
     });
@@ -1577,6 +1580,7 @@ export class MockLoadTestAgentSession implements AgentSession {
     this.emit({
       type: "turn_completed",
       provider: this.provider,
+      outputProvenance: "provider",
       turnId: turn.turnId,
       usage,
     });

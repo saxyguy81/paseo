@@ -435,6 +435,8 @@ export type AgentStreamEvent =
   | {
       type: "turn_completed";
       provider: AgentProvider;
+      /** Whether the completed turn produced model/provider work or only local client output. */
+      outputProvenance?: "provider" | "local";
       usage?: AgentUsage;
       turnId?: string;
     }

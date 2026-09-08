@@ -51,7 +51,10 @@ import type { GeneratedWorkspaceName } from "../worktree-branch-name-generator.j
 import type { ForgeService } from "../../services/forge-service.js";
 import { areEquivalentPaths } from "../../utils/path.js";
 import type { TerminalManager } from "../../terminal/terminal-manager.js";
-import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
+import {
+  CONVERSATION_FAMILY_ID_LABEL,
+  PARENT_AGENT_ID_LABEL,
+} from "@getpaseo/protocol/agent-labels";
 import { MutableDaemonConfigSchema, type AgentProfile } from "@getpaseo/protocol/messages";
 import type { DaemonConfigStore } from "../daemon-config-store.js";
 import type { BrowserToolsBroker, BrowserToolsExecuteInput } from "../browser-tools/broker.js";
@@ -219,6 +222,8 @@ function buildAgentManagerSpies() {
     appendTimelineItem: vi.fn().mockResolvedValue(undefined),
     emitLiveTimelineItem: vi.fn().mockResolvedValue(undefined),
     hasInFlightRun: vi.fn().mockReturnValue(false),
+    prepareAgentPromptTarget: vi.fn(async (agentId: string) => agentId),
+    isAgentPromptRecoveryParked: vi.fn().mockResolvedValue(false),
     tryRunOutOfBand: vi.fn().mockReturnValue(false),
     planPromptAdmission: vi.fn().mockReturnValue({ type: "dispatch" }),
     subscribe: vi.fn().mockReturnValue(() => {}),
@@ -3685,6 +3690,117 @@ describe("send_agent_prompt MCP tool", () => {
       "child-agent",
       expect.objectContaining({ waitForActive: true }),
     );
+  });
+
+  it("waits on and returns the effective rollover successor", async () => {
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    const originalId = "parked-child-agent";
+    const successorId = "fresh-child-agent";
+    const original = createStoredRecord({
+      id: originalId,
+      archivedAt: null,
+      labels: { [CONVERSATION_FAMILY_ID_LABEL]: "family-effective-mcp-send" },
+    });
+    const successor = createStoredRecord({
+      id: successorId,
+      archivedAt: null,
+      labels: { [CONVERSATION_FAMILY_ID_LABEL]: "family-effective-mcp-send" },
+    });
+    spies.agentStorage.get.mockImplementation(async (agentId: string) =>
+      agentId === originalId ? original : successor,
+    );
+    spies.agentManager.prepareAgentPromptTarget.mockResolvedValue(successorId);
+    spies.agentManager.getAgent.mockImplementation((agentId: string) =>
+      agentId === successorId
+        ? ({
+            id: successorId,
+            cwd: existingCwd,
+            lifecycle: "idle",
+            currentModeId: null,
+            availableModes: [],
+            config: { title: "Fresh child" },
+          } as ManagedAgent)
+        : null,
+    );
+
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      providerSnapshotManager: createOpenCodeManager().manager,
+      logger,
+    });
+    const response = await invokeToolWithParsedInput(registeredTool(server, "send_agent_prompt"), {
+      agentId: originalId,
+      prompt: "Continue on the fresh session.",
+    });
+
+    expect(spies.agentManager.waitForAgentEvent).toHaveBeenCalledWith(
+      successorId,
+      expect.objectContaining({ waitForActive: true }),
+    );
+    expect(response.structuredContent.agentId).toBe(successorId);
+  });
+
+  it("attaches a background finish notification to the effective rollover successor", async () => {
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    const parentId = "parent-agent";
+    const originalId = "parked-background-child";
+    const successorId = "fresh-background-child";
+    const records = new Map([
+      [parentId, createStoredRecord({ id: parentId, archivedAt: null })],
+      [
+        originalId,
+        createStoredRecord({
+          id: originalId,
+          archivedAt: null,
+          labels: { [CONVERSATION_FAMILY_ID_LABEL]: "family-effective-mcp-notify" },
+        }),
+      ],
+      [successorId, createStoredRecord({ id: successorId, archivedAt: null })],
+    ]);
+    spies.agentStorage.get.mockImplementation(async (agentId: string) => records.get(agentId));
+    spies.agentManager.prepareAgentPromptTarget.mockResolvedValue(successorId);
+    spies.agentManager.getAgent.mockImplementation((agentId: string) => {
+      if (agentId === parentId) {
+        return {
+          id: parentId,
+          cwd: existingCwd,
+          workspaceId: "wks_parent",
+          provider: "codex",
+          lifecycle: "idle",
+          currentModeId: "full-access",
+        } as ManagedAgent;
+      }
+      if (agentId === successorId) {
+        return {
+          id: successorId,
+          cwd: existingCwd,
+          lifecycle: "running",
+          currentModeId: null,
+          availableModes: [],
+          config: { title: "Fresh child" },
+        } as ManagedAgent;
+      }
+      return null;
+    });
+
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      providerSnapshotManager: createOpenCodeManager().manager,
+      callerAgentId: parentId,
+      logger,
+    });
+    const response = await invokeToolWithParsedInput(registeredTool(server, "send_agent_prompt"), {
+      agentId: originalId,
+      prompt: "Continue in the background.",
+    });
+
+    expect(spies.agentManager.subscribe).toHaveBeenCalledWith(expect.any(Function), {
+      agentId: successorId,
+      replayState: false,
+    });
+    expect(response.structuredContent.agentId).toBe(successorId);
   });
 
   it("does not arm a finish notification for blocking agent-scoped prompts", async () => {

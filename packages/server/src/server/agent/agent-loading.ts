@@ -85,6 +85,12 @@ export async function reconcileStoredConversationContinuations(deps: {
   const reconciled: ConversationRolloverReconciliationResult[] = [];
   for (const predecessor of candidates) {
     try {
+      // Exhaustion is a durable latch, not merely an expiring rate window.
+      // Startup must never reconnect to the native session that the family
+      // parked; only an explicit user prompt may create a fresh successor.
+      if (await deps.agentManager.isAgentPromptRecoveryParked(predecessor.id)) {
+        continue;
+      }
       await ensureAgentLoaded(predecessor.id, deps);
       const hydratedFailure = readTerminalConversationRolloverFailure(
         await deps.agentManager.getTimelineRows(predecessor.id),

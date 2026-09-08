@@ -8,6 +8,10 @@ import {
   CONVERSATION_FAMILY_POSITION_LABEL,
   CONVERSATION_FAMILY_PREDECESSOR_LABEL,
   CONVERSATION_FAMILY_RESUME_MODEL_ROLLOVER_LABEL,
+  CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL,
+  CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL,
+  CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL,
+  CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL,
 } from "@getpaseo/protocol/agent-labels";
 import { expect, test, vi } from "vitest";
 
@@ -93,6 +97,89 @@ test("loads archived records for history and active records with the interactive
       manager.closeAgent(activeId).catch(() => undefined),
     ]);
     await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("startup reconciliation does not resume an aged parked family's poisoned session", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "agent-loading-parked-bootstrap-"));
+  const logger = createTestLogger();
+  const storage = new AgentStorage(path.join(root, "agents"), logger);
+  const baseClient = createTestAgentClients().codex;
+  if (!baseClient) throw new Error("expected Codex test client");
+
+  const agentId = "00000000-0000-4000-8000-000000000399";
+  const setupManager = new AgentManager({
+    clients: { codex: baseClient },
+    registry: storage,
+    logger,
+  });
+  await setupManager.createAgent({ provider: "codex", cwd: root }, agentId, {
+    workspaceId: "workspace-parked",
+    labels: {
+      [CONVERSATION_FAMILY_ID_LABEL]: "family-parked-at-bootstrap",
+      [CONVERSATION_FAMILY_CURRENT_LABEL]: agentId,
+      [CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]: "4",
+      [CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]: "2",
+      [CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL]: "true",
+      [CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL]: new Date(
+        Date.now() - 61 * 60 * 1_000,
+      ).toISOString(),
+    },
+  });
+  await setupManager.closeAgent(agentId);
+  const stored = await storage.get(agentId);
+  if (!stored) throw new Error("expected persisted parked agent");
+  await storage.upsert({
+    ...stored,
+    lastStatus: "error",
+    lastError: "API Error: 409 Conversation has an unresolved prior request",
+    lastFailureKind: "conversation_unresolved",
+  });
+
+  let createCount = 0;
+  let resumeCount = 0;
+  const client: AgentClient = {
+    provider: baseClient.provider,
+    capabilities: baseClient.capabilities,
+    createSession: async (config, launchContext) => {
+      createCount += 1;
+      return await baseClient.createSession(config, launchContext);
+    },
+    resumeSession: async (handle, overrides, launchContext, options) => {
+      resumeCount += 1;
+      return await baseClient.resumeSession(handle, overrides, launchContext, options);
+    },
+    fetchCatalog: async (options) => await baseClient.fetchCatalog(options),
+    isAvailable: async () => await baseClient.isAvailable(),
+  };
+  const restartedManager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000400",
+  });
+
+  try {
+    await expect(
+      reconcileStoredConversationContinuations({
+        agentManager: restartedManager,
+        agentStorage: storage,
+        logger,
+      }),
+    ).resolves.toEqual([]);
+    expect(resumeCount).toBe(0);
+    expect(createCount).toBe(0);
+    const records = await storage.list();
+    expect(records).toHaveLength(1);
+    expect(records[0]?.id).toBe(agentId);
+    expect(records[0]?.archivedAt).toBeFalsy();
+    expect(records[0]?.labels[CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL]).toBe("true");
+  } finally {
+    await restartedManager.closeAgent(agentId).catch(() => undefined);
+    await restartedManager.flush().catch(() => undefined);
+    await setupManager.flush().catch(() => undefined);
     await storage.flush().catch(() => undefined);
     await rm(root, { recursive: true, force: true });
   }

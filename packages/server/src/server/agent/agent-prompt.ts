@@ -16,7 +16,10 @@ import {
 } from "./agent-storage.js";
 import { ensureAgentLoaded } from "./agent-loading.js";
 import { isInternalPromptPreflightId } from "./prompt-preflight.js";
-import { getParentAgentIdFromLabels } from "@getpaseo/protocol/agent-labels";
+import {
+  CONVERSATION_FAMILY_ID_LABEL,
+  getParentAgentIdFromLabels,
+} from "@getpaseo/protocol/agent-labels";
 import type { ActiveTurnBehavior } from "@getpaseo/protocol/messages";
 
 export type AgentUnarchiveController = Pick<AgentManager, "notifyAgentState" | "unarchiveSnapshot">;
@@ -47,6 +50,12 @@ export interface AgentRunSettlement {
 }
 
 export type PromptDispatchDisposition = "out_of_band" | "queued" | "steered" | "turn_started";
+
+export interface SendPromptToAgentResult {
+  disposition: PromptDispatchDisposition;
+  /** The canonical agent that owns the accepted prompt after any family rollover. */
+  effectiveAgentId: string;
+}
 
 const promptAdmissionTails = new WeakMap<AgentManager, Map<string, Promise<void>>>();
 
@@ -289,6 +298,9 @@ export async function resumePendingAgentPrompts(params: {
       .filter((record) => !record.archivedAt && record.pendingPrompts.length > 0)
       .map(async (record) => {
         try {
+          if (await params.agentManager.isAgentPromptRecoveryParked(record.id)) {
+            return;
+          }
           await ensureAgentLoaded(record.id, {
             agentManager: params.agentManager,
             agentStorage: params.agentStorage,
@@ -463,7 +475,7 @@ export async function waitForAgentRunStartWithTimeout(
  */
 export async function sendPromptToAgent(
   params: SendPromptToAgentParams,
-): Promise<{ disposition: PromptDispatchDisposition }> {
+): Promise<SendPromptToAgentResult> {
   if (params.messageId && isInternalPromptPreflightId(params.messageId)) {
     throw new Error("Prompt message id uses Paseo's reserved internal prefix");
   }
@@ -472,39 +484,68 @@ export async function sendPromptToAgent(
   const record = await params.agentStorage.get(params.agentId);
   if (record?.archivedAt) {
     if (!unarchive) {
-      return { disposition: "turn_started" };
+      return { disposition: "turn_started", effectiveAgentId: params.agentId };
     }
     await unarchiveAgentState(params.agentStorage, params.agentManager, params.agentId);
   }
 
-  await ensureAgentLoaded(params.agentId, {
+  const isExplicitUserPrompt =
+    typeof params.prompt !== "string" || !isSystemInjectedEnvelope(params.prompt);
+  const belongsToConversationFamily = Boolean(
+    record?.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim(),
+  );
+  let targetAgentId = params.agentId;
+  if (isExplicitUserPrompt && belongsToConversationFamily) {
+    targetAgentId = await params.agentManager.prepareAgentPromptTarget(params.agentId);
+  } else if (belongsToConversationFamily) {
+    const familyAdmission = await params.agentManager.withConversationFamilyPromptTarget(
+      params.agentId,
+      async (canonicalAgentId, recoveryParked) => ({
+        targetAgentId: canonicalAgentId,
+        queued: recoveryParked
+          ? await enqueuePromptForDrain({ ...params, agentId: canonicalAgentId })
+          : null,
+      }),
+    );
+    targetAgentId = familyAdmission.targetAgentId;
+    if (familyAdmission.queued) {
+      return {
+        ...familyAdmission.queued,
+        effectiveAgentId: targetAgentId,
+      };
+    }
+  }
+  const targetParams =
+    targetAgentId === params.agentId ? params : { ...params, agentId: targetAgentId };
+
+  await ensureAgentLoaded(targetAgentId, {
     agentManager: params.agentManager,
     agentStorage: params.agentStorage,
     logger: params.logger,
   });
 
   if (params.sessionMode) {
-    await params.agentManager.setAgentMode(params.agentId, params.sessionMode);
+    await params.agentManager.setAgentMode(targetAgentId, params.sessionMode);
   }
 
   const runOptions = params.messageId
     ? { ...params.runOptions, clientMessageId: params.messageId }
     : params.runOptions;
 
-  return await runPromptAdmission(params.agentManager, params.agentId, async () => {
-    const snapshot = params.agentManager.getAgent(params.agentId);
-    const hasInFlightRun = params.agentManager.hasInFlightRun(params.agentId);
+  const result = await runPromptAdmission(params.agentManager, targetAgentId, async () => {
+    const snapshot = params.agentManager.getAgent(targetAgentId);
+    const hasInFlightRun = params.agentManager.hasInFlightRun(targetAgentId);
     // Out-of-band controls are local session state changes; they never enter
     // the model context. Classify them before provider prompt admission. Once
     // a provider-bound prompt is assigned to the durable FIFO below, it cannot
     // escape through this side channel or reorder around a synthetic compact.
     if (
       hasInFlightRun &&
-      params.agentManager.tryRunOutOfBand(params.agentId, params.prompt, runOptions)
+      params.agentManager.tryRunOutOfBand(targetAgentId, params.prompt, runOptions)
     ) {
       return { disposition: "out_of_band" as const };
     }
-    const promptAdmission = params.agentManager.planPromptAdmission(params.agentId, params.prompt);
+    const promptAdmission = params.agentManager.planPromptAdmission(targetAgentId, params.prompt);
     if (promptAdmission.type === "reject") {
       throw new Error(promptAdmission.message);
     }
@@ -516,7 +557,7 @@ export async function sendPromptToAgent(
       snapshot?.capabilities.supportsInFlightSteering !== true &&
       params.clearPendingPermissions === true &&
       Boolean(snapshot?.pendingPermissions.size);
-    const latestRecord = await params.agentStorage.get(params.agentId);
+    const latestRecord = await params.agentStorage.get(targetAgentId);
     const shouldQueue = promptMustUseDurableQueue({
       hasInFlightRun,
       pendingPrompts: latestRecord?.pendingPrompts ?? [],
@@ -528,10 +569,10 @@ export async function sendPromptToAgent(
       replaceBlockedPermission,
     });
     if (shouldQueue) {
-      return await enqueuePromptForDrain(params);
+      return await enqueuePromptForDrain(targetParams);
     }
 
-    return await startAgentRun(params.agentManager, params.agentId, params.prompt, params.logger, {
+    return await startAgentRun(params.agentManager, targetAgentId, params.prompt, params.logger, {
       replaceRunning: true,
       // A permission-blocked request cannot drain a FIFO. Retire it through
       // the acknowledged interrupt path before starting the replacement.
@@ -543,13 +584,14 @@ export async function sendPromptToAgent(
           await drainNextPendingPrompt({
             agentManager: params.agentManager,
             agentStorage: params.agentStorage,
-            agentId: params.agentId,
+            agentId: targetAgentId,
             logger: params.logger,
           });
         }
       },
     });
   });
+  return { ...result, effectiveAgentId: targetAgentId };
 }
 
 export async function startCreatedAgentInitialPrompt(

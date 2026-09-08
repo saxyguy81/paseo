@@ -2598,6 +2598,7 @@ describe("OpenCode adapter startTurn error handling", () => {
         expect(events).toContainEqual({
           type: "turn_completed",
           provider: "opencode",
+          outputProvenance: "provider",
           turnId: "opencode-turn-1",
           usage: expect.objectContaining({
             inputTokens: 7,

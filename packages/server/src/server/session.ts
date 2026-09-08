@@ -7395,6 +7395,7 @@ export class Session {
       );
       let dispatchResult: {
         disposition: "out_of_band" | "queued" | "steered" | "turn_started";
+        effectiveAgentId: string;
       };
       try {
         dispatchResult = await sendPromptToAgent({
@@ -7427,7 +7428,7 @@ export class Session {
           type: "send_agent_message_response",
           payload: {
             requestId: msg.requestId,
-            agentId,
+            agentId: dispatchResult.effectiveAgentId,
             accepted: true,
             error: null,
           },
@@ -7436,13 +7437,13 @@ export class Session {
       }
 
       try {
-        await waitForAgentRunStartWithTimeout(this.agentManager, agentId);
+        await waitForAgentRunStartWithTimeout(this.agentManager, dispatchResult.effectiveAgentId);
       } catch (error) {
         this.emit({
           type: "send_agent_message_response",
           payload: {
             requestId: msg.requestId,
-            agentId,
+            agentId: dispatchResult.effectiveAgentId,
             accepted: false,
             error: errorToFriendlyMessage(error),
           },
@@ -7454,7 +7455,7 @@ export class Session {
         type: "send_agent_message_response",
         payload: {
           requestId: msg.requestId,
-          agentId,
+          agentId: dispatchResult.effectiveAgentId,
           accepted: true,
           error: null,
         },

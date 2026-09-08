@@ -185,6 +185,7 @@ describe("OMP agent client and session", () => {
     ]);
     expect(omp.eventTypes().slice(0, 2)).toEqual(["turn_started", "timeline"]);
     expect(omp.completedTurnCount()).toBe(1);
+    expect(omp.turnCompletions()[0]?.outputProvenance).toBe("provider");
   });
 
   test("streams OMP advisor messages as distinct tool-call blocks", async () => {
@@ -413,6 +414,18 @@ describe("OMP agent client and session", () => {
 
     await expect(omp.runPromptWithoutTurn("/model")).resolves.toMatchObject({ finalText: "" });
     expect(omp.completedTurnCount()).toBe(1);
+    expect(omp.turnCompletions()[0]?.outputProvenance).toBe("local");
+  });
+
+  test("marks a custom-role completion without a provider turn as local", async () => {
+    const omp = new OmpHarness();
+    await omp.start();
+
+    await expect(
+      omp.runPromptWithCustomMessageWithoutTurn("/extension", "Extension output"),
+    ).resolves.toMatchObject({ finalText: "Extension output" });
+    expect(omp.timeline()).toContainEqual({ type: "assistant_message", text: "Extension output" });
+    expect(omp.turnCompletions()[0]?.outputProvenance).toBe("local");
   });
 
   test("waits for a delayed queued model turn after OMP's local-only result", async () => {

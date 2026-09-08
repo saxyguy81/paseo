@@ -3056,7 +3056,13 @@ describe("ClaudeAgentSession context window usage", () => {
         messageId: "result-unknown-1",
       },
     });
-    expect(events.some((event) => event.type === "turn_completed")).toBe(true);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "turn_completed",
+        provider: "claude",
+        outputProvenance: "local",
+      }),
+    );
   });
 
   test("result.result is not duplicated when the model produced output during the turn", async () => {
@@ -3084,7 +3090,13 @@ describe("ClaudeAgentSession context window usage", () => {
 
     const timelineEvents = events.filter((event) => event.type === "timeline");
     expect(timelineEvents).toEqual([]);
-    expect(events.some((event) => event.type === "turn_completed")).toBe(true);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "turn_completed",
+        provider: "claude",
+        outputProvenance: "provider",
+      }),
+    );
   });
 
   test("result.result is not duplicated when assistant text already streamed with zero token usage", async () => {

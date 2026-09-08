@@ -5,6 +5,12 @@ export const CONVERSATION_FAMILY_NAME_LABEL = "paseo.family.name";
 export const CONVERSATION_FAMILY_POSITION_LABEL = "paseo.family.position";
 export const CONVERSATION_FAMILY_HIDDEN_LABEL = "paseo.family.hidden";
 export const CONVERSATION_FAMILY_PREDECESSOR_LABEL = "paseo.family.predecessor";
+/** Durable, family-scoped state for automatic fresh-session recovery. */
+export const CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL =
+  "paseo.family.rollover-window-started-at";
+export const CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL = "paseo.family.rollover-count";
+export const CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL = "paseo.family.rollover-parked";
+export const CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL = "paseo.family.rollover-epoch";
 /**
  * Marks the one fresh-session escape from a resumed Claude session that was
  * rejected with the SDK's synthetic model_not_found error. This is deliberately

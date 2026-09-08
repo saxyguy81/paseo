@@ -23,6 +23,7 @@ import type {
   AgentPromptAdmissionDecision,
   AgentRunResult,
   AgentSession,
+  AgentSessionConfig,
   AgentStreamEvent,
   AgentUsage,
 } from "./agent-sdk-types.js";
@@ -30,6 +31,14 @@ import {
   isClaudeContextPreflightPrompt,
   planClaudePromptAdmission,
 } from "./providers/claude/prompt-admission.js";
+import {
+  CONVERSATION_FAMILY_CURRENT_LABEL,
+  CONVERSATION_FAMILY_ID_LABEL,
+  CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL,
+  CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL,
+  CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL,
+  CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL,
+} from "@getpaseo/protocol/agent-labels";
 
 interface CapturedLogger {
   logger: Logger;
@@ -121,6 +130,7 @@ function createFinishNotificationScenario(
   Reflect.set(agentManager, "planPromptAdmission", () => ({
     type: "dispatch",
   }));
+  Reflect.set(agentManager, "isAgentPromptRecoveryParked", async () => false);
   Reflect.set(agentManager, "hasInFlightRun", () => Boolean(options?.parentPromptError));
   Reflect.set(agentManager, "steerOrReplaceActiveTurn", async () => {
     steerAttemptCount += 1;
@@ -922,7 +932,7 @@ test("precompacts high-context Claude sessions before releasing the exact queued
         activeTurnBehavior: "queue",
         logger,
       }),
-    ).resolves.toEqual({ disposition: "queued" });
+    ).resolves.toMatchObject({ disposition: "queued" });
 
     await vi.waitFor(() => expect(client.session.prompts).toHaveLength(1));
     expect(isClaudeContextPreflightPrompt(client.session.prompts[0]!)).toBe(true);
@@ -938,7 +948,7 @@ test("precompacts high-context Claude sessions before releasing the exact queued
         activeTurnBehavior: "queue",
         logger,
       }),
-    ).resolves.toEqual({ disposition: "queued" });
+    ).resolves.toMatchObject({ disposition: "queued" });
 
     // A clean compact result is sufficient even when the SDK omits compact_boundary.
     client.session.complete({
@@ -1633,7 +1643,7 @@ test("queues an in-flight steer when high context requires compaction", async ()
       activeTurnBehavior: "steer",
       logger,
     }),
-  ).resolves.toEqual({ disposition: "queued" });
+  ).resolves.toMatchObject({ disposition: "queued" });
   expect(steerOrReplaceActiveTurn).not.toHaveBeenCalled();
   expect(enqueuePendingPrompt).toHaveBeenCalledWith(
     "running-agent",
@@ -1680,7 +1690,7 @@ test("queues an ordinary steer while the synthetic compact turn owns the provide
         activeTurnBehavior: "steer",
         logger: scenario.logger,
       }),
-    ).resolves.toEqual({ disposition: "queued" });
+    ).resolves.toMatchObject({ disposition: "queued" });
     expect(scenario.client.session.prompts).toHaveLength(1);
     await expect(scenario.storage.listPendingPrompts(scenario.agentId)).resolves.toMatchObject([
       { id: expect.stringMatching(/^paseo-internal-preflight:/), state: "dispatching" },
@@ -1732,7 +1742,7 @@ test("serializes all queue-mode prompts through one durable FIFO", async () => {
         activeTurnBehavior: "queue",
         logger,
       }),
-    ).resolves.toEqual({ disposition: "queued" });
+    ).resolves.toMatchObject({ disposition: "queued" });
     await vi.waitFor(() => expect(client.session.prompts).toEqual(["first request"]));
 
     await expect(
@@ -1745,7 +1755,7 @@ test("serializes all queue-mode prompts through one durable FIFO", async () => {
         activeTurnBehavior: "queue",
         logger,
       }),
-    ).resolves.toEqual({ disposition: "queued" });
+    ).resolves.toMatchObject({ disposition: "queued" });
     expect(client.session.prompts).toEqual(["first request"]);
     expect(client.session.interruptCount).toBe(0);
     await expect(storage.listPendingPrompts(snapshot.id)).resolves.toMatchObject([
@@ -1808,7 +1818,7 @@ test("falls back from unsafe in-flight steering to the durable FIFO", async () =
         activeTurnBehavior: "steer",
         logger,
       }),
-    ).resolves.toEqual({ disposition: "queued" });
+    ).resolves.toMatchObject({ disposition: "queued" });
 
     expect(client.session.prompts).toEqual(["first request"]);
     expect(client.session.interruptCount).toBe(0);
@@ -1858,7 +1868,7 @@ test("routes an idle unsafe steer through the durable FIFO before starting it", 
         activeTurnBehavior: "steer",
         logger,
       }),
-    ).resolves.toEqual({ disposition: "queued" });
+    ).resolves.toMatchObject({ disposition: "queued" });
 
     expect(enqueueSpy).toHaveBeenCalledWith(snapshot.id, {
       id: "message-idle-steer",
@@ -1925,7 +1935,7 @@ test("retires a permission-blocked unsafe turn before replacing it", async () =>
         clearPendingPermissions: true,
         logger,
       }),
-    ).resolves.toEqual({ disposition: "turn_started" });
+    ).resolves.toMatchObject({ disposition: "turn_started" });
 
     expect(client.session.interruptCount).toBe(1);
     expect(client.session.prompts).toEqual([
@@ -1971,7 +1981,7 @@ test("a repeated client message id is not enqueued after provider acceptance", a
       });
     await send("run this once");
     await vi.waitFor(() => expect(client.session.prompts).toEqual(["run this once"]));
-    await expect(send("browser retried this request")).resolves.toEqual({
+    await expect(send("browser retried this request")).resolves.toMatchObject({
       disposition: "queued",
     });
     expect(client.session.prompts).toEqual(["run this once"]);
@@ -2187,6 +2197,270 @@ test("daemon recovery preserves a queued retry whose user message is already rec
     await agentManager.closeAgent(snapshot.id).catch(() => undefined);
     await agentManager.flush().catch(() => undefined);
     await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("daemon recovery leaves a parked family FIFO on disk without resuming its native session", async () => {
+  class CountingClient extends QueuedPromptAgentClient {
+    createCount = 0;
+    resumeCount = 0;
+
+    override async createSession(): Promise<AgentSession> {
+      this.createCount += 1;
+      return this.session;
+    }
+
+    override async resumeSession(): Promise<AgentSession> {
+      this.resumeCount += 1;
+      return this.session;
+    }
+  }
+
+  const workdir = mkdtempSync(join(tmpdir(), "agent-durable-prompt-parked-restart-"));
+  const logger = createTestLogger();
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const originalClient = new CountingClient();
+  const originalManager = new AgentManager({
+    clients: { "claude-acc": originalClient },
+    registry: storage,
+    logger,
+  });
+  const agentId = "00000000-0000-4000-8000-000000000401";
+  await originalManager.createAgent({ provider: "claude-acc", cwd: workdir }, agentId, {
+    workspaceId: undefined,
+    labels: {
+      [CONVERSATION_FAMILY_ID_LABEL]: "parked-startup-family",
+      [CONVERSATION_FAMILY_CURRENT_LABEL]: agentId,
+      [CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]: "3",
+      [CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]: "2",
+      [CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL]: "true",
+      [CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL]: new Date(
+        Date.now() - 61 * 60 * 1_000,
+      ).toISOString(),
+    },
+  });
+  await storage.enqueuePendingPrompt(agentId, {
+    id: "parked-message",
+    prompt: "do not run this on the poisoned session",
+  });
+  await originalManager.closeAgent(agentId);
+
+  const restartedStorage = new AgentStorage(join(workdir, "agents"), logger);
+  const restartedClient = new CountingClient();
+  const restartedManager = new AgentManager({
+    clients: { "claude-acc": restartedClient },
+    registry: restartedStorage,
+    logger,
+  });
+  try {
+    await resumePendingAgentPrompts({
+      agentManager: restartedManager,
+      agentStorage: restartedStorage,
+      logger,
+    });
+    expect(restartedClient.createCount).toBe(0);
+    expect(restartedClient.resumeCount).toBe(0);
+    await expect(restartedStorage.listPendingPrompts(agentId)).resolves.toEqual([
+      expect.objectContaining({ id: "parked-message", state: "queued" }),
+    ]);
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("an explicit prompt starts a parked family on a fresh canonical native session", async () => {
+  class MultiSessionClient extends QueuedPromptAgentClient {
+    readonly sessions: QueuedPromptAgentSession[] = [];
+
+    override async createSession(_config?: AgentSessionConfig): Promise<AgentSession> {
+      const session = new QueuedPromptAgentSession();
+      this.sessions.push(session);
+      return session;
+    }
+  }
+
+  const workdir = mkdtempSync(join(tmpdir(), "agent-parked-explicit-retry-"));
+  const logger = createTestLogger();
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new MultiSessionClient();
+  const oldAgentId = "00000000-0000-4000-8000-000000000402";
+  const successorId = "00000000-0000-4000-8000-000000000403";
+  const agentManager = new AgentManager({
+    clients: { "claude-acc": client },
+    registry: storage,
+    logger,
+    idFactory: () => successorId,
+  });
+  await agentManager.createAgent({ provider: "claude-acc", cwd: workdir }, oldAgentId, {
+    workspaceId: undefined,
+    labels: {
+      [CONVERSATION_FAMILY_ID_LABEL]: "parked-explicit-family",
+      [CONVERSATION_FAMILY_CURRENT_LABEL]: oldAgentId,
+      [CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]: "6",
+      [CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]: "2",
+      [CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL]: "true",
+      [CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL]: new Date().toISOString(),
+    },
+  });
+
+  try {
+    await expect(
+      sendPromptToAgent({
+        agentManager,
+        agentStorage: storage,
+        agentId: oldAgentId,
+        prompt: "Retry this work now.",
+        messageId: "explicit-retry-message",
+        logger,
+      }),
+    ).resolves.toMatchObject({ disposition: "turn_started", effectiveAgentId: successorId });
+    expect(client.sessions).toHaveLength(2);
+    expect(client.sessions[0]?.prompts).toEqual([]);
+    await vi.waitFor(() => expect(client.sessions[1]?.prompts).toEqual(["Retry this work now."]));
+
+    const predecessor = await storage.get(oldAgentId);
+    const successor = await storage.get(successorId);
+    expect(predecessor?.archivedAt).toBeTruthy();
+    expect(predecessor?.labels[CONVERSATION_FAMILY_CURRENT_LABEL]).toBe(successorId);
+    expect(successor?.archivedAt).toBeFalsy();
+    expect(successor?.labels[CONVERSATION_FAMILY_CURRENT_LABEL]).toBe(successorId);
+    expect(successor?.labels[CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]).toBe("7");
+    expect(successor?.labels[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]).toBeUndefined();
+    expect(successor?.labels[CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL]).toBeUndefined();
+    client.sessions[1]!.complete();
+  } finally {
+    await agentManager.closeAgent(successorId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("a system prompt racing an explicit parked-family retry follows the canonical FIFO", async () => {
+  class BlockingFamilyLookupStorage extends AgentStorage {
+    private blockedAgentId: string | null = null;
+    private getCount = 0;
+    private blockedResolve!: () => void;
+    private releaseResolve!: () => void;
+    private blocked = new Promise<void>((resolve) => {
+      this.blockedResolve = resolve;
+    });
+    private release = new Promise<void>((resolve) => {
+      this.releaseResolve = resolve;
+    });
+
+    blockSecondGet(agentId: string): void {
+      this.blockedAgentId = agentId;
+      this.getCount = 0;
+    }
+
+    waitUntilBlocked(): Promise<void> {
+      return this.blocked;
+    }
+
+    releaseGet(): void {
+      this.releaseResolve();
+    }
+
+    override async get(agentId: string) {
+      const record = await super.get(agentId);
+      if (agentId === this.blockedAgentId) {
+        this.getCount += 1;
+        if (this.getCount === 2) {
+          this.blockedResolve();
+          await this.release;
+        }
+      }
+      return record;
+    }
+  }
+
+  class MultiSessionClient extends QueuedPromptAgentClient {
+    readonly sessions: QueuedPromptAgentSession[] = [];
+
+    override async createSession(_config?: AgentSessionConfig): Promise<AgentSession> {
+      const session = new QueuedPromptAgentSession();
+      this.sessions.push(session);
+      return session;
+    }
+  }
+
+  const workdir = mkdtempSync(join(tmpdir(), "agent-parked-prompt-race-"));
+  const logger = createTestLogger();
+  const storage = new BlockingFamilyLookupStorage(join(workdir, "agents"), logger);
+  const client = new MultiSessionClient();
+  const oldAgentId = "00000000-0000-4000-8000-000000000404";
+  const successorId = "00000000-0000-4000-8000-000000000405";
+  const agentManager = new AgentManager({
+    clients: { "claude-acc": client },
+    registry: storage,
+    logger,
+    idFactory: () => successorId,
+  });
+  await agentManager.createAgent({ provider: "claude-acc", cwd: workdir }, oldAgentId, {
+    workspaceId: undefined,
+    labels: {
+      [CONVERSATION_FAMILY_ID_LABEL]: "parked-prompt-race-family",
+      [CONVERSATION_FAMILY_CURRENT_LABEL]: oldAgentId,
+      [CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]: "4",
+      [CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]: "2",
+      [CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL]: "true",
+      [CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL]: new Date().toISOString(),
+    },
+  });
+
+  try {
+    storage.blockSecondGet(oldAgentId);
+    const systemSend = sendPromptToAgent({
+      agentManager,
+      agentStorage: storage,
+      agentId: oldAgentId,
+      prompt: formatSystemNotificationPrompt("Background review finished."),
+      messageId: "racing-system-message",
+      activeTurnBehavior: "queue",
+      unarchive: false,
+      logger,
+    });
+    await storage.waitUntilBlocked();
+
+    const explicitSend = await sendPromptToAgent({
+      agentManager,
+      agentStorage: storage,
+      agentId: oldAgentId,
+      prompt: "Retry the interrupted work.",
+      messageId: "explicit-race-retry",
+      logger,
+    });
+    expect(explicitSend).toMatchObject({
+      disposition: "turn_started",
+      effectiveAgentId: successorId,
+    });
+
+    storage.releaseGet();
+    await expect(systemSend).resolves.toMatchObject({
+      disposition: "queued",
+      effectiveAgentId: successorId,
+    });
+    await expect(storage.listPendingPrompts(oldAgentId)).resolves.toEqual([]);
+    await expect(storage.listPendingPrompts(successorId)).resolves.toMatchObject([
+      { id: "racing-system-message", state: "queued" },
+    ]);
+    expect(client.sessions[0]?.prompts).toEqual([]);
+    expect(client.sessions[1]?.prompts).toEqual(["Retry the interrupted work."]);
+
+    client.sessions[1]!.complete();
+    await vi.waitFor(() =>
+      expect(client.sessions[1]?.prompts).toEqual([
+        "Retry the interrupted work.",
+        formatSystemNotificationPrompt("Background review finished."),
+      ]),
+    );
+    client.sessions[1]!.complete();
+    await vi.waitFor(async () => {
+      await expect(storage.listPendingPrompts(successorId)).resolves.toEqual([]);
+    });
+  } finally {
+    storage.releaseGet();
+    await agentManager.closeAgent(successorId).catch(() => undefined);
     rmSync(workdir, { recursive: true, force: true });
   }
 });

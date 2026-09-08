@@ -1868,6 +1868,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       inputSchema: sendAgentPromptInputSchema,
       outputSchema: {
         success: z.boolean(),
+        agentId: z.string(),
         status: AgentStatusEnum,
         lastMessage: z.string().nullable().optional(),
         permission: AgentPermissionRequestPayloadSchema.nullable().optional(),
@@ -1883,7 +1884,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
     }) => {
       const shouldNotifyOnFinish = Boolean(callerAgentId && notifyOnFinish && background);
 
-      await sendPromptToAgent({
+      const dispatchResult = await sendPromptToAgent({
         agentManager,
         agentStorage,
         agentId,
@@ -1891,12 +1892,13 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         sessionMode,
         logger: childLogger,
       });
+      const effectiveAgentId = dispatchResult.effectiveAgentId;
 
       if (shouldNotifyOnFinish && callerAgentId) {
         setupFinishNotification({
           agentManager,
           agentStorage,
-          childAgentId: agentId,
+          childAgentId: effectiveAgentId,
           callerAgentId,
           logger: childLogger,
         });
@@ -1904,12 +1906,13 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
 
       // If not running in background, wait for completion
       if (!background) {
-        const result = await waitForAgentWithTimeout(agentManager, agentId, {
+        const result = await waitForAgentWithTimeout(agentManager, effectiveAgentId, {
           waitForActive: true,
         });
 
         const responseData = {
           success: true,
+          agentId: effectiveAgentId,
           status: result.status,
           lastMessage: result.lastMessage,
           permission: sanitizePermissionRequest(result.permission),
@@ -1925,10 +1928,11 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
 
       // Return immediately if background=true
       // Re-fetch snapshot since the state may have changed
-      const currentSnapshot = agentManager.getAgent(agentId);
+      const currentSnapshot = agentManager.getAgent(effectiveAgentId);
 
       const responseData = {
         success: true,
+        agentId: effectiveAgentId,
         status: currentSnapshot?.lifecycle ?? "idle",
         lastMessage: null,
         permission: null,

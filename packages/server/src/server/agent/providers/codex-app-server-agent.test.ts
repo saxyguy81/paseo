@@ -4911,6 +4911,7 @@ describe("Codex app-server provider", () => {
     expect(events.at(-1)).toEqual({
       type: "turn_completed",
       provider: "codex",
+      outputProvenance: "provider",
       turnId: "test-turn",
       usage: undefined,
     });
@@ -5405,6 +5406,7 @@ describe("Codex app-server provider", () => {
       {
         type: "turn_completed",
         provider: "codex",
+        outputProvenance: "provider",
         turnId: "test-turn",
         usage: undefined,
       },
@@ -5446,6 +5448,7 @@ describe("Codex app-server provider", () => {
     expect(events.at(-1)).toEqual({
       type: "turn_completed",
       provider: "codex",
+      outputProvenance: "provider",
       turnId: "test-turn",
       usage: {
         inputTokens: 30000,

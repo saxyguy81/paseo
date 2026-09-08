@@ -9,7 +9,10 @@ import {
   assertPullRequestAutoMergeDisableReady,
   assertPullRequestAutoMergeEnableReady,
 } from "../services/github-service.js";
-import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
+import {
+  CONVERSATION_FAMILY_ID_LABEL,
+  PARENT_AGENT_ID_LABEL,
+} from "@getpaseo/protocol/agent-labels";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import type { WorkspaceDescriptorPayload } from "@getpaseo/protocol/messages";
 import {
@@ -178,6 +181,70 @@ test("legacy cancel_agent_request reports refusal through the activity log", asy
       },
     },
   ]);
+});
+
+test("send_agent_message waits for and reports the effective rollover successor", async () => {
+  const originalId = "11111111-1111-4111-8111-111111111121";
+  const successorId = "11111111-1111-4111-8111-111111111122";
+  const messages: SessionOutboundMessage[] = [];
+  const original = createStoredAgentRecord({
+    id: originalId,
+    cwd: "/tmp/rollover-original",
+    labels: { [CONVERSATION_FAMILY_ID_LABEL]: "family-effective-send" },
+  });
+  const successor = createStoredAgentRecord({
+    id: successorId,
+    cwd: "/tmp/rollover-successor",
+    labels: { [CONVERSATION_FAMILY_ID_LABEL]: "family-effective-send" },
+  });
+  const waitForAgentRunStart = vi.fn(async () => {});
+  const session = createSessionForTest({
+    messages,
+    agentStorage: {
+      list: vi.fn(async () => [original, successor]),
+      get: vi.fn(async (agentId: string) => (agentId === originalId ? original : successor)),
+    },
+    agentManager: {
+      prepareAgentPromptTarget: vi.fn(async () => successorId),
+      getAgent: vi.fn((agentId: string) =>
+        agentId === successorId
+          ? {
+              id: successorId,
+              provider: "codex",
+              lifecycle: "idle",
+              capabilities: {},
+            }
+          : null,
+      ),
+      hasInFlightRun: vi.fn(() => false),
+      hasSubmittedPrompt: vi.fn(() => false),
+      tryRunOutOfBand: vi.fn(() => false),
+      planPromptAdmission: vi.fn(() => ({ type: "dispatch" as const })),
+      streamAgent: vi.fn(() => (async function* noop() {})()),
+      waitForAgentClose: vi.fn(async () => {}),
+      waitForAgentRunStart,
+    },
+  });
+
+  await session.handleMessage({
+    type: "send_agent_message_request",
+    requestId: "send-effective-successor",
+    agentId: originalId,
+    text: "Retry on a clean native session.",
+    activeTurnBehavior: "interrupt",
+    attachments: [],
+  });
+
+  expect(waitForAgentRunStart).toHaveBeenCalledWith(successorId, expect.any(Object));
+  expect(messages).toContainEqual({
+    type: "send_agent_message_response",
+    payload: {
+      requestId: "send-effective-successor",
+      agentId: successorId,
+      accepted: true,
+      error: null,
+    },
+  });
 });
 
 const checkoutGitMocks = vi.hoisted(() => ({
