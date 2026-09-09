@@ -128,6 +128,41 @@ describe("selectSubagentsForParent", () => {
     expect(useProviderSubagentStore.getState().descriptors.size).toBe(1);
   });
 
+  it("shows a Bash task only after Claude explicitly backgrounds it", () => {
+    const store = useProviderSubagentStore.getState();
+    const descriptor = {
+      id: "bash-task",
+      parentAgentId: "parent-a",
+      provider: "claude" as const,
+      title: "Command",
+      description: "Watch the remote regression",
+      status: "running" as const,
+      createdAt: "2026-09-08T18:00:00.000Z",
+      updatedAt: "2026-09-08T18:00:00.000Z",
+      toolCallId: "toolu_bash",
+      activityKind: "foreground_task" as const,
+    };
+    store.applyUpdate(SERVER_ID, { kind: "upsert", subagent: descriptor });
+    const params = { serverId: SERVER_ID, parentAgentId: "parent-a" };
+
+    expect(
+      selectProviderSubagentsForParent(useProviderSubagentStore.getState(), params, true),
+    ).toEqual([]);
+
+    store.applyUpdate(SERVER_ID, {
+      kind: "upsert",
+      subagent: {
+        ...descriptor,
+        title: "Background task",
+        activityKind: "background_task",
+        updatedAt: "2026-09-08T18:01:00.000Z",
+      },
+    });
+    expect(
+      selectProviderSubagentsForParent(useProviderSubagentStore.getState(), params, true),
+    ).toMatchObject([{ id: "bash-task", activityKind: "background_task" }]);
+  });
+
   it("returns only non-archived children for the requested parent", () => {
     setAgents([
       makeAgent({ id: "parent-a" }),

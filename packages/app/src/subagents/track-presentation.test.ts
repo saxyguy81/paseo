@@ -225,6 +225,22 @@ describe("buildSubagentRowPresentationData for provider rows", () => {
     expect(presentation.subtitle).toBe("general-purpose");
   });
 
+  it("identifies provider background work without parsing its description", () => {
+    const presentation = buildSubagentRowPresentationData(
+      providerRow({
+        title: "Background task",
+        description: "Watch the remote regression",
+        activityKind: "background_task",
+      }),
+    );
+
+    expect(presentation).toMatchObject({
+      label: "Watch the remote regression",
+      subtitle: "Background task",
+      statusBucket: "running",
+    });
+  });
+
   it("tells two siblings of the same type apart", () => {
     const left = buildSubagentRowPresentationData(
       providerRow({ id: "a", description: "Summarize the docs" }),

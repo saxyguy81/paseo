@@ -73,4 +73,33 @@ describe("provider subagent protocol", () => {
       }),
     ).toMatchObject({ payload: { subagents: [{ id: "child-1" }] } });
   });
+
+  test("carries a provider background-task category without breaking older descriptors", () => {
+    const parsed = SessionOutboundMessageSchema.parse({
+      type: "agent.provider_subagents.list.response",
+      payload: {
+        requestId: "request-background",
+        parentAgentId: "parent-1",
+        subagents: [
+          {
+            id: "task-1",
+            parentAgentId: "parent-1",
+            provider: "claude",
+            title: "Background task",
+            description: "Watch the remote regression",
+            status: "running",
+            createdAt: "2026-09-08T18:00:00.000Z",
+            updatedAt: "2026-09-08T18:05:00.000Z",
+            toolCallId: "toolu_watch",
+            activityKind: "background_task",
+          },
+        ],
+        error: null,
+      },
+    });
+
+    expect(parsed).toMatchObject({
+      payload: { subagents: [{ activityKind: "background_task" }] },
+    });
+  });
 });

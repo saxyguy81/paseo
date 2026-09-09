@@ -24,6 +24,15 @@ export type SubagentObservation =
       /** The task this child was given. What actually distinguishes it from its siblings. */
       description?: string;
       toolCallId?: string;
+      activityKind?: "subagent" | "foreground_task" | "background_task";
+      timestamp?: string;
+    }
+  | {
+      /** A provider task moved between foreground and background execution. */
+      kind: "activity";
+      id: string;
+      activityKind: "foreground_task" | "background_task";
+      title: "Command" | "Background task";
       timestamp?: string;
     }
   | { kind: "status"; id: string; status: ProviderSubagentStatus; timestamp?: string }
@@ -75,6 +84,17 @@ export function foldSubagentObservations(
       continue;
     }
 
+    if (observation.kind === "activity") {
+      events.push({
+        type: "upsert",
+        id: observation.id,
+        title: observation.title,
+        activityKind: observation.activityKind,
+        ...(observation.timestamp ? { timestamp: observation.timestamp } : {}),
+      });
+      continue;
+    }
+
     // A declared subagent is running until something says otherwise. Its terminal status
     // arrives as its own observation, so this never has to guess at completion.
     events.push({
@@ -84,6 +104,7 @@ export function foldSubagentObservations(
       ...(observation.title === undefined ? {} : { title: observation.title }),
       ...(observation.description === undefined ? {} : { description: observation.description }),
       ...(observation.toolCallId === undefined ? {} : { toolCallId: observation.toolCallId }),
+      ...(observation.activityKind === undefined ? {} : { activityKind: observation.activityKind }),
       ...(observation.timestamp ? { timestamp: observation.timestamp } : {}),
     });
   }

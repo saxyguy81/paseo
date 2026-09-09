@@ -231,7 +231,7 @@ describe("ClaudeTaskProtocolSource", () => {
     expect(source.isActive).toBe(false);
   });
 
-  it("ignores a backgrounded shell command", () => {
+  it("declares a backgrounded shell command as background activity", () => {
     const source = new ClaudeTaskProtocolSource();
     // Real wire shape: a backgrounded Bash announces with a tool_use_id but no subagent_type,
     // so filtering on the id alone would put `sleep 20` in the subagents track.
@@ -242,11 +242,76 @@ describe("ClaudeTaskProtocolSource", () => {
           tool_use_id: "toolu_01MgVdcGPYnqE8cJQuccFtkU",
           task_type: "local_bash",
           subagent_type: undefined,
+          is_backgrounded: true,
           description: "Sleep 20 seconds in background",
         }),
       ),
-    ).toEqual([]);
-    expect(source.isActive).toBe(false);
+    ).toEqual([
+      {
+        kind: "declared",
+        id: "toolu_01MgVdcGPYnqE8cJQuccFtkU",
+        toolCallId: "toolu_01MgVdcGPYnqE8cJQuccFtkU",
+        title: "Background task",
+        description: "Sleep 20 seconds in background",
+        activityKind: "background_task",
+      },
+    ]);
+    expect(source.isActive).toBe(true);
+    expect(source.hasRunningForegroundTasks).toBe(false);
+    expect(source.needsSyntheticParentToolCard("toolu_01MgVdcGPYnqE8cJQuccFtkU")).toBe(false);
+  });
+
+  it("keeps a foreground Bash task in foreground recovery without duplicating its card", () => {
+    const source = new ClaudeTaskProtocolSource();
+    expect(
+      source.observe(
+        taskStarted({
+          task_type: "local_bash",
+          subagent_type: undefined,
+          is_backgrounded: false,
+          description: "Run the regression",
+        }),
+      ),
+    ).toContainEqual(
+      expect.objectContaining({
+        kind: "declared",
+        activityKind: "foreground_task",
+        title: "Command",
+      }),
+    );
+    expect(source.hasRunningForegroundTasks).toBe(true);
+    expect(source.needsSyntheticParentToolCard("toolu_01DgLoPMW9")).toBe(false);
+    expect(source.cancelRunningForegroundTasks()).toEqual([
+      { kind: "status", id: "toolu_01DgLoPMW9", status: "canceled" },
+    ]);
+  });
+
+  it("reclassifies a foreground Bash task when Claude backgrounds it later", () => {
+    const source = new ClaudeTaskProtocolSource();
+    source.observe(
+      taskStarted({
+        task_type: "local_bash",
+        subagent_type: undefined,
+        is_backgrounded: false,
+      }),
+    );
+
+    expect(
+      source.observe({
+        type: "system",
+        subtype: "task_updated",
+        task_id: "a1730a6215e1f5cf6",
+        patch: { is_backgrounded: true },
+      } as unknown as SDKMessage),
+    ).toEqual([
+      {
+        kind: "activity",
+        id: "toolu_01DgLoPMW9",
+        activityKind: "background_task",
+        title: "Background task",
+      },
+    ]);
+    expect(source.hasRunningForegroundTasks).toBe(false);
   });
 
   it("declares a workflow as a provider subagent with a provider-owned Workflow label", () => {
@@ -390,7 +455,7 @@ describe("ClaudeTaskProtocolSource", () => {
     expect(source.observe(taskUpdated("completed", "unknown-task"))).toEqual([]);
   });
 
-  it("does not readmit a filtered task through its notification", () => {
+  it("routes a background task notification through its declaration", () => {
     const source = new ClaudeTaskProtocolSource();
     // A backgrounded shell is filtered at declaration, but it still gets a task_notification
     // carrying a tool_use_id. Routing status off that id would recreate the descriptor with a
@@ -401,10 +466,17 @@ describe("ClaudeTaskProtocolSource", () => {
         tool_use_id: "toolu_01MgVdcGPYnqE8cJQuccFtkU",
         task_type: "local_bash",
         subagent_type: undefined,
+        is_backgrounded: true,
       }),
     );
 
-    expect(source.observe(taskNotification("completed", "b51skux0z"))).toEqual([]);
+    expect(source.observe(taskNotification("completed", "b51skux0z"))).toEqual([
+      {
+        kind: "status",
+        id: "toolu_01MgVdcGPYnqE8cJQuccFtkU",
+        status: "completed",
+      },
+    ]);
   });
 
   it("drops a notification for a task it never declared", () => {
@@ -570,7 +642,7 @@ describe("ClaudeTaskProtocolSource usage and runtime", () => {
   });
 
   it("ignores a frame from a task it never declared", () => {
-    // A filtered task still emits frames carrying its tool_use id. Reporting a model for one
+    // An unknown filtered task still emits frames carrying its tool_use id. Reporting a model for one
     // would create a descriptor the declaration filter deliberately refused — with no title and
     // a defaulted "running" status, which the track renders as a nameless row that never ends.
     const source = new ClaudeTaskProtocolSource();
@@ -578,7 +650,7 @@ describe("ClaudeTaskProtocolSource usage and runtime", () => {
       taskStarted({
         task_id: "b51skux0z",
         tool_use_id: "toolu_01MgVdcGPYnqE8cJQuccFtkU",
-        task_type: "local_bash",
+        task_type: "remote_unknown",
         subagent_type: undefined,
       }),
     );

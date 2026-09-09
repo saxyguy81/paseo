@@ -4464,6 +4464,11 @@ export const ProviderSubagentDescriptorPayloadSchema = z.object({
   // Compact provider-owned context for the shared track. Providers choose what belongs here and
   // format it for display; clients must not parse provider-specific facts out of this string.
   subtitle: z.string().nullable().optional(),
+  /**
+   * Provider-owned lifecycle category. Background tasks share Claude's task protocol with
+   * subagents, but are not themselves agents. Optional keeps older daemons wire-compatible.
+   */
+  activityKind: z.enum(["subagent", "foreground_task", "background_task"]).optional(),
 });
 
 export type ProviderSubagentDescriptorPayload = z.infer<

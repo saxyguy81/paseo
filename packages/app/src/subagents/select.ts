@@ -34,6 +34,7 @@ export interface ProviderSubagentRow {
   status: ProviderSubagentDescriptorPayload["status"];
   requiresAttention: boolean;
   createdAt: Date;
+  activityKind?: NonNullable<ProviderSubagentDescriptorPayload["activityKind"]>;
 }
 
 export type SubagentRow = PaseoSubagentRow | ProviderSubagentRow;
@@ -103,6 +104,9 @@ export function selectProviderSubagentsForParent(
   const prefix = `${params.serverId}\0${params.parentAgentId}\0`;
   for (const [key, subagent] of state.descriptors) {
     if (!key.startsWith(prefix) || state.hiddenFromTrack.has(key)) continue;
+    // Foreground Bash already has a first-class transcript card. It enters this compact activity
+    // track only if Claude explicitly backgrounds it in a later task update.
+    if (subagent.activityKind === "foreground_task") continue;
     rows.push({
       kind: "provider",
       id: subagent.id,
@@ -114,6 +118,7 @@ export function selectProviderSubagentsForParent(
       status: subagent.status,
       requiresAttention: subagent.status === "failed",
       createdAt: new Date(subagent.createdAt),
+      activityKind: subagent.activityKind ?? "subagent",
     });
   }
   rows.sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime());

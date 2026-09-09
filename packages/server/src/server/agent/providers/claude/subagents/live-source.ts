@@ -39,12 +39,15 @@ interface TaskStartedMessage {
   task_type?: string;
   prompt?: string;
   skip_transcript?: boolean;
+  is_backgrounded?: boolean;
 }
 
 /** Task-tool subagents. Backgrounded shell commands announce as `local_bash`. */
 const CLAUDE_SUBAGENT_TASK_TYPE = "local_agent";
 /** Workflow executions use the same announced task lifecycle as Task-tool subagents. */
 const CLAUDE_WORKFLOW_TASK_TYPE = "local_workflow";
+/** Background commands, including Monitor jobs, use this provider-owned task category. */
+const CLAUDE_BACKGROUND_TASK_TYPE = "local_bash";
 
 /**
  * Not every announced task belongs in the subagents track. Verified on the wire:
@@ -53,15 +56,16 @@ const CLAUDE_WORKFLOW_TASK_TYPE = "local_workflow";
  *   Workflow           task_type "local_workflow", no subagent_type
  *   background shell   task_type "local_bash",  no subagent_type
  *
- * All three carry a `tool_use_id`, so presence of an id is not a discriminator — filtering on it
- * alone puts `sleep 20` in the subagents track. Releases that predate `task_type` are covered
- * by requiring a subagent type instead.
+ * All three carry a `tool_use_id`, so presence of an id is not a discriminator. Background shell
+ * work is admitted explicitly and marked as such; arbitrary unknown task types remain filtered.
+ * Releases that predate `task_type` are covered by requiring a subagent type instead.
  */
 function isProviderSubagentTask(message: TaskStartedMessage): boolean {
   if (message.task_type) {
     return (
       message.task_type === CLAUDE_SUBAGENT_TASK_TYPE ||
-      message.task_type === CLAUDE_WORKFLOW_TASK_TYPE
+      message.task_type === CLAUDE_WORKFLOW_TASK_TYPE ||
+      message.task_type === CLAUDE_BACKGROUND_TASK_TYPE
     );
   }
   return readString(message.subagent_type) !== undefined;
@@ -171,6 +175,10 @@ export class ClaudeTaskProtocolSource {
    * them, so a turn ending is not evidence that they stopped.
    */
   private readonly backgroundedIds = new Set<string>();
+  /** Provider tasks already represented by their own Bash card in the parent transcript. */
+  private readonly localBashIds = new Set<string>();
+  /** Last foreground/background category, so repeated patches stay idempotent. */
+  private readonly activityKindById = new Map<string, "foreground_task" | "background_task">();
   /** Last status emitted per subagent, so a redundant announcement is not re-broadcast. */
   private readonly lastStatusById = new Map<string, ProviderSubagentStatus>();
   /** Claude facts stay inside the provider boundary; clients receive one compact subtitle. */
@@ -271,6 +279,8 @@ export class ClaudeTaskProtocolSource {
     this.lastWorkflowResultByTaskId.clear();
     this.idsWithExistingParentToolCard.clear();
     this.backgroundedIds.clear();
+    this.localBashIds.clear();
+    this.activityKindById.clear();
     this.lastStatusById.clear();
     this.presentationById.clear();
     this.lastSubtitleById.clear();
@@ -348,22 +358,14 @@ export class ClaudeTaskProtocolSource {
     this.declaredIds.add(id);
     this.lastStatusById.set(id, "running");
 
-    // An explicit `name` on the Task call wins over the agent type, matching how replay titles the
-    // same subagent. Without it a fan-out of five Explores reads as five identical rows.
-    const isWorkflow = message.task_type === CLAUDE_WORKFLOW_TASK_TYPE;
-    if (isWorkflow) {
-      this.idsWithExistingParentToolCard.add(id);
-      this.workflowTaskIds.add(message.task_id);
-    }
-    const title = isWorkflow
-      ? "Workflow"
-      : (readString(this.getToolInput(id)?.name) ?? readString(message.subagent_type));
+    const { isWorkflow, activityKind, title } = this.recordDeclaredTaskCategory(message, id);
     const description = readString(message.description);
     const observations: SubagentObservation[] = [
       {
         kind: "declared",
         id,
         toolCallId: id,
+        ...(activityKind ? { activityKind } : {}),
         ...(title ? { title } : {}),
         ...(description ? { description } : {}),
       },
@@ -384,14 +386,53 @@ export class ClaudeTaskProtocolSource {
     return observations;
   }
 
+  private recordDeclaredTaskCategory(message: TaskStartedMessage, id: string) {
+    const isWorkflow = message.task_type === CLAUDE_WORKFLOW_TASK_TYPE;
+    const isLocalBash = message.task_type === CLAUDE_BACKGROUND_TASK_TYPE;
+    let activityKind: "foreground_task" | "background_task" | undefined;
+    if (isLocalBash) {
+      activityKind = message.is_backgrounded === true ? "background_task" : "foreground_task";
+    }
+
+    if (message.is_backgrounded === true) this.backgroundedIds.add(id);
+    if (isLocalBash && activityKind) {
+      this.localBashIds.add(id);
+      this.activityKindById.set(id, activityKind);
+    }
+    // Workflow and Bash invocations already emitted their own parent tool card. A second synthetic
+    // Task/sub_agent card would duplicate the command and can hide the real result during projection.
+    if (isWorkflow || isLocalBash) this.idsWithExistingParentToolCard.add(id);
+    if (isWorkflow) this.workflowTaskIds.add(message.task_id);
+
+    // An explicit `name` on the Task call wins over the agent type, matching replay behavior.
+    let title = readString(this.getToolInput(id)?.name) ?? readString(message.subagent_type);
+    if (isWorkflow) title = "Workflow";
+    if (isLocalBash) title = activityKind === "background_task" ? "Background task" : "Command";
+    return { isWorkflow, isLocalBash, activityKind, title };
+  }
+
   private observeTaskUpdated(message: TaskUpdatedMessage): SubagentObservation[] {
     const id = this.subagentIdByTaskId.get(message.task_id);
     const backgrounded = message.patch?.is_backgrounded;
+    const observations: SubagentObservation[] = [];
     if (id && typeof backgrounded === "boolean") {
       if (backgrounded) this.backgroundedIds.add(id);
       else this.backgroundedIds.delete(id);
+      if (this.localBashIds.has(id)) {
+        const activityKind = backgrounded ? "background_task" : "foreground_task";
+        if (this.activityKindById.get(id) !== activityKind) {
+          this.activityKindById.set(id, activityKind);
+          observations.push({
+            kind: "activity",
+            id,
+            activityKind,
+            title: backgrounded ? "Background task" : "Command",
+          });
+        }
+      }
     }
-    return this.observeStatus(message.task_id, message.patch?.status);
+    observations.push(...this.observeStatus(message.task_id, message.patch?.status));
+    return observations;
   }
 
   private observeTaskNotification(message: TaskNotificationMessage): SubagentObservation[] {

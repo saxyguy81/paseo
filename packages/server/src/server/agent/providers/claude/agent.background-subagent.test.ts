@@ -295,6 +295,110 @@ describe("background Claude subagents", () => {
     ).toBeUndefined();
   });
 
+  test("shows a background Monitor once without replacing its existing Bash card", async () => {
+    queryFactory.mockImplementation(() =>
+      buildQueryMock([
+        {
+          type: "system",
+          subtype: "init",
+          session_id: "monitor-session",
+          permissionMode: "default",
+        },
+        {
+          type: "assistant",
+          message: {
+            model: "claude-opus-5",
+            content: [
+              {
+                type: "tool_use",
+                id: "toolu_monitor",
+                name: "Bash",
+                input: {
+                  command: "bash .watch_regression_loop.sh",
+                  run_in_background: true,
+                  description: "Watch the remote regression",
+                },
+              },
+            ],
+          },
+        },
+        {
+          type: "system",
+          subtype: "task_started",
+          task_id: "monitor-task",
+          tool_use_id: "toolu_monitor",
+          task_type: "local_bash",
+          is_backgrounded: true,
+          description: "Watch the remote regression",
+        },
+        {
+          type: "user",
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu_monitor",
+                content: "Command running in background with ID: monitor-task",
+              },
+            ],
+          },
+        },
+        {
+          type: "system",
+          subtype: "task_updated",
+          task_id: "monitor-task",
+          patch: { status: "completed" },
+        },
+        { type: "result", subtype: "success", usage: {}, total_cost_usd: 0 },
+      ]),
+    );
+    const session = await new ClaudeAgentClient({
+      logger: createTestLogger(),
+      queryFactory,
+      resolveBinary: async () => "/test/claude/bin",
+    }).createSession({ provider: "claude", cwd: process.cwd() });
+    const events = await collectUntilTerminal(streamSession(session, "watch it"));
+    await session.close();
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "provider_subagent",
+        event: expect.objectContaining({
+          type: "upsert",
+          id: "toolu_monitor",
+          activityKind: "background_task",
+          description: "Watch the remote regression",
+        }),
+      }),
+    );
+
+    const cardUpdates = events
+      .filter((event) => event.type === "timeline")
+      .map((event) => event.item)
+      .filter((item) => item.type === "tool_call" && item.callId === "toolu_monitor");
+    const rows: AgentTimelineRow[] = cardUpdates.map((item, index) => ({
+      seq: index + 1,
+      timestamp: `2026-09-08T18:00:0${index}.000Z`,
+      item,
+    }));
+    const projected = projectTimelineRows({ rows, mode: "projected" }).filter(
+      (entry) => entry.item.type === "tool_call" && entry.item.callId === "toolu_monitor",
+    );
+
+    expect(projected).toHaveLength(1);
+    expect(projected[0]?.item).toMatchObject({
+      type: "tool_call",
+      name: "Bash",
+      callId: "toolu_monitor",
+    });
+    expect(projected[0]?.item).not.toMatchObject({ detail: { type: "sub_agent" } });
+    expect(JSON.stringify(projected[0]?.item)).toContain("bash .watch_regression_loop.sh");
+    expect(JSON.stringify(projected[0]?.item)).toContain(
+      "Command running in background with ID: monitor-task",
+    );
+  });
+
   test("labels the parent's Task card with the type and task", async () => {
     // Without this the card renders as a bare "Task": the tracker that normally supplies the
     // sub_agent detail never runs, because no frame carries parent_tool_use_id.
