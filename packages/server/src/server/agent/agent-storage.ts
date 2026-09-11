@@ -377,6 +377,7 @@ export class AgentStorage {
     agentId: string,
     targetPromptId: string,
     preflight: AgentPromptPreflight,
+    options?: { preserveClaimedAttempt?: boolean },
   ): Promise<boolean> {
     await this.load();
     let inserted = false;
@@ -389,10 +390,18 @@ export class AgentStorage {
 
       const preflightId = buildInternalPromptPreflightId(targetPromptId, preflight.key);
       const duplicate = existing.pendingPrompts.some((item) => item.id === preflightId);
-      // Preserve the attempt count: an earlier provider dispatch may already
-      // have recorded this stable client message before a retry needed the
-      // preflight. Resetting it can make the later user dispatch execute twice.
-      const queuedTarget = { ...target, state: "queued" as const };
+      // The queue claim that discovered an initial preflight is admission work,
+      // not a provider attempt. Remove that claim from the retry budget. A
+      // submitted retry, however, already reached the provider and must retain
+      // its count so a later user dispatch cannot execute twice.
+      const queuedTarget = {
+        ...target,
+        state: "queued" as const,
+        attemptCount:
+          options?.preserveClaimedAttempt !== false
+            ? target.attemptCount
+            : Math.max(0, target.attemptCount - 1),
+      };
       const pendingPrompts = [...existing.pendingPrompts];
       pendingPrompts[targetIndex] = queuedTarget;
       if (duplicate) return { ...existing, pendingPrompts };

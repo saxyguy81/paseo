@@ -1065,6 +1065,37 @@ test("precompacts a submitted retry without executing the original user turn twi
   }
 });
 
+test("preflight admission does not consume the retained prompt retry budget", async () => {
+  const scenario = await createContextPreflightScenario({ retryDelayMs: 5 });
+  try {
+    await sendPromptToAgent({
+      agentManager: scenario.agentManager,
+      agentStorage: scenario.storage,
+      agentId: scenario.agentId,
+      prompt: "compact first, then recover one transient provider failure",
+      messageId: "message-preflight-then-provider-retry",
+      activeTurnBehavior: "queue",
+      logger: scenario.logger,
+    });
+    await vi.waitFor(() => expect(scenario.client.session.prompts).toHaveLength(1));
+    expect(isClaudeContextPreflightPrompt(scenario.client.session.prompts[0]!)).toBe(true);
+
+    scenario.client.session.complete();
+    await vi.waitFor(() =>
+      expect(scenario.client.session.prompts[1]).toBe(
+        "compact first, then recover one transient provider failure",
+      ),
+    );
+    scenario.client.session.fail("API Error: 503 upstream unavailable", "retryable_api");
+
+    await vi.waitFor(() => expect(scenario.client.session.prompts).toHaveLength(3));
+    expect(scenario.client.session.prompts[2]).toContain("Continue that unfinished request now");
+    scenario.client.session.complete();
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
 test("does not repeat compaction after a boundary even if the trailing result fails", async () => {
   const scenario = await createContextPreflightScenario({ retryDelayMs: 5 });
   try {
@@ -2144,6 +2175,56 @@ test("a retained transient prompt retries automatically as a continuation", asyn
     await vi.waitFor(async () => {
       await expect(storage.listPendingPrompts(snapshot.id)).resolves.toEqual([]);
     });
+  } finally {
+    await agentManager.closeAgent(snapshot.id).catch(() => undefined);
+    await agentManager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("a retained transient prompt stops after one automatic continuation", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-durable-prompt-transient-bounded-"));
+  const logger = createTestLogger();
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new QueuedPromptAgentClient();
+  const agentManager = new AgentManager({
+    clients: { "claude-acc": client },
+    registry: storage,
+    transientPromptRetryBaseDelayMs: 5,
+    transientPromptRetryMaxDelayMs: 5,
+    logger,
+  });
+  const snapshot = await agentManager.createAgent(
+    { provider: "claude-acc", cwd: workdir },
+    undefined,
+    { workspaceId: undefined },
+  );
+
+  try {
+    await sendPromptToAgent({
+      agentManager,
+      agentStorage: storage,
+      agentId: snapshot.id,
+      prompt: "finish this exactly once after a transient outage",
+      messageId: "message-transient-bounded",
+      activeTurnBehavior: "queue",
+      logger,
+    });
+    await vi.waitFor(() =>
+      expect(client.session.prompts).toEqual(["finish this exactly once after a transient outage"]),
+    );
+
+    client.session.fail("API Error: 503 upstream unavailable", "retryable_api");
+    await vi.waitFor(() => expect(client.session.prompts).toHaveLength(2));
+    expect(client.session.prompts[1]).toContain("Continue that unfinished request now");
+
+    client.session.fail("API Error: 503 upstream still unavailable", "retryable_api");
+    await vi.waitFor(async () => {
+      await expect(storage.listPendingPrompts(snapshot.id)).resolves.toEqual([]);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(client.session.prompts).toHaveLength(2);
   } finally {
     await agentManager.closeAgent(snapshot.id).catch(() => undefined);
     await agentManager.flush().catch(() => undefined);

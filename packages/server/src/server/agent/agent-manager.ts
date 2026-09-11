@@ -1206,7 +1206,9 @@ export class AgentManager {
     try {
       admission = this.planPromptAdmission(agentId, pending.prompt);
       if (admission.type === "preflight") {
-        await registry.insertPendingPromptPreflight(agentId, pending.id, admission);
+        await registry.insertPendingPromptPreflight(agentId, pending.id, admission, {
+          preserveClaimedAttempt: this.hasSubmittedPrompt(agentId, pending.id),
+        });
       }
     } catch (error) {
       // No provider request was opened. Restore the durable claim so a later
@@ -1387,7 +1389,7 @@ export class AgentManager {
       await registry.releasePendingPrompt(agentId, pending.id);
       return false;
     }
-    if (failureKind === "retryable_api") {
+    if (failureKind === "retryable_api" && pending.attemptCount < 2) {
       await registry.releasePendingPrompt(agentId, pending.id);
       this.scheduleTransientPromptRetry(agentId, pending.attemptCount);
       return false;
