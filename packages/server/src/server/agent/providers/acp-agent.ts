@@ -3141,6 +3141,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         this.finishTurn({
           type: "turn_completed",
           provider: this.provider,
+          outputProvenance: "provider",
           usage: this.currentTurnUsage,
           turnId,
         });

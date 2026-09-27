@@ -499,6 +499,7 @@ class FakeAgentSession implements AgentSession {
     const completed: AgentStreamEvent = {
       type: "turn_completed",
       provider: this.providerName,
+      outputProvenance: "local",
       usage: result.usage ?? { inputTokens: 1, outputTokens: 1 },
     };
     await this.appendHistoryEvent(completed);
@@ -528,6 +529,7 @@ class FakeAgentSession implements AgentSession {
     const completed: AgentStreamEvent = {
       type: "turn_completed",
       provider: this.providerName,
+      outputProvenance: "provider",
       usage: { inputTokens: 1, outputTokens: stress.count },
     };
     await this.appendHistoryEvent(completed);
@@ -548,6 +550,7 @@ class FakeAgentSession implements AgentSession {
     const completed: AgentStreamEvent = {
       type: "turn_completed",
       provider: this.providerName,
+      outputProvenance: "provider",
       usage: { inputTokens: 1, outputTokens: largePayload.bytes },
     };
     await this.appendHistoryEvent(completed);
@@ -620,6 +623,7 @@ class FakeAgentSession implements AgentSession {
     const deniedCompleted: AgentStreamEvent = {
       type: "turn_completed",
       provider: this.providerName,
+      outputProvenance: "provider",
       usage: { inputTokens: 1, outputTokens: 0 },
     };
     await this.appendHistoryEvent(deniedCompleted);
@@ -802,6 +806,7 @@ class FakeAgentSession implements AgentSession {
       const completed: AgentStreamEvent = {
         type: "turn_completed",
         provider: this.providerName,
+        outputProvenance: "provider",
         usage: { inputTokens: 1, outputTokens: 1 },
       };
       await this.appendHistoryEvent(completed);

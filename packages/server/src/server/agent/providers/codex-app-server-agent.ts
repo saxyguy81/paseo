@@ -218,6 +218,7 @@ const CODEX_APP_SERVER_CAPABILITIES: AgentCapabilityFlags = {
   supportsMcpServers: true,
   supportsReasoningStream: true,
   supportsToolInvocations: true,
+  supportsInFlightSteering: true,
   supportsRewindConversation: true,
   supportsRewindFiles: false,
   supportsRewindBoth: false,
@@ -6022,6 +6023,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.emitEvent({
         type: "turn_completed",
         provider: CODEX_PROVIDER,
+        outputProvenance: "provider",
         usage: this.latestUsage,
       });
     }

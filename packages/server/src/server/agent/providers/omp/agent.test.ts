@@ -210,6 +210,7 @@ describe("OMP agent client and session", () => {
     ]);
     expect(omp.eventTypes().slice(0, 2)).toEqual(["turn_started", "timeline"]);
     expect(omp.completedTurnCount()).toBe(1);
+    expect(omp.turnCompletions()[0]?.outputProvenance).toBe("provider");
   });
 
   test("streams OMP advisor messages as distinct tool-call blocks", async () => {
@@ -461,6 +462,7 @@ describe("OMP agent client and session", () => {
 
     await expect(omp.runPromptWithoutTurn("/model")).resolves.toMatchObject({ finalText: "" });
     expect(omp.completedTurnCount()).toBe(1);
+    expect(omp.turnCompletions()[0]?.outputProvenance).toBe("local");
   });
 
   test("waits for a delayed queued model turn after OMP's local-only result", async () => {

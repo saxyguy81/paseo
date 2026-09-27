@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { buildAgentForkContextAttachment, curateAgentActivity } from "./activity-curator.js";
+import {
+  buildAgentFreshSessionContinuationPrompt,
+  buildAgentForkContextAttachment,
+  curateAgentActivity,
+} from "./activity-curator.js";
 import type { AgentTimelineItem } from "./agent-sdk-types.js";
 import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
 
@@ -212,7 +216,9 @@ second line'`,
       { type: "assistant_message", text: "After second child." },
     ];
 
-    const result = curateAgentActivity(timeline, { labelAssistantMessages: true });
+    const result = curateAgentActivity(timeline, {
+      labelAssistantMessages: true,
+    });
 
     expect(result.split("\n")).toEqual([
       "[Assistant] Before first child.",
@@ -267,13 +273,269 @@ second line'`,
     expect(curateAgentActivity([])).toBe("No activity to display.");
   });
 
+  it("builds a bounded continuation from current state instead of copying the transcript", () => {
+    const oldRows = Array.from({ length: 100 }, (_, index) =>
+      row(index + 1, {
+        type: "user_message",
+        text: `old-transcript-marker-${index}-${"x".repeat(500)}`,
+      }),
+    );
+    const result = buildAgentFreshSessionContinuationPrompt({
+      failureKind: "context_overflow",
+      maxChars: 1_500,
+      rows: [
+        ...oldRows,
+        row(101, {
+          type: "user_message",
+          text: "Finish the MR review and report blockers.",
+        }),
+        row(102, {
+          type: "assistant_message",
+          text: "I finished the diff and started tests.",
+        }),
+        row(
+          103,
+          toolCallItem({
+            callId: "test-1",
+            name: "Bash",
+            detail: {
+              type: "shell",
+              command: "npm test",
+              output: "one failure",
+              exitCode: 1,
+            },
+          }),
+        ),
+      ],
+    });
+
+    expect(result).not.toBeNull();
+    expect(result?.length).toBeLessThanOrEqual(1_500);
+    expect(result).toContain("Finish the MR review and report blockers.");
+    expect(result).toContain("I finished the diff and started tests.");
+    expect(result).toContain("npm test");
+    expect(result).not.toContain("old-transcript-marker");
+    expect(result).not.toContain("<chat-history-summary>");
+  });
+
+  it("preserves a recent AskUserQuestion answer in the bounded continuation", () => {
+    const result = buildAgentFreshSessionContinuationPrompt({
+      failureKind: "context_overflow",
+      maxChars: 2_000,
+      rows: [
+        row(1, {
+          type: "user_message",
+          text: "Choose the implementation and continue.",
+        }),
+        row(
+          2,
+          toolCallItem({
+            callId: "question-1",
+            name: "AskUserQuestion",
+            detail: {
+              type: "unknown",
+              input: {
+                questions: [{ question: "Which implementation?", header: "Choice" }],
+              },
+              output: {
+                answers: { "Which implementation?": "Bounded rollover" },
+              },
+            },
+          }),
+        ),
+        row(3, {
+          type: "assistant_message",
+          text: "[System Error] Prompt is too long",
+        }),
+      ],
+    });
+
+    expect(result).toContain("Which implementation?");
+    expect(result).toContain("Bounded rollover");
+    expect(result).not.toContain("Prompt is too long");
+  });
+
+  it("preserves the goal and plan referenced by a short slash-command follow-up", () => {
+    const result = buildAgentFreshSessionContinuationPrompt({
+      failureKind: "context_overflow",
+      maxChars: 4_000,
+      rows: [
+        row(1, {
+          type: "user_message",
+          text: "Implement the durable admission queue, preserve active goals, and deploy it safely.",
+        }),
+        row(2, {
+          type: "assistant_message",
+          text: "Plan: add durable admission state, regression tests, rollback-safe storage, and canary verification.",
+        }),
+        row(3, { type: "user_message", text: "/team ok go ahead and do all this" }),
+        row(4, { type: "assistant_message", text: "Prompt is too long" }),
+      ],
+    });
+
+    expect(result).toContain("Outstanding user request:\n/team ok go ahead and do all this");
+    expect(result).toContain("Implement the durable admission queue");
+    expect(result).toContain("Plan: add durable admission state");
+    expect(result).not.toContain("Prompt is too long");
+  });
+
+  it("does not evict referenced goal context behind newer working-state entries", () => {
+    const laterState = Array.from({ length: 40 }, (_, index) => [
+      row(index * 2 + 4, {
+        type: "assistant_message" as const,
+        text: `later-state-${index}-${"x".repeat(900)}`,
+      }),
+      row(
+        index * 2 + 5,
+        toolCallItem({
+          callId: `later-${index}`,
+          name: "Bash",
+          detail: {
+            type: "shell",
+            command: `check-${index}`,
+            output: "done",
+            exitCode: 0,
+          },
+        }),
+      ),
+    ]).flat();
+    const result = buildAgentFreshSessionContinuationPrompt({
+      failureKind: "context_overflow",
+      maxChars: 4_000,
+      rows: [
+        row(1, { type: "user_message", text: "Implement the durable goal-preserving repair." }),
+        row(2, {
+          type: "assistant_message",
+          text: "Plan: preserve antecedents before recent logs.",
+        }),
+        row(3, { type: "user_message", text: "/team go ahead" }),
+        ...laterState,
+      ],
+    });
+
+    expect(result).toContain("Implement the durable goal-preserving repair");
+    expect(result).toContain("Plan: preserve antecedents before recent logs");
+    expect(result).toContain("later-state-39");
+  });
+
+  it("preserves antecedents for a short approval without a slash command", () => {
+    const result = buildAgentFreshSessionContinuationPrompt({
+      failureKind: "conversation_unresolved",
+      rows: [
+        row(1, { type: "user_message", text: "Apply the reviewed repair and deploy it." }),
+        row(2, { type: "assistant_message", text: "I can deploy after the canary passes." }),
+        row(3, { type: "user_message", text: "Sounds good" }),
+      ],
+    });
+
+    expect(result).toContain("Apply the reviewed repair and deploy it");
+    expect(result).toContain("I can deploy after the canary passes");
+  });
+
+  it("walks through chained acknowledgments to the substantive goal", () => {
+    const result = buildAgentFreshSessionContinuationPrompt({
+      failureKind: "context_overflow",
+      rows: [
+        row(1, { type: "user_message", text: "Implement durable queue and preserve active goal." }),
+        row(2, { type: "assistant_message", text: "Plan: add restart-safe admission." }),
+        row(3, { type: "user_message", text: "Yes" }),
+        row(4, { type: "assistant_message", text: "I will begin now." }),
+        row(5, { type: "user_message", text: "/team do this" }),
+      ],
+    });
+
+    expect(result).toContain("Implement durable queue and preserve active goal");
+    expect(result).toContain("Plan: add restart-safe admission");
+    expect(result).toContain("I will begin now");
+  });
+
+  it("explains unresolved delivery state without copying the failed error", () => {
+    const result = buildAgentFreshSessionContinuationPrompt({
+      failureKind: "conversation_unresolved",
+      rows: [
+        row(1, { type: "user_message", text: "Finish the review." }),
+        row(2, {
+          type: "assistant_message",
+          text: "API Error: 409 Conversation has an unresolved prior request",
+        }),
+      ],
+    });
+
+    expect(result).toContain("cannot be continued safely");
+    expect(result).toContain("Finish the review.");
+    expect(result).not.toContain("API Error: 409");
+  });
+
+  it("explains resumed-session rejection without calling a healthy model unavailable", () => {
+    const result = buildAgentFreshSessionContinuationPrompt({
+      failureKind: "resume_model_unavailable",
+      rows: [
+        row(1, { type: "user_message", text: "Finish the review." }),
+        row(2, {
+          type: "assistant_message",
+          text: "Selected model claude-opus-5 is unavailable for this resumed request.",
+        }),
+      ],
+    });
+
+    expect(result).toContain("saved native session");
+    expect(result).toContain("Finish the review.");
+    expect(result).not.toContain("selected model");
+  });
+
+  it("does not nest a previous internal handoff as the outstanding user request", () => {
+    const result = buildAgentFreshSessionContinuationPrompt({
+      failureKind: "resume_model_unavailable",
+      rows: [
+        row(1, { type: "user_message", text: "Finish the review." }),
+        row(2, {
+          type: "user_message",
+          text: "<paseo-system>\nContinue the previous handoff.\n</paseo-system>",
+        }),
+        row(3, { type: "assistant_message", text: "Repository state is preserved." }),
+      ],
+    });
+
+    expect(result).toContain("Outstanding user request:\nFinish the review.");
+    expect(result?.match(/<paseo-system>/g)).toHaveLength(1);
+    expect(result).not.toContain("Continue the previous handoff.");
+  });
+
+  it("refuses continuation when the timeline contains only an internal handoff", () => {
+    const result = buildAgentFreshSessionContinuationPrompt({
+      failureKind: "resume_model_unavailable",
+      rows: [
+        row(1, {
+          type: "user_message",
+          text: "<paseo-system>\nContinue the previous handoff.\n</paseo-system>",
+        }),
+      ],
+    });
+
+    expect(result).toBeNull();
+  });
+
+  it("refuses automatic continuation when the outstanding request cannot fit", () => {
+    expect(
+      buildAgentFreshSessionContinuationPrompt({
+        failureKind: "context_overflow",
+        maxChars: 500,
+        rows: [row(1, { type: "user_message", text: "x".repeat(1_000) })],
+      }),
+    ).toBeNull();
+  });
+
   it("builds fork context from user messages, assistant messages, and tool summaries", () => {
     const result = buildAgentForkContextAttachment({
       agentTitle: "Source Agent",
       cwd: "/repo",
       boundaryMessageId: "assistant-1",
       rows: [
-        row(1, { type: "user_message", text: "Ship the thing", messageId: "user-1" }),
+        row(1, {
+          type: "user_message",
+          text: "Ship the thing",
+          messageId: "user-1",
+        }),
         row(2, { type: "reasoning", text: "private chain of thought" }),
         row(
           3,
@@ -401,8 +663,15 @@ second line'`,
         cursor: { epoch: "timeline-1", seq: 2 },
       },
       rows: [
-        row(1, { type: "user_message", text: "Try the task", messageId: "user-1" }),
-        row(2, { type: "assistant_message", text: "[System Error] provider failed" }),
+        row(1, {
+          type: "user_message",
+          text: "Try the task",
+          messageId: "user-1",
+        }),
+        row(2, {
+          type: "assistant_message",
+          text: "[System Error] provider failed",
+        }),
         row(3, {
           type: "assistant_message",
           text: "This belongs to a later turn.",
@@ -433,7 +702,13 @@ second line'`,
     expect(() =>
       buildAgentForkContextAttachment({
         boundaryMessageId: "missing",
-        rows: [row(1, { type: "assistant_message", text: "Done.", messageId: "assistant-1" })],
+        rows: [
+          row(1, {
+            type: "assistant_message",
+            text: "Done.",
+            messageId: "assistant-1",
+          }),
+        ],
       }),
     ).toThrow("Selected assistant message is no longer available.");
   });

@@ -23,6 +23,7 @@ export interface ProviderSubagentDescriptor {
   toolCallId: string | null;
   cwd: string | null;
   subtitle: string | null;
+  activityKind?: "subagent" | "foreground_task" | "background_task";
 }
 
 export type ProviderSubagentInputEvent =
@@ -39,6 +40,7 @@ export type ProviderSubagentInputEvent =
       toolCallId?: string | null;
       cwd?: string | null;
       subtitle?: string | null;
+      activityKind?: "subagent" | "foreground_task" | "background_task";
       parentSubagentId?: string | null;
       timestamp?: string;
     }
@@ -125,6 +127,7 @@ export class ProviderSubagentStore {
       toolCallId: stickyField(event.toolCallId, previous?.toolCallId),
       cwd: stickyField(event.cwd, previous?.cwd),
       subtitle: stickyField(event.subtitle, previous?.subtitle),
+      activityKind: event.activityKind ?? previous?.activityKind ?? "subagent",
       parentSubagentId: stickyField(event.parentSubagentId, previous?.parentSubagentId),
     };
     this.descriptors.set(key, subagent);

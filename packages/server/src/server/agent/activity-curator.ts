@@ -4,10 +4,17 @@ import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
 import { isLikelyExternalToolName } from "@getpaseo/protocol/tool-name-normalization";
 import { buildToolCallDisplayModel } from "@getpaseo/protocol/tool-call-display";
 import { projectTimelineRows } from "./timeline-projection.js";
+import {
+  isContextOverflowFailureText,
+  isConversationUnresolvedFailureText,
+} from "./context-overflow.js";
+import { isSystemInjectedEnvelope } from "./agent-prompt.js";
 
 const DEFAULT_MAX_ITEMS = 0;
 const MAX_TOOL_INPUT_CHARS = 400;
 const MAX_TOOL_SUMMARY_CHARS = 200;
+const DEFAULT_CONTEXT_OVERFLOW_CONTINUATION_MAX_CHARS = 24_000;
+const MAX_CONTEXT_STATE_ENTRY_CHARS = 1_000;
 
 interface ActivityCuratorOptions {
   maxItems?: number;
@@ -84,6 +91,202 @@ function formatToolSummary(summary: string | undefined): string | null {
     return normalized;
   }
   return `${normalized.slice(0, MAX_TOOL_SUMMARY_CHARS - 3)}...`;
+}
+
+function normalizeBoundedText(value: unknown, maxChars: number): string | null {
+  let text: string;
+  if (typeof value === "string") {
+    text = value;
+  } else {
+    try {
+      text = JSON.stringify(value);
+    } catch {
+      return null;
+    }
+  }
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return null;
+  }
+  if (normalized.length <= maxChars) {
+    return normalized;
+  }
+  return `${normalized.slice(0, Math.max(0, maxChars - 3))}...`;
+}
+
+function formatContextOverflowStateEntry(item: AgentTimelineItem): string | null {
+  switch (item.type) {
+    case "assistant_message": {
+      const text = item.text.trim();
+      return text.startsWith("[System Error]") ||
+        isContextOverflowFailureText(text) ||
+        isConversationUnresolvedFailureText(text)
+        ? null
+        : normalizeBoundedText(text, MAX_CONTEXT_STATE_ENTRY_CHARS);
+    }
+    case "todo": {
+      const lines = item.items.map(
+        (entry) => `- [${entry.completed ? "x" : " "}] ${entry.text.trim()}`,
+      );
+      return normalizeBoundedText(`[Tasks]\n${lines.join("\n")}`, MAX_CONTEXT_STATE_ENTRY_CHARS);
+    }
+    case "tool_call": {
+      if (item.name.toLowerCase() === "askuserquestion" && item.detail.type === "unknown") {
+        const question = normalizeBoundedText(item.detail.input, MAX_CONTEXT_STATE_ENTRY_CHARS / 2);
+        const answer = normalizeBoundedText(item.detail.output, MAX_CONTEXT_STATE_ENTRY_CHARS / 2);
+        if (question || answer) {
+          return `[User decision]\n${question ?? "Question unavailable"}\n${answer ?? "No answer recorded"}`;
+        }
+      }
+      return formatToolCallEntry(item, { includeExternalToolInput: false }).text;
+    }
+    case "user_message":
+    case "reasoning":
+    case "error":
+    case "notification":
+    case "compaction":
+    case "plugin":
+      return null;
+  }
+}
+
+function requestNeedsPriorContext(request: string): boolean {
+  const normalized = request.trim();
+  if (/^\/[^\s/]+(?:\s|$)/.test(normalized)) return true;
+  if (normalized.length > 240) return false;
+  return /\b(?:yes|ok(?:ay)?|sounds good|approved|continue|go ahead|do (?:it|all|that|this)|proceed|same|above|previous)\b/i.test(
+    normalized,
+  );
+}
+
+function referencedPriorContextEntries(
+  projected: ReturnType<typeof projectTimelineRows>,
+  latestUserIndex: number,
+): string[] {
+  if (latestUserIndex <= 0) return [];
+  let priorUser: string | null = null;
+  const priorAssistants: string[] = [];
+  for (let index = latestUserIndex - 1; index >= 0; index -= 1) {
+    const item = projected[index]?.item;
+    if (!item) continue;
+    if (
+      !priorUser &&
+      item.type === "user_message" &&
+      item.text.trim() &&
+      !isSystemInjectedEnvelope(item.text) &&
+      !requestNeedsPriorContext(item.text)
+    ) {
+      priorUser = normalizeBoundedText(item.text, MAX_CONTEXT_STATE_ENTRY_CHARS);
+    } else if (priorAssistants.length < 2 && item.type === "assistant_message") {
+      const candidate = formatContextOverflowStateEntry(item);
+      if (candidate) priorAssistants.unshift(candidate);
+    }
+    if (priorUser && priorAssistants.length >= 2) break;
+  }
+  return [
+    priorUser ? `[Prior user request]\n${priorUser}` : null,
+    ...priorAssistants.map((entry) => `[Prior assistant plan or status]\n${entry}`),
+  ].filter((entry): entry is string => Boolean(entry));
+}
+
+function continuationStateGroups(
+  projected: ReturnType<typeof projectTimelineRows>,
+  latestUserIndex: number,
+  request: string,
+): { prior: string[]; later: string[] } {
+  const prior = requestNeedsPriorContext(request)
+    ? referencedPriorContextEntries(projected, latestUserIndex)
+    : [];
+  const later = projected
+    .slice(latestUserIndex >= 0 ? latestUserIndex + 1 : 0)
+    .map((entry) => formatContextOverflowStateEntry(entry.item))
+    .filter((entry): entry is string => Boolean(entry));
+  return { prior, later };
+}
+
+function selectContinuationStateEntries(input: {
+  prior: readonly string[];
+  later: readonly string[];
+  budget: number;
+}): string[] {
+  const selectedPrior: string[] = [];
+  let remaining = input.budget;
+  for (const entry of input.prior) {
+    const separatorLength = selectedPrior.length > 0 ? 2 : 0;
+    if (entry.length + separatorLength > remaining) continue;
+    selectedPrior.push(entry);
+    remaining -= entry.length + separatorLength;
+  }
+
+  const selectedLater: string[] = [];
+  for (let index = input.later.length - 1; index >= 0; index -= 1) {
+    const entry = input.later[index];
+    if (!entry) continue;
+    const separatorLength = selectedPrior.length + selectedLater.length > 0 ? 2 : 0;
+    if (entry.length + separatorLength > remaining) continue;
+    selectedLater.unshift(entry);
+    remaining -= entry.length + separatorLength;
+  }
+  return [...selectedPrior, ...selectedLater];
+}
+
+/**
+ * Build a deliberately small handoff for a fresh native session after the
+ * previous one becomes unsafe to continue. The latest user request is preserved
+ * verbatim; older conversation history is never copied.
+ */
+export function buildAgentFreshSessionContinuationPrompt(input: {
+  rows: readonly AgentTimelineRow[];
+  failureKind: "context_overflow" | "conversation_unresolved" | "resume_model_unavailable";
+  maxChars?: number;
+  outstandingRequest?: string | null;
+}): string | null {
+  const maxChars = input.maxChars ?? DEFAULT_CONTEXT_OVERFLOW_CONTINUATION_MAX_CHARS;
+  const projected = projectTimelineRows({ rows: input.rows, mode: "projected" });
+  const latestUserIndex = projected.findLastIndex(
+    (entry) =>
+      entry.item.type === "user_message" &&
+      entry.item.text.trim().length > 0 &&
+      !isSystemInjectedEnvelope(entry.item.text),
+  );
+  const latestUser = latestUserIndex >= 0 ? projected[latestUserIndex]?.item : null;
+  const request =
+    latestUser?.type === "user_message"
+      ? latestUser.text.trim()
+      : input.outstandingRequest?.trim() || null;
+  if (!request) return null;
+  let reason =
+    "cannot be resumed safely because Claude rejected the saved native session before doing new work";
+  if (input.failureKind === "context_overflow") {
+    reason = "reached its context limit";
+  } else if (input.failureKind === "conversation_unresolved") {
+    reason = "cannot be continued safely because its prior request has unresolved delivery state";
+  }
+  const prefix =
+    `<paseo-system>\nThe previous native Claude session ${reason}. ` +
+    "Continue the unfinished work in this fresh session. Do not repeat completed work.\n\n" +
+    "Outstanding user request:\n";
+  const stateHeader = "\n\nRecent working state:\n";
+  const suffix = "\n</paseo-system>";
+  const minimum = `${prefix}${request}${stateHeader}No provider work was recorded after the request.${suffix}`;
+  if (minimum.length > maxChars) {
+    return null;
+  }
+
+  const stateGroups = continuationStateGroups(projected, latestUserIndex, request);
+  if (stateGroups.prior.length === 0 && stateGroups.later.length === 0) {
+    return minimum;
+  }
+
+  const fixedLength = prefix.length + request.length + stateHeader.length + suffix.length;
+  const selected = selectContinuationStateEntries({
+    ...stateGroups,
+    budget: maxChars - fixedLength,
+  });
+
+  const state = selected.length > 0 ? selected.join("\n\n") : "No bounded state fit.";
+  const prompt = `${prefix}${request}${stateHeader}${state}${suffix}`;
+  return prompt.length <= maxChars ? prompt : null;
 }
 
 function inputFromUnknownDetail(

@@ -699,7 +699,9 @@ describe("PiRpcAgentSession", () => {
     });
     fakeSession.finishTurn();
 
-    await events.nextTurnCompletion();
+    await expect(events.nextTurnCompletion()).resolves.toMatchObject({
+      outputProvenance: "provider",
+    });
 
     expect(events.timelineItems()).toEqual([
       { type: "assistant_message", text: "hel", messageId: "response-1" },
@@ -962,6 +964,7 @@ describe("PiRpcAgentSession", () => {
       },
       { type: "turn_completed" },
     ]);
+    expect(events.turnCompletedEvents()[0]?.outputProvenance).toBe("local");
   });
 
   test("settles an autonomous turn triggered by a Pi extension custom message", async () => {
@@ -1812,7 +1815,11 @@ describe("PiRpcAgentSession", () => {
 
     await flushTurnScheduling();
     const usageCompletion = await events.nextTurnCompletion();
-    expect(usageCompletion).toMatchObject({ type: "turn_completed", turnId: usageTurnId });
+    expect(usageCompletion).toMatchObject({
+      type: "turn_completed",
+      outputProvenance: "local",
+      turnId: usageTurnId,
+    });
     expect(events.timelineAndCompletionEvents()).toEqual([
       { type: "timeline", item: { type: "user_message", text: "/usage" } },
       { type: "timeline", item: { type: "assistant_message", text: "Usage 12%" } },
@@ -1825,6 +1832,7 @@ describe("PiRpcAgentSession", () => {
     expect(events.turnCompletedEvents()).toHaveLength(2);
     expect(events.turnCompletedEvents()[1]).toMatchObject({
       type: "turn_completed",
+      outputProvenance: "provider",
       turnId: helloTurnId,
     });
   });

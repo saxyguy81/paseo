@@ -1,15 +1,26 @@
 import type { Logger } from "pino";
+import { randomUUID } from "node:crypto";
 
 import type {
   AgentPermissionRequest,
   AgentPromptInput,
   AgentRunOptions,
+  AgentStreamEvent,
 } from "./agent-sdk-types.js";
+import { isConversationRolloverFailureKind } from "./context-overflow.js";
 import type { AgentManager, ManagedAgent } from "./agent-manager.js";
-import type { AgentStorage } from "./agent-storage.js";
+import {
+  isStoredPendingPromptPreflight,
+  type AgentStorage,
+  type StoredPendingAgentPrompt,
+} from "./agent-storage.js";
 import { ensureAgentLoaded } from "./agent-loading.js";
+import { isInternalPromptPreflightId } from "./prompt-preflight.js";
 import { isStaleProviderSessionError } from "./stale-provider-session-error.js";
-import { getParentAgentIdFromLabels } from "@getpaseo/protocol/agent-labels";
+import {
+  CONVERSATION_FAMILY_ID_LABEL,
+  getParentAgentIdFromLabels,
+} from "@getpaseo/protocol/agent-labels";
 import type { ActiveTurnBehavior } from "@getpaseo/protocol/messages";
 
 export type AgentUnarchiveController = Pick<AgentManager, "notifyAgentState" | "unarchiveSnapshot">;
@@ -32,9 +43,48 @@ export interface StartAgentRunOptions {
   runOptions?: AgentRunOptions;
   /** Ask the provider to deny permissions blocking this steer. */
   clearPendingPermissions?: boolean;
+  onIteratorSettled?: (settlement: AgentRunSettlement) => void | Promise<void>;
 }
 
-export type PromptDispatchDisposition = "out_of_band" | "steered" | "turn_started";
+export interface AgentRunSettlement {
+  started: boolean;
+  terminal: "completed" | "failed" | "canceled" | null;
+  failureKind?: Extract<AgentStreamEvent, { type: "turn_failed" }>["failureKind"];
+}
+
+export type PromptDispatchDisposition = "out_of_band" | "queued" | "steered" | "turn_started";
+
+export interface SendPromptToAgentResult {
+  disposition: PromptDispatchDisposition;
+  /** The canonical agent that owns the accepted prompt after any family rollover. */
+  effectiveAgentId: string;
+}
+
+const promptAdmissionTails = new WeakMap<AgentManager, Map<string, Promise<void>>>();
+
+async function runPromptAdmission<T>(
+  agentManager: AgentManager,
+  agentId: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  let tails = promptAdmissionTails.get(agentManager);
+  if (!tails) {
+    tails = new Map();
+    promptAdmissionTails.set(agentManager, tails);
+  }
+  const previous = tails.get(agentId) ?? Promise.resolve();
+  const result = previous.catch(() => undefined).then(operation);
+  const tail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  tails.set(agentId, tail);
+  try {
+    return await result;
+  } finally {
+    if (tails.get(agentId) === tail) tails.delete(agentId);
+  }
+}
 
 async function steerOrReplaceActiveRun(
   agentManager: AgentRunController,
@@ -82,10 +132,12 @@ async function startOrReplaceRun(
 }
 
 async function drainAgentRunIterator(
-  iterator: AsyncGenerator<import("./agent-sdk-types.js").AgentStreamEvent>,
+  iterator: AsyncGenerator<AgentStreamEvent>,
+  onEvent?: (event: AgentStreamEvent) => void,
 ): Promise<void> {
-  for await (const _ of iterator) {
+  for await (const event of iterator) {
     // Events are broadcast via AgentManager subscribers.
+    onEvent?.(event);
   }
 }
 
@@ -152,9 +204,21 @@ async function startAgentRunInner(
     "agent.session.start_stream.iterator_returned",
   );
   void (async () => {
+    let started = false;
+    let terminal: AgentRunSettlement["terminal"] = null;
+    let failureKind: AgentRunSettlement["failureKind"];
     try {
+      const observeEvent = (event: AgentStreamEvent) => {
+        if (event.type === "turn_started") started = true;
+        if (event.type === "turn_completed") terminal = "completed";
+        if (event.type === "turn_failed") {
+          terminal = "failed";
+          failureKind = event.failureKind;
+        }
+        if (event.type === "turn_canceled") terminal = "canceled";
+      };
       try {
-        await drainAgentRunIterator(iterator);
+        await drainAgentRunIterator(iterator, observeEvent);
       } catch (error) {
         if (!isStaleProviderSessionError(error)) throw error;
         logger.info(
@@ -163,7 +227,7 @@ async function startAgentRunInner(
         );
         await agentManager.reloadAgentSession(agentId);
         const retry = await startOrReplaceRun(agentManager, agentId, prompt, options);
-        await drainAgentRunIterator(retry.iterator);
+        await drainAgentRunIterator(retry.iterator, observeEvent);
       }
       logger.trace(
         {
@@ -184,6 +248,12 @@ async function startAgentRunInner(
         "agent.session.iterator.error",
       );
       logger.error({ err: error, agentId }, "Agent stream failed");
+    } finally {
+      try {
+        await options?.onIteratorSettled?.({ started, terminal, failureKind });
+      } catch (error) {
+        logger.error({ err: error, agentId }, "Failed to settle queued agent prompt");
+      }
     }
   })();
   return { disposition: "turn_started" };
@@ -252,6 +322,151 @@ export interface StartCreatedAgentInitialPromptParams {
   logger: Logger;
 }
 
+async function drainNextPendingPrompt(params: {
+  agentManager: AgentManager;
+  agentStorage: AgentStorage;
+  agentId: string;
+  logger: Logger;
+}): Promise<void> {
+  await params.agentManager.drainStoredPendingPrompts(params.agentId);
+}
+
+export async function resumePendingAgentPrompts(params: {
+  agentManager: AgentManager;
+  agentStorage: AgentStorage;
+  logger: Logger;
+}): Promise<void> {
+  const records = await params.agentStorage.list();
+  await Promise.all(
+    records
+      .filter((record) => !record.archivedAt && record.pendingPrompts.length > 0)
+      .map(async (record) => {
+        try {
+          if (await params.agentManager.isAgentPromptRecoveryParked(record.id)) {
+            return;
+          }
+          await ensureAgentLoaded(record.id, {
+            agentManager: params.agentManager,
+            agentStorage: params.agentStorage,
+            logger: params.logger,
+          });
+          for (const pending of record.pendingPrompts) {
+            if (pending.state === "queued") {
+              // Queued is an explicit durable replay decision. This includes a request that
+              // reached Claude but failed safely before work began; its submitted timeline row
+              // is identity and history, not proof of completion.
+              continue;
+            }
+            if (isStoredPendingPromptPreflight(pending)) {
+              if (record.completedPromptPreflightIds.includes(pending.id)) {
+                // An exact durable boundary receipt proves this synthetic
+                // compact completed before the daemon exited. Never infer that
+                // from a token count that might be stale or independently saved.
+                await params.agentStorage.settlePendingPromptPreflight(record.id, pending.id, {
+                  clearContextUsage: true,
+                });
+                params.agentManager.clearPromptAdmissionContextUsage(record.id);
+                continue;
+              }
+              await params.agentStorage.releasePendingPrompt(record.id, pending.id);
+              continue;
+            }
+            if (params.agentManager.hasSubmittedPrompt(record.id, pending.id)) {
+              // startTurn accepted this stable client message before the daemon
+              // exited. The durable timeline is the commit record; replaying
+              // the queue item would execute the same user instruction twice.
+              await params.agentStorage.completePendingPrompt(record.id, pending.id);
+              continue;
+            }
+            if (pending.state === "dispatching") {
+              // A daemon cannot retain the provider iterator that owned this
+              // claim. Replay uses the same client message id (and Claude SDK
+              // message UUID), making the durable claim the stable identity.
+              await params.agentStorage.releasePendingPrompt(record.id, pending.id);
+            }
+          }
+          // Recovery must not hold daemon startup hostage for the duration of
+          // an agent turn. The manager retains this task and serializes any
+          // live WebSocket submissions behind the same durable queue.
+          void drainNextPendingPrompt({ ...params, agentId: record.id }).catch((error) => {
+            params.logger.error(
+              { err: error, agentId: record.id },
+              "Failed to drain recovered agent prompts",
+            );
+          });
+        } catch (error) {
+          params.logger.error(
+            { err: error, agentId: record.id },
+            "Failed to resume queued agent prompts",
+          );
+        }
+      }),
+  );
+}
+
+function promptMustUseDurableQueue(params: {
+  hasInFlightRun: boolean;
+  pendingPrompts: StoredPendingAgentPrompt[];
+  preflightRequired: boolean;
+  requestedQueue: boolean;
+  unsafeSteer: boolean;
+  replaceBlockedPermission: boolean;
+}): boolean {
+  const pendingHead = params.pendingPrompts[0];
+  const preflightInFlight =
+    params.hasInFlightRun &&
+    pendingHead?.state === "dispatching" &&
+    isStoredPendingPromptPreflight(pendingHead);
+  const hasBlockingPendingPrompt =
+    Boolean(pendingHead) &&
+    (pendingHead?.state === "queued" ||
+      !params.hasInFlightRun ||
+      preflightInFlight ||
+      params.pendingPrompts.length > 1) &&
+    !params.replaceBlockedPermission;
+  return (
+    preflightInFlight ||
+    hasBlockingPendingPrompt ||
+    params.preflightRequired ||
+    params.requestedQueue ||
+    (params.unsafeSteer && !params.replaceBlockedPermission)
+  );
+}
+
+async function enqueuePromptForDrain(
+  params: SendPromptToAgentParams,
+): Promise<{ disposition: "queued" }> {
+  const promptId = params.messageId ?? randomUUID();
+  if (params.agentManager.hasSubmittedPrompt(params.agentId, promptId)) {
+    params.logger.info(
+      { agentId: params.agentId, messageId: promptId },
+      "Ignored duplicate prompt that was already accepted",
+    );
+    return { disposition: "queued" };
+  }
+
+  const queued = await params.agentStorage.enqueuePendingPrompt(params.agentId, {
+    id: promptId,
+    prompt: params.prompt,
+  });
+  params.logger.info(
+    { agentId: params.agentId, messageId: promptId, position: queued.position },
+    "Persisted prompt in agent FIFO",
+  );
+  void drainNextPendingPrompt({
+    agentManager: params.agentManager,
+    agentStorage: params.agentStorage,
+    agentId: params.agentId,
+    logger: params.logger,
+  }).catch((error) => {
+    params.logger.error(
+      { err: error, agentId: params.agentId },
+      "Failed to start durable prompt drain",
+    );
+  });
+  return { disposition: "queued" };
+}
+
 /**
  * Outer bound on a run reaching "started" after dispatch.
  *
@@ -305,37 +520,123 @@ export async function waitForAgentRunStartWithTimeout(
  */
 export async function sendPromptToAgent(
   params: SendPromptToAgentParams,
-): Promise<{ disposition: PromptDispatchDisposition }> {
+): Promise<SendPromptToAgentResult> {
+  if (params.messageId && isInternalPromptPreflightId(params.messageId)) {
+    throw new Error("Prompt message id uses Paseo's reserved internal prefix");
+  }
   const unarchive = params.unarchive ?? true;
 
   const record = await params.agentStorage.get(params.agentId);
   if (record?.archivedAt) {
     if (!unarchive) {
-      return { disposition: "turn_started" };
+      return { disposition: "turn_started", effectiveAgentId: params.agentId };
     }
     await unarchiveAgentState(params.agentStorage, params.agentManager, params.agentId);
   }
 
-  await ensureAgentLoaded(params.agentId, {
+  const isExplicitUserPrompt =
+    typeof params.prompt !== "string" || !isSystemInjectedEnvelope(params.prompt);
+  const belongsToConversationFamily = Boolean(
+    record?.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim(),
+  );
+  let targetAgentId = params.agentId;
+  if (isExplicitUserPrompt && belongsToConversationFamily) {
+    targetAgentId = await params.agentManager.prepareAgentPromptTarget(params.agentId);
+  } else if (belongsToConversationFamily) {
+    const familyAdmission = await params.agentManager.withConversationFamilyPromptTarget(
+      params.agentId,
+      async (canonicalAgentId, recoveryParked) => ({
+        targetAgentId: canonicalAgentId,
+        queued: recoveryParked
+          ? await enqueuePromptForDrain({ ...params, agentId: canonicalAgentId })
+          : null,
+      }),
+    );
+    targetAgentId = familyAdmission.targetAgentId;
+    if (familyAdmission.queued) {
+      return {
+        ...familyAdmission.queued,
+        effectiveAgentId: targetAgentId,
+      };
+    }
+  }
+  const targetParams =
+    targetAgentId === params.agentId ? params : { ...params, agentId: targetAgentId };
+
+  await ensureAgentLoaded(targetAgentId, {
     agentManager: params.agentManager,
     agentStorage: params.agentStorage,
     logger: params.logger,
   });
 
   if (params.sessionMode) {
-    await params.agentManager.setAgentMode(params.agentId, params.sessionMode);
+    await params.agentManager.setAgentMode(targetAgentId, params.sessionMode);
   }
 
   const runOptions = params.messageId
     ? { ...params.runOptions, clientMessageId: params.messageId }
     : params.runOptions;
 
-  return await startAgentRun(params.agentManager, params.agentId, params.prompt, params.logger, {
-    replaceRunning: true,
-    activeTurnBehavior: params.activeTurnBehavior,
-    clearPendingPermissions: params.clearPendingPermissions,
-    runOptions,
+  const result = await runPromptAdmission(params.agentManager, targetAgentId, async () => {
+    const snapshot = params.agentManager.getAgent(targetAgentId);
+    const hasInFlightRun = params.agentManager.hasInFlightRun(targetAgentId);
+    // Out-of-band controls are local session state changes; they never enter
+    // the model context. Classify them before provider prompt admission. Once
+    // a provider-bound prompt is assigned to the durable FIFO below, it cannot
+    // escape through this side channel or reorder around a synthetic compact.
+    if (
+      hasInFlightRun &&
+      params.agentManager.tryRunOutOfBand(targetAgentId, params.prompt, runOptions)
+    ) {
+      return { disposition: "out_of_band" as const };
+    }
+    const promptAdmission = params.agentManager.planPromptAdmission(targetAgentId, params.prompt);
+    if (promptAdmission.type === "reject") {
+      throw new Error(promptAdmission.message);
+    }
+    // A provider must explicitly prove that pushing input cannot open a second
+    // upstream request. Otherwise the durable FIFO is the sole turn owner even
+    // during the brief idle edge between two queued prompts.
+    const replaceBlockedPermission =
+      params.activeTurnBehavior === "steer" &&
+      snapshot?.capabilities.supportsInFlightSteering !== true &&
+      params.clearPendingPermissions === true &&
+      Boolean(snapshot?.pendingPermissions.size);
+    const latestRecord = await params.agentStorage.get(targetAgentId);
+    const shouldQueue = promptMustUseDurableQueue({
+      hasInFlightRun,
+      pendingPrompts: latestRecord?.pendingPrompts ?? [],
+      preflightRequired: promptAdmission.type === "preflight",
+      requestedQueue: params.activeTurnBehavior === "queue",
+      unsafeSteer:
+        params.activeTurnBehavior === "steer" &&
+        snapshot?.capabilities.supportsInFlightSteering !== true,
+      replaceBlockedPermission,
+    });
+    if (shouldQueue) {
+      return await enqueuePromptForDrain(targetParams);
+    }
+
+    return await startAgentRun(params.agentManager, targetAgentId, params.prompt, params.logger, {
+      replaceRunning: true,
+      // A permission-blocked request cannot drain a FIFO. Retire it through
+      // the acknowledged interrupt path before starting the replacement.
+      activeTurnBehavior: replaceBlockedPermission ? "interrupt" : params.activeTurnBehavior,
+      clearPendingPermissions: params.clearPendingPermissions,
+      runOptions,
+      onIteratorSettled: async (settlement) => {
+        if (!isConversationRolloverFailureKind(settlement.failureKind)) {
+          await drainNextPendingPrompt({
+            agentManager: params.agentManager,
+            agentStorage: params.agentStorage,
+            agentId: targetAgentId,
+            logger: params.logger,
+          });
+        }
+      },
+    });
   });
+  return { ...result, effectiveAgentId: targetAgentId };
 }
 
 export async function startCreatedAgentInitialPrompt(

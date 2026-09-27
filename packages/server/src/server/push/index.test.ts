@@ -2,6 +2,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type pino from "pino";
+import webPush from "web-push";
 import { afterEach, describe, expect, test } from "vitest";
 
 import { createPushNotifications } from "./index.js";
@@ -44,7 +45,9 @@ describe("push notifications", () => {
     await pushNotifications.send({ title: "Agent finished", body: "Done" });
 
     expect(deliveries).toEqual([]);
-    expect(JSON.parse(readFileSync(filePath, "utf8"))).toEqual({ subscriptions: [] });
+    expect(JSON.parse(readFileSync(filePath, "utf8"))).toEqual({
+      subscriptions: [],
+    });
   });
 
   test("online revocation stops notifications immediately", async () => {
@@ -63,5 +66,96 @@ describe("push notifications", () => {
     await pushNotifications.send({ title: "Agent finished", body: "Done" });
 
     expect(deliveries).toEqual([]);
+  });
+
+  test("delivers one attention payload through Expo and configured Web Push", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), "paseo-push-notifications-"));
+    homes.push(home);
+    const expoDeliveries: string[][] = [];
+    const webDeliveries: Array<{ endpoints: string[]; title: string }> = [];
+    const vapidKeys = webPush.generateVAPIDKeys();
+    const pushNotifications = createPushNotifications({
+      logger: createLogger(),
+      filePath: path.join(home, "push-tokens.json"),
+      now: () => Date.parse("2026-09-05T00:00:00.000Z"),
+      deliver: async (tokens) => expoDeliveries.push(tokens),
+      webPush: {
+        filePath: path.join(home, "web-push-subscriptions.json"),
+        vapidPublicKey: vapidKeys.publicKey,
+        vapidPrivateKey: vapidKeys.privateKey,
+        subject: "mailto:operator@example.test",
+        deliver: async (subscriptions, payload) => {
+          webDeliveries.push({
+            endpoints: subscriptions.map(({ endpoint }) => endpoint),
+            title: payload.title,
+          });
+        },
+      },
+    });
+
+    pushNotifications.renew("ExponentPushToken[native-device]");
+    pushNotifications.renewWeb({
+      endpoint: "https://fcm.googleapis.com/wp/web-device",
+      expirationTime: null,
+      keys: { p256dh: "public-key", auth: "auth-secret" },
+    });
+    await pushNotifications.send({
+      title: "Agent needs attention",
+      body: "Open the thread",
+    });
+
+    expect(pushNotifications.webPushCapability).toEqual({
+      vapidPublicKey: vapidKeys.publicKey,
+    });
+    expect(expoDeliveries).toEqual([["ExponentPushToken[native-device]"]]);
+    expect(webDeliveries).toEqual([
+      {
+        endpoints: ["https://fcm.googleapis.com/wp/web-device"],
+        title: "Agent needs attention",
+      },
+    ]);
+  });
+
+  test("does not advertise or accept Web Push when VAPID is not configured", () => {
+    const home = mkdtempSync(path.join(tmpdir(), "paseo-push-notifications-"));
+    homes.push(home);
+    const pushNotifications = createPushNotifications({
+      logger: createLogger(),
+      filePath: path.join(home, "push-tokens.json"),
+    });
+
+    expect(pushNotifications.webPushCapability).toBeNull();
+    expect(() =>
+      pushNotifications.renewWeb({
+        endpoint: "https://fcm.googleapis.com/wp/web-device",
+        expirationTime: null,
+        keys: { p256dh: "public-key", auth: "auth-secret" },
+      }),
+    ).toThrow("Web Push is not configured");
+  });
+
+  test("disables malformed complete VAPID configuration without blocking startup", () => {
+    const home = mkdtempSync(path.join(tmpdir(), "paseo-push-notifications-"));
+    homes.push(home);
+
+    const pushNotifications = createPushNotifications({
+      logger: createLogger(),
+      filePath: path.join(home, "push-tokens.json"),
+      webPush: {
+        filePath: path.join(home, "web-push-subscriptions.json"),
+        vapidPublicKey: "not-a-valid-public-key",
+        vapidPrivateKey: "not-a-valid-private-key",
+        subject: "not-a-valid-subject",
+      },
+    });
+
+    expect(pushNotifications.webPushCapability).toBeNull();
+    expect(() =>
+      pushNotifications.renewWeb({
+        endpoint: "https://fcm.googleapis.com/wp/web-device",
+        expirationTime: null,
+        keys: { p256dh: "public-key", auth: "auth-secret" },
+      }),
+    ).toThrow("Web Push is not configured");
   });
 });

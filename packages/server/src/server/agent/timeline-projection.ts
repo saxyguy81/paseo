@@ -337,6 +337,18 @@ export class TimelineProjection {
     this.rows[index] = { ...this.rows[index], providerMessageId };
     return { ...this.rows[index] };
   }
+
+  markUserMessageProviderSubmitted(clientMessageId: string): ProjectedTimelineRow | null {
+    const index = this.rows.findIndex(
+      (row) => row.item.type === "user_message" && row.item.clientMessageId === clientMessageId,
+    );
+    const row = this.rows[index];
+    if (!row || row.item.type !== "user_message") return null;
+    const submittedItem = { ...row.item };
+    delete submittedItem.deliveryStatus;
+    this.rows[index] = { ...row, item: submittedItem };
+    return { ...this.rows[index] };
+  }
 }
 
 export function projectTimelineRows(input: {

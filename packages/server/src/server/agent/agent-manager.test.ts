@@ -17,7 +17,20 @@ import { AgentStorage } from "./agent-storage.js";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 import { toAgentPayload } from "./agent-projections.js";
 import { projectTimelineRows } from "./timeline-projection.js";
-import { getOpenAgentTabLabel, PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
+import {
+  CONVERSATION_FAMILY_CURRENT_LABEL,
+  CONVERSATION_FAMILY_ID_LABEL,
+  CONVERSATION_FAMILY_NAME_LABEL,
+  CONVERSATION_FAMILY_POSITION_LABEL,
+  CONVERSATION_FAMILY_PREDECESSOR_LABEL,
+  CONVERSATION_FAMILY_RESUME_MODEL_ROLLOVER_LABEL,
+  CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL,
+  CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL,
+  CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL,
+  CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL,
+  getOpenAgentTabLabel,
+  PARENT_AGENT_ID_LABEL,
+} from "@getpaseo/protocol/agent-labels";
 import { formatSystemNotificationPrompt, startAgentRun } from "./agent-prompt.js";
 import { StaleProviderSessionError } from "./stale-provider-session-error.js";
 import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent-loading.js";
@@ -463,7 +476,11 @@ class TestAgentSession implements AgentSession {
     // Use setTimeout so events arrive after the caller sets up the foreground waiter
     setTimeout(() => {
       this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
-      this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+      this.pushEvent({
+        type: "turn_completed",
+        provider: this.provider,
+        turnId,
+      });
       this.runtimeModel = "gpt-5.2-codex";
     }, 0);
     return { turnId };
@@ -578,7 +595,15 @@ class SteeringTestSession extends TestAgentSession {
   override async startTurn(prompt: AgentPromptInput): Promise<{ turnId: string }> {
     this.startPrompts.push(prompt);
     const turnId = `active-turn-${++this.startCount}`;
-    setTimeout(() => this.pushEvent({ type: "turn_started", provider: this.provider, turnId }), 0);
+    setTimeout(
+      () =>
+        this.pushEvent({
+          type: "turn_started",
+          provider: this.provider,
+          turnId,
+        }),
+      0,
+    );
     return { turnId };
   }
 
@@ -621,7 +646,15 @@ class UnsupportedSteeringSession extends TestAgentSession {
 
   override async startTurn(): Promise<{ turnId: string }> {
     const turnId = `unsupported-turn-${++this.startCount}`;
-    setTimeout(() => this.pushEvent({ type: "turn_started", provider: this.provider, turnId }), 0);
+    setTimeout(
+      () =>
+        this.pushEvent({
+          type: "turn_started",
+          provider: this.provider,
+          turnId,
+        }),
+      0,
+    );
     return { turnId };
   }
 
@@ -663,6 +696,52 @@ async function startAndSteerThroughManager(
   return { manager, agentId: agent.id, workdir };
 }
 
+class ControlledCompletionSession extends TestAgentSession {
+  private activeTurnId: string | null = null;
+
+  override async startTurn(): Promise<{ turnId: string }> {
+    const turnId = randomUUID();
+    this.activeTurnId = turnId;
+    setTimeout(() => this.pushEvent({ type: "turn_started", provider: this.provider, turnId }), 0);
+    return { turnId };
+  }
+
+  complete(options?: {
+    text?: string;
+    provider?: AgentProvider;
+    outputProvenance?: "provider" | "local";
+  }): void {
+    const turnId = this.activeTurnId;
+    if (!turnId) throw new Error("No active test turn");
+    const provider = options?.provider ?? this.provider;
+    if (options?.text !== undefined) {
+      this.pushEvent({
+        type: "timeline",
+        provider,
+        turnId,
+        item: { type: "assistant_message", text: options.text },
+      });
+    }
+    this.pushEvent({
+      type: "turn_completed",
+      provider,
+      turnId,
+      outputProvenance: options?.outputProvenance ?? "provider",
+    });
+    this.activeTurnId = null;
+  }
+}
+
+class ControlledCompletionClient extends TestAgentClient {
+  readonly sessions: ControlledCompletionSession[] = [];
+
+  override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+    const session = new ControlledCompletionSession(config);
+    this.sessions.push(session);
+    return session;
+  }
+}
+
 test("uses an injected timeline store without making it a production requirement", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-timeline-store-"));
   const store = new RecordingTimelineStore();
@@ -677,14 +756,21 @@ test("uses an injected timeline store without making it a production requirement
       workspaceId: undefined,
     });
     agentId = agent.id;
-    await manager.appendTimelineItem(agent.id, { type: "assistant_message", text: "stored" });
+    await manager.appendTimelineItem(agent.id, {
+      type: "assistant_message",
+      text: "stored",
+    });
     await manager.flush();
 
     expect(store.writes.flat()).toContainEqual(
-      expect.objectContaining({ item: { type: "assistant_message", text: "stored" } }),
+      expect.objectContaining({
+        item: { type: "assistant_message", text: "stored" },
+      }),
     );
     await expect(manager.getTimelineRows(agent.id)).resolves.toContainEqual(
-      expect.objectContaining({ item: { type: "assistant_message", text: "stored" } }),
+      expect.objectContaining({
+        item: { type: "assistant_message", text: "stored" },
+      }),
     );
   } finally {
     if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
@@ -844,7 +930,10 @@ test("retries provider history hydration after a stream failure", async () => {
           _handle: AgentPersistenceHandle,
           config?: Partial<AgentSessionConfig>,
         ): Promise<AgentSession> {
-          return new RetryingHistorySession({ provider: "codex", cwd: config?.cwd ?? workdir });
+          return new RetryingHistorySession({
+            provider: "codex",
+            cwd: config?.cwd ?? workdir,
+          });
         }
       })(),
     },
@@ -875,14 +964,20 @@ test("retries provider history hydration after a stream failure", async () => {
 });
 
 test("unavailable steer interrupts once and starts one replacement turn", async () => {
-  const session = new SteeringTestSession({ provider: "codex", cwd: process.cwd() });
+  const session = new SteeringTestSession({
+    provider: "codex",
+    cwd: process.cwd(),
+  });
   session.steerResult = "unavailable";
   const { manager, agentId, workdir } = await startAndSteerThroughManager(session);
   try {
     expect(session.interruptCount).toBe(1);
     expect(session.startCount).toBe(2);
     expect(manager.getTimeline(agentId)).toContainEqual(
-      expect.objectContaining({ type: "user_message", clientMessageId: "replacement-client" }),
+      expect.objectContaining({
+        type: "user_message",
+        clientMessageId: "replacement-client",
+      }),
     );
   } finally {
     await manager.closeAgent(agentId);
@@ -905,7 +1000,10 @@ test("orders an accepted steer before output emitted while acknowledgement is pe
       return { status: "accepted" };
     }
   }
-  const session = new HeldAcceptedSteerSession({ provider: "codex", cwd: process.cwd() });
+  const session = new HeldAcceptedSteerSession({
+    provider: "codex",
+    cwd: process.cwd(),
+  });
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-steer-order-"));
   const manager = new AgentManager({
     clients: {
@@ -946,7 +1044,10 @@ test("orders an accepted steer before output emitted while acknowledgement is pe
       turnId: "active-turn-1",
     });
     expect(manager.getTimeline(agent.id)).not.toContainEqual(
-      expect.objectContaining({ type: "assistant_message", text: "terminal output" }),
+      expect.objectContaining({
+        type: "assistant_message",
+        text: "terminal output",
+      }),
     );
 
     release.resolve();
@@ -959,7 +1060,10 @@ test("orders an accepted steer before output emitted while acknowledgement is pe
       );
     });
     expect(rows).toMatchObject([
-      { item: { type: "user_message", text: "hello" }, turnId: "active-turn-1" },
+      {
+        item: { type: "user_message", text: "hello" },
+        turnId: "active-turn-1",
+      },
       {
         item: { type: "assistant_message", text: "terminal output" },
         turnId: "active-turn-1",
@@ -973,7 +1077,10 @@ test("orders an accepted steer before output emitted while acknowledgement is pe
 });
 
 test("orders buffered pre-steer output before an immediately accepted steer", async () => {
-  const session = new SteeringTestSession({ provider: "codex", cwd: process.cwd() });
+  const session = new SteeringTestSession({
+    provider: "codex",
+    cwd: process.cwd(),
+  });
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-steer-buffer-order-"));
   const manager = new AgentManager({
     clients: {
@@ -1006,7 +1113,9 @@ test("orders buffered pre-steer output before an immediately accepted steer", as
       item: { type: "assistant_message", text: "pre-steer output" },
     });
     await expect(
-      manager.steerAgentRun(agent.id, "hello", { clientMessageId: "hello-client" }),
+      manager.steerAgentRun(agent.id, "hello", {
+        clientMessageId: "hello-client",
+      }),
     ).resolves.toEqual({ status: "accepted" });
 
     const rows = manager.fetchTimeline(agent.id, { limit: 0 }).rows.filter((row) => {
@@ -1020,7 +1129,10 @@ test("orders buffered pre-steer output before an immediately accepted steer", as
         item: { type: "assistant_message", text: "pre-steer output" },
         turnId: "active-turn-1",
       },
-      { item: { type: "user_message", text: "hello" }, turnId: "active-turn-1" },
+      {
+        item: { type: "user_message", text: "hello" },
+        turnId: "active-turn-1",
+      },
     ]);
   } finally {
     if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
@@ -1042,7 +1154,10 @@ test("orders a concurrent replacement after a pending accepted steer", async () 
       return { status: "accepted" };
     }
   }
-  const session = new HeldAcceptedSteerSession({ provider: "codex", cwd: process.cwd() });
+  const session = new HeldAcceptedSteerSession({
+    provider: "codex",
+    cwd: process.cwd(),
+  });
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-steer-replace-order-"));
   const manager = new AgentManager({
     clients: {
@@ -1107,7 +1222,10 @@ test("orders a concurrent replacement after a pending accepted steer", async () 
 test("does not replace a newer foreground turn after unavailable steer fallback is admitted", async () => {
   const entered = deferred<void>();
   const release = deferred<void>();
-  const session = new SteeringTestSession({ provider: "codex", cwd: process.cwd() });
+  const session = new SteeringTestSession({
+    provider: "codex",
+    cwd: process.cwd(),
+  });
   session.steerResult = "unavailable";
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-stale-steer-"));
   const client = new (class extends TestAgentClient {
@@ -1145,7 +1263,11 @@ test("does not replace a newer foreground turn after unavailable steer fallback 
       "Active turn changed before steering could be delivered",
     );
     await entered.promise;
-    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+    session.pushEvent({
+      type: "turn_completed",
+      provider: "codex",
+      turnId: "active-turn-1",
+    });
     await consumeA;
     const b = manager.streamAgent(agent.id, "B");
     consumeB = (async () => {
@@ -1175,7 +1297,10 @@ test("does not replace a newer foreground turn after unavailable steer fallback 
 });
 
 test("steers a tracked autonomous turn without creating a replacement run", async () => {
-  const session = new SteeringTestSession({ provider: "claude", cwd: process.cwd() });
+  const session = new SteeringTestSession({
+    provider: "claude",
+    cwd: process.cwd(),
+  });
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-autonomous-steer-"));
   const client = new (class extends TestAgentClient {
     override async createSession() {
@@ -1190,7 +1315,11 @@ test("steers a tracked autonomous turn without creating a replacement run", asyn
       workspaceId: undefined,
     });
     agentId = agent.id;
-    session.pushEvent({ type: "turn_started", provider: "claude", turnId: "active-turn-0" });
+    session.pushEvent({
+      type: "turn_started",
+      provider: "claude",
+      turnId: "active-turn-0",
+    });
     await vi.waitFor(() => expect(manager.getAgent(agent.id)?.activeTurnId).toBe("active-turn-0"));
 
     const result = await startAgentRun(manager, agent.id, "autonomous follow-up", logger, {
@@ -1217,7 +1346,10 @@ test("steers a tracked autonomous turn without creating a replacement run", asyn
 });
 
 test("isolated rewind falls back from steering to the normal replacement path", async () => {
-  const session = new SteeringTestSession({ provider: "claude", cwd: process.cwd() });
+  const session = new SteeringTestSession({
+    provider: "claude",
+    cwd: process.cwd(),
+  });
   session.steerResult = "unavailable";
   const { manager, agentId, workdir } = await startAndSteerThroughManager(session);
   try {
@@ -1230,7 +1362,10 @@ test("isolated rewind falls back from steering to the normal replacement path", 
     expect(session.interruptCount).toBe(2);
     expect(session.startPrompts).toContain("/rewind submitted-message-id");
     expect(manager.getTimeline(agentId)).toContainEqual(
-      expect.objectContaining({ type: "user_message", clientMessageId: "rewind-client" }),
+      expect.objectContaining({
+        type: "user_message",
+        clientMessageId: "rewind-client",
+      }),
     );
   } finally {
     await manager.closeAgent(agentId);
@@ -1239,13 +1374,19 @@ test("isolated rewind falls back from steering to the normal replacement path", 
 });
 
 test("missing steer operation interrupts once and starts one replacement turn", async () => {
-  const session = new UnsupportedSteeringSession({ provider: "codex", cwd: process.cwd() });
+  const session = new UnsupportedSteeringSession({
+    provider: "codex",
+    cwd: process.cwd(),
+  });
   const { manager, agentId, workdir } = await startAndSteerThroughManager(session);
   try {
     expect(session.interruptCount).toBe(1);
     expect(session.startCount).toBe(2);
     expect(manager.getTimeline(agentId)).toContainEqual(
-      expect.objectContaining({ type: "user_message", clientMessageId: "replacement-client" }),
+      expect.objectContaining({
+        type: "user_message",
+        clientMessageId: "replacement-client",
+      }),
     );
   } finally {
     await manager.closeAgent(agentId);
@@ -1254,7 +1395,10 @@ test("missing steer operation interrupts once and starts one replacement turn", 
 });
 
 test("ambiguous steer failure leaves the active turn untouched", async () => {
-  const session = new SteeringTestSession({ provider: "codex", cwd: process.cwd() });
+  const session = new SteeringTestSession({
+    provider: "codex",
+    cwd: process.cwd(),
+  });
   session.steerResult = new Error("connection lost after delivery");
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-steer-ambiguous-"));
   const client = new (class extends TestAgentClient {
@@ -1321,8 +1465,14 @@ test("steering records concurrent early echoes as canonical submitted prompts", 
     const rows = manager.getTimeline(agent.id).filter((item) => item.type === "user_message");
     expect(rows).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ messageId: "client-one", clientMessageId: "client-one" }),
-        expect.objectContaining({ messageId: "client-two", clientMessageId: "client-two" }),
+        expect.objectContaining({
+          messageId: "client-one",
+          clientMessageId: "client-one",
+        }),
+        expect.objectContaining({
+          messageId: "client-two",
+          clientMessageId: "client-two",
+        }),
       ]),
     );
     expect(rows.filter((item) => item.clientMessageId === "client-one")).toHaveLength(1);
@@ -1370,7 +1520,11 @@ class ControlledInterruptSession extends TestAgentSession {
 
   override async startTurn(): Promise<{ turnId: string }> {
     setTimeout(() => {
-      this.pushEvent({ type: "turn_started", provider: this.provider, turnId: this.turnId });
+      this.pushEvent({
+        type: "turn_started",
+        provider: this.provider,
+        turnId: this.turnId,
+      });
     }, 0);
     return { turnId: this.turnId };
   }
@@ -1516,7 +1670,11 @@ class StreamingAssistantSession implements AgentSession {
         turnId,
         item: { type: "assistant_message", text: "reply" },
       });
-      this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+      this.pushEvent({
+        type: "turn_completed",
+        provider: this.provider,
+        turnId,
+      });
     }, 0);
     return { turnId };
   }
@@ -1609,11 +1767,24 @@ function fakeCodexEmitting(args: FakeCodexEmitterArgs): AgentClient {
     override async startTurn(): Promise<{ turnId: string }> {
       const turnId = "turn-fake-codex";
       setTimeout(() => {
-        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "turn_started",
+          provider: this.provider,
+          turnId,
+        });
         for (const item of turnItems) {
-          this.pushEvent({ type: "timeline", provider: this.provider, item, turnId });
+          this.pushEvent({
+            type: "timeline",
+            provider: this.provider,
+            item,
+            turnId,
+          });
         }
-        this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "turn_completed",
+          provider: this.provider,
+          turnId,
+        });
       }, 0);
       return { turnId };
     }
@@ -1664,7 +1835,10 @@ test("does not register a session that finishes starting after shutdown begins",
   client.finishCreating();
 
   await expect(creation).rejects.toThrow("Agent manager is shutting down");
-  expect({ agents: manager.listAgents(), sessionClosed: client.createdSessionClosed }).toEqual({
+  expect({
+    agents: manager.listAgents(),
+    sessionClosed: client.createdSessionClosed,
+  }).toEqual({
     agents: [],
     sessionClosed: true,
   });
@@ -1740,11 +1914,75 @@ test("does not persist an initializing session after shutdown closes it", async 
     await expect(creation).rejects.toBeInstanceOf(AgentManagerShuttingDownError);
     await closing;
     await storage.flush();
-    expect({ agents: manager.listAgents(), record: await storage.get(agentId) }).toMatchObject({
+    expect({
+      agents: manager.listAgents(),
+      record: await storage.get(agentId),
+    }).toMatchObject({
       agents: [],
       record: { lastStatus: "closed" },
     });
   } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("provider teardown SIGTERM cannot replace a durable rollover failure before shutdown starts", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-shutdown-failure-state-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  let resumedSession: TestAgentSession | null = null;
+  const client = new (class extends TestAgentClient {
+    override async resumeSession(
+      _handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+    ): Promise<AgentSession> {
+      resumedSession = new TestAgentSession({
+        provider: "codex",
+        cwd: config?.cwd ?? workdir,
+      });
+      return resumedSession;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const failureText =
+    "There's an issue with the selected model (claude-opus-5). It may not exist or you may not have access to it.";
+
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.closeAgent(agent.id);
+    const stored = (await storage.get(agent.id))!;
+    await storage.upsert({
+      ...stored,
+      lastStatus: "error",
+      lastError: failureText,
+      lastFailureKind: "resume_model_unavailable",
+      requiresAttention: true,
+      attentionReason: "error",
+      attentionTimestamp: new Date().toISOString(),
+    });
+    await ensureAgentLoaded(agent.id, { agentManager: manager, agentStorage: storage, logger });
+    expect(resumedSession).not.toBeNull();
+
+    resumedSession!.pushEvent({
+      type: "turn_failed",
+      provider: "codex",
+      error:
+        "Claude stopped unexpectedly (signal SIGTERM). Any background work was terminated with it.",
+    });
+    await vi.waitFor(() => expect(manager.getAgent(agent.id)?.lastError).toBe(failureText));
+    manager.prepareForShutdown();
+    await manager.closeAgent(agent.id);
+    await storage.flush();
+
+    expect(await storage.get(agent.id)).toMatchObject({
+      lastStatus: "closed",
+      lastError: failureText,
+      lastFailureKind: "resume_model_unavailable",
+    });
+  } finally {
+    await manager.flushForShutdown().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
     rmSync(workdir, { recursive: true, force: true });
   }
 });
@@ -2116,7 +2354,11 @@ test("listDraftFeatures uses client feature listing without a model", async () =
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-draft-features-"));
   const storagePath = join(workdir, "agents");
   const storage = new AgentStorage(storagePath, logger);
-  const draftFeature = createFeature({ id: "auto_accept", label: "Auto Accept", value: false });
+  const draftFeature = createFeature({
+    id: "auto_accept",
+    label: "Auto Accept",
+    value: false,
+  });
   class DraftFeatureClient extends TestAgentClient {
     fetchCatalogCalls = 0;
     createSessionCalls = 0;
@@ -2171,7 +2413,11 @@ test("listDraftFeatures uses explicit model config without default model fetchin
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-draft-features-"));
   const storagePath = join(workdir, "agents");
   const storage = new AgentStorage(storagePath, logger);
-  const draftFeature = createFeature({ id: "fast_mode", label: "Fast mode", value: false });
+  const draftFeature = createFeature({
+    id: "fast_mode",
+    label: "Fast mode",
+    value: false,
+  });
   class DraftFeatureClient extends TestAgentClient {
     fetchCatalogCalls = 0;
     createSessionCalls = 0;
@@ -2373,7 +2619,14 @@ test("setAgentMode persists the selected mode across session reload", async () =
 
     async fetchCatalog() {
       return {
-        models: [{ provider: "codex", id: "gpt-5.4", label: "GPT-5.4", isDefault: true }],
+        models: [
+          {
+            provider: "codex",
+            id: "gpt-5.4",
+            label: "GPT-5.4",
+            isDefault: true,
+          },
+        ],
         modes: [],
       };
     }
@@ -3075,7 +3328,10 @@ test("createAgent closes and rejects a provider session that cannot honor MCP se
 test("resumeAgentFromPersistence closes and rejects a session that cannot honor external MCP", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
-  const replacement = new CloseRecordingTestAgentSession({ provider: "codex", cwd: workdir });
+  const replacement = new CloseRecordingTestAgentSession({
+    provider: "codex",
+    cwd: workdir,
+  });
 
   class UnsupportedResumeClient extends TestAgentClient {
     override async resumeSession(): Promise<AgentSession> {
@@ -3102,7 +3358,10 @@ test("resumeAgentFromPersistence closes and rejects a session that cannot honor 
         {
           cwd: workdir,
           mcpServers: {
-            hub: { type: "http", url: "https://hub.test/mcp/executions/resume" },
+            hub: {
+              type: "http",
+              url: "https://hub.test/mcp/executions/resume",
+            },
           },
         },
         agentId,
@@ -3119,8 +3378,14 @@ test("resumeAgentFromPersistence closes and rejects a session that cannot honor 
 
 test("reloadAgentSession preserves the live session when its replacement cannot honor external MCP", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
-  const original = new CloseRecordingTestAgentSession({ provider: "codex", cwd: workdir });
-  const replacement = new CloseRecordingTestAgentSession({ provider: "codex", cwd: workdir });
+  const original = new CloseRecordingTestAgentSession({
+    provider: "codex",
+    cwd: workdir,
+  });
+  const replacement = new CloseRecordingTestAgentSession({
+    provider: "codex",
+    cwd: workdir,
+  });
 
   class UnsupportedReloadClient extends TestAgentClient {
     override async createSession(): Promise<AgentSession> {
@@ -4224,7 +4489,10 @@ test("importProviderSession imports the selected session without listing and pub
         },
         timeline: [
           {
-            item: { type: "user_message" as const, text: "Trace provider imports" },
+            item: {
+              type: "user_message" as const,
+              text: "Trace provider imports",
+            },
             timestamp: "2026-01-02T00:00:00.000Z",
           },
           {
@@ -4265,7 +4533,10 @@ test("importProviderSession imports the selected session without listing and pub
             event: {
               type: "timeline" as const,
               id: "thread-child",
-              item: { type: "assistant_message" as const, text: "Child result" },
+              item: {
+                type: "assistant_message" as const,
+                text: "Child result",
+              },
             },
           },
         ],
@@ -4291,7 +4562,10 @@ test("importProviderSession imports the selected session without listing and pub
   });
 
   expect(client.listCalls).toBe(0);
-  expect(client.importInput).toEqual({ providerHandleId: "thread-selected", cwd: workdir });
+  expect(client.importInput).toEqual({
+    providerHandleId: "thread-selected",
+    cwd: workdir,
+  });
   expect(client.importLaunchContext).toEqual({
     agentId: imported.id,
     env: {
@@ -4319,10 +4593,16 @@ test("importProviderSession imports the selected session without listing and pub
     },
   ]);
   expect(manager.listProviderSubagents(imported.id)).toEqual([
-    expect.objectContaining({ id: "thread-child", title: "Imported child", status: "completed" }),
+    expect.objectContaining({
+      id: "thread-child",
+      title: "Imported child",
+      status: "completed",
+    }),
   ]);
   expect(manager.fetchProviderSubagentTimeline(imported.id, "thread-child").rows).toEqual([
-    expect.objectContaining({ item: { type: "assistant_message", text: "Child result" } }),
+    expect.objectContaining({
+      item: { type: "assistant_message", text: "Child result" },
+    }),
   ]);
   expect(events).toHaveLength(3);
   expect(events[0]).toMatchObject({
@@ -4538,11 +4818,18 @@ test("reloadAgentSession clears provider children before rehydrating from disk",
   activeSession?.pushEvent({
     type: "provider_subagent",
     provider: "codex",
-    event: { type: "upsert", id: "stale-child", title: "Stale child", status: "running" },
+    event: {
+      type: "upsert",
+      id: "stale-child",
+      title: "Stale child",
+      status: "running",
+    },
   });
   await vi.waitFor(() => expect(manager.listProviderSubagents(snapshot.id)).toHaveLength(1));
 
-  await manager.reloadAgentSession(snapshot.id, undefined, { rehydrateFromDisk: true });
+  await manager.reloadAgentSession(snapshot.id, undefined, {
+    rehydrateFromDisk: true,
+  });
 
   expect(manager.listProviderSubagents(snapshot.id)).toEqual([]);
 });
@@ -4579,7 +4866,12 @@ test("reloadAgentSession terminalizes running provider children when preserving 
   activeSession?.pushEvent({
     type: "provider_subagent",
     provider: "codex",
-    event: { type: "upsert", id: "running-child", title: "Running child", status: "running" },
+    event: {
+      type: "upsert",
+      id: "running-child",
+      title: "Running child",
+      status: "running",
+    },
   });
   await vi.waitFor(() => expect(manager.listProviderSubagents(snapshot.id)).toHaveLength(1));
 
@@ -4627,7 +4919,10 @@ test("hydrateTimelineFromProvider restores and broadcasts provider children from
     replayState: false,
   });
 
-  await manager.hydrateTimelineFromProvider(snapshot.id, { force: true, broadcast: true });
+  await manager.hydrateTimelineFromProvider(snapshot.id, {
+    force: true,
+    broadcast: true,
+  });
 
   expect(manager.listProviderSubagents(snapshot.id)).toEqual([
     expect.objectContaining({
@@ -4686,7 +4981,10 @@ test("force provider hydration removes children absent from current history", as
     replayState: false,
   });
 
-  await manager.hydrateTimelineFromProvider(snapshot.id, { force: true, broadcast: true });
+  await manager.hydrateTimelineFromProvider(snapshot.id, {
+    force: true,
+    broadcast: true,
+  });
 
   expect(manager.listProviderSubagents(snapshot.id)).toEqual([]);
   expect(events).toContainEqual({
@@ -5445,7 +5743,11 @@ test("reloadAgentSession cancels active run and resumes existing session once th
       this.activeTurnId = turnId;
       // Push turn_started, then thread_started, then wait on gate
       setTimeout(async () => {
-        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "turn_started",
+          provider: this.provider,
+          turnId,
+        });
         this.persistenceReady = true;
         this.pushEvent({
           type: "thread_started",
@@ -5461,7 +5763,11 @@ test("reloadAgentSession cancels active run and resumes existing session once th
             turnId,
           });
         } else {
-          this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+          this.pushEvent({
+            type: "turn_completed",
+            provider: this.provider,
+            turnId,
+          });
         }
       }, 0);
       return { turnId };
@@ -6296,9 +6602,17 @@ test("waitForAgentEvent does not resolve idle until foreground turn is finalized
       this.interrupted = false;
       const turnId = `turn-${++this.turnIdCounter}`;
       void (async () => {
-        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "turn_started",
+          provider: this.provider,
+          turnId,
+        });
         await releaseTurnCompleted.promise;
-        this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "turn_completed",
+          provider: this.provider,
+          turnId,
+        });
       })();
       return { turnId };
     }
@@ -6389,6 +6703,161 @@ test("waitForAgentRunStart resolves while a foreground run is still only pending
 
   await drainRun;
   expect(manager.getAgent(snapshot.id)?.lifecycle).toBe("idle");
+});
+
+test("waitForAgentRunStart does not report a stale error after the replacement was accepted", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-retry-start-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const allowRetryStart = deferred<void>();
+  const allowRetryCompletion = deferred<void>();
+  const acceptedPrompts: AgentPromptInput[] = [];
+
+  class ErrorThenRetrySession extends TestAgentSession {
+    private starts = 0;
+
+    override async startTurn(prompt: AgentPromptInput): Promise<{ turnId: string }> {
+      acceptedPrompts.push(prompt);
+      this.starts += 1;
+      const turnId = `turn-${this.starts}`;
+      if (this.starts === 1) {
+        setTimeout(() => {
+          this.pushEvent({
+            type: "turn_started",
+            provider: this.provider,
+            turnId,
+          });
+          this.pushEvent({
+            type: "turn_failed",
+            provider: this.provider,
+            turnId,
+            error: "previous provider failure",
+          });
+        }, 0);
+        return { turnId };
+      }
+
+      await allowRetryStart.promise;
+      void allowRetryCompletion.promise.then(() => {
+        this.pushEvent({
+          type: "turn_completed",
+          provider: this.provider,
+          turnId,
+        });
+        return undefined;
+      });
+      return { turnId };
+    }
+  }
+
+  const session = new ErrorThenRetrySession({
+    provider: "codex",
+    cwd: workdir,
+  });
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+  });
+  const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+
+  try {
+    const failedRun = manager.streamAgent(snapshot.id, "first");
+    for await (const _event of failedRun) {
+      // Drain the failed run.
+    }
+    expect(manager.getAgent(snapshot.id)?.lifecycle).toBe("error");
+
+    const retryRun = manager.streamAgent(snapshot.id, "retry");
+    const drainRetry = (async () => {
+      for await (const _event of retryRun) {
+        // Drain the retry.
+      }
+    })();
+    await Promise.resolve();
+
+    const startWait = manager.waitForAgentRunStart(snapshot.id);
+    let settled = false;
+    void startWait.then(
+      () => {
+        settled = true;
+        return undefined;
+      },
+      () => {
+        settled = true;
+        return undefined;
+      },
+    );
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    allowRetryStart.resolve(undefined);
+    await expect(startWait).resolves.toBeUndefined();
+    expect(manager.getAgent(snapshot.id)?.lifecycle).toBe("running");
+
+    allowRetryCompletion.resolve(undefined);
+    await drainRetry;
+    expect(acceptedPrompts).toEqual(["first", "retry"]);
+  } finally {
+    await manager.closeAgent(snapshot.id).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("waitForAgentRunStart still reports the current attempt's start failure", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-current-start-failure-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const allowStartFailure = deferred<void>();
+
+  class DeferredStartFailureSession extends TestAgentSession {
+    override async startTurn(): Promise<{ turnId: string }> {
+      await allowStartFailure.promise;
+      throw new Error("current provider start failed");
+    }
+  }
+
+  const session = new DeferredStartFailureSession({
+    provider: "codex",
+    cwd: workdir,
+  });
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+  });
+  const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+
+  try {
+    const run = manager.streamAgent(snapshot.id, "fail this start");
+    const drainRun = (async () => {
+      for await (const _event of run) {
+        // Drain until the provider rejects the start.
+      }
+    })();
+    await Promise.resolve();
+
+    const startWait = manager.waitForAgentRunStart(snapshot.id);
+    allowStartFailure.resolve(undefined);
+
+    await expect(startWait).rejects.toThrow("current provider start failed");
+    await expect(drainRun).rejects.toThrow("current provider start failed");
+  } finally {
+    await manager.closeAgent(snapshot.id).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
 });
 
 test("waitForAgentRunStart ignores a prior turn error while the next run starts", async () => {
@@ -6487,7 +6956,11 @@ test("replaceAgentRun does not emit idle or resolve waiters between interrupted 
       const turnNum = this.turnIdCounter;
 
       void (async () => {
-        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "turn_started",
+          provider: this.provider,
+          turnId,
+        });
         if (turnNum === 1) {
           await allowFirstRunToEnd.promise;
           this.pushEvent({
@@ -6498,7 +6971,11 @@ test("replaceAgentRun does not emit idle or resolve waiters between interrupted 
           });
         } else {
           await allowSecondRunToEnd.promise;
-          this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+          this.pushEvent({
+            type: "turn_completed",
+            provider: this.provider,
+            turnId,
+          });
         }
       })();
       return { turnId };
@@ -6611,7 +7088,11 @@ test("replaceAgentRun stays running when a stale old terminal arrives before the
 
       if (turnNum === 1) {
         setTimeout(() => {
-          this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+          this.pushEvent({
+            type: "turn_started",
+            provider: this.provider,
+            turnId,
+          });
         }, 0);
         return { turnId };
       }
@@ -6619,9 +7100,17 @@ test("replaceAgentRun stays running when a stale old terminal arrives before the
       secondStartEntered.resolve();
       await allowSecondStartToResolve.promise;
       setTimeout(async () => {
-        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "turn_started",
+          provider: this.provider,
+          turnId,
+        });
         await allowSecondTurnToComplete.promise;
-        this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "turn_completed",
+          provider: this.provider,
+          turnId,
+        });
       }, 0);
       return { turnId };
     }
@@ -6713,7 +7202,11 @@ test("replaceAgentRun stays running when a stale old terminal arrives before the
   await secondStartEntered.promise;
 
   const replaceGapSnapshot = manager.getAgent(snapshot.id) as
-    | { pendingReplacement: boolean; activeForegroundTurnId: string | null; lifecycle: string }
+    | {
+        pendingReplacement: boolean;
+        activeForegroundTurnId: string | null;
+        lifecycle: string;
+      }
     | undefined;
   expect(replaceGapSnapshot?.pendingReplacement).toBe(true);
   expect(replaceGapSnapshot?.activeForegroundTurnId).toBeNull();
@@ -6726,7 +7219,11 @@ test("replaceAgentRun stays running when a stale old terminal arrives before the
   ]);
   expect(prematureStart).toBe("pending");
 
-  capturedSession!.pushEvent({ type: "turn_completed", provider: "codex", turnId: "turn-1" });
+  capturedSession!.pushEvent({
+    type: "turn_completed",
+    provider: "codex",
+    turnId: "turn-1",
+  });
   await new Promise((resolve) => setTimeout(resolve, 0));
 
   expect(manager.getAgent(snapshot.id)?.lifecycle).toBe("running");
@@ -6738,7 +7235,11 @@ test("replaceAgentRun stays running when a stale old terminal arrives before the
   allowSecondStartToResolve.resolve();
 
   await replacementStart;
-  capturedSession!.pushEvent({ type: "turn_completed", provider: "codex", turnId: "turn-1" });
+  capturedSession!.pushEvent({
+    type: "turn_completed",
+    provider: "codex",
+    turnId: "turn-1",
+  });
   await new Promise((resolve) => setTimeout(resolve, 0));
   expect(
     manager
@@ -6901,7 +7402,11 @@ test("ignores stale autonomous terminals without lowering the active turn lifecy
     expect(priorFailure?.lastUsage).toEqual({ inputTokens: 7 });
   });
 
-  capturedSession!.pushEvent({ type: "turn_started", provider: "codex", turnId: "turn-b" });
+  capturedSession!.pushEvent({
+    type: "turn_started",
+    provider: "codex",
+    turnId: "turn-b",
+  });
   await vi.waitFor(() => {
     const running = manager.getAgent(snapshot.id);
     expect(running?.lifecycle).toBe("running");
@@ -6924,8 +7429,18 @@ test("ignores stale autonomous terminals without lowering the active turn lifecy
       turnId: "turn-a",
       usage: { inputTokens: 99 },
     },
-    { type: "turn_failed", provider: "codex", turnId: "turn-a", error: "late failure" },
-    { type: "turn_canceled", provider: "codex", turnId: "turn-a", reason: "late cancel" },
+    {
+      type: "turn_failed",
+      provider: "codex",
+      turnId: "turn-a",
+      error: "late failure",
+    },
+    {
+      type: "turn_canceled",
+      provider: "codex",
+      turnId: "turn-a",
+      reason: "late cancel",
+    },
   ];
   for (const terminal of staleTerminals) {
     const processed = new Promise<void>((resolve) => {
@@ -6954,7 +7469,11 @@ test("ignores stale autonomous terminals without lowering the active turn lifecy
     expect(manager.getTimeline(snapshot.id)).toEqual(timelineBeforeStaleTerminals);
   }
 
-  capturedSession!.pushEvent({ type: "turn_completed", provider: "codex", turnId: "turn-b" });
+  capturedSession!.pushEvent({
+    type: "turn_completed",
+    provider: "codex",
+    turnId: "turn-b",
+  });
   await vi.waitFor(() => {
     const settled = manager.getAgent(snapshot.id);
     expect(settled?.lifecycle).toBe("idle");
@@ -7188,7 +7707,9 @@ test("waitForAgentEvent waitForActive resolves for autonomous live-event run", a
   );
 
   const autonomousTurnId = "autonomous-wait-1";
-  const waitPromise = manager.waitForAgentEvent(snapshot.id, { waitForActive: true });
+  const waitPromise = manager.waitForAgentEvent(snapshot.id, {
+    waitForActive: true,
+  });
   capturedSession!.pushEvent({
     type: "turn_started",
     provider: "codex",
@@ -7216,9 +7737,17 @@ test("autonomous events arriving during foreground run are processed via subscri
     override async startTurn(): Promise<{ turnId: string }> {
       const turnId = "fg-turn-1";
       setTimeout(async () => {
-        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "turn_started",
+          provider: this.provider,
+          turnId,
+        });
         await releaseForeground.promise;
-        this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "turn_completed",
+          provider: this.provider,
+          turnId,
+        });
       }, 0);
       return { turnId };
     }
@@ -7438,7 +7967,10 @@ test("keeps updatedAt monotonic when user message and run start happen in the sa
 
   const nowSpy = vi.spyOn(Date, "now").mockReturnValue(1_750_000_000_000);
   try {
-    await manager.appendTimelineItem(snapshot.id, { type: "user_message", text: "hello" });
+    await manager.appendTimelineItem(snapshot.id, {
+      type: "user_message",
+      text: "hello",
+    });
     const afterMessage = manager.getAgent(snapshot.id);
     expect(afterMessage).toBeDefined();
     const messageUpdatedAt = afterMessage!.updatedAt.getTime();
@@ -7744,9 +8276,16 @@ test("subscribe hides provider subagents of internal parents from global subscri
   });
   const globalEvents: AgentManagerEvent[] = [];
   const scopedEvents: AgentManagerEvent[] = [];
-  manager.subscribe((event) => globalEvents.push(event), { replayState: false });
+  manager.subscribe((event) => globalEvents.push(event), {
+    replayState: false,
+  });
   await manager.createAgent(
-    { provider: "codex", cwd: workdir, title: "Internal Agent", internal: true },
+    {
+      provider: "codex",
+      cwd: workdir,
+      title: "Internal Agent",
+      internal: true,
+    },
     undefined,
     { workspaceId: undefined },
   );
@@ -7758,7 +8297,12 @@ test("subscribe hides provider subagents of internal parents from global subscri
   sessionHolder.current?.pushEvent({
     type: "provider_subagent",
     provider: "codex",
-    event: { type: "upsert", id: "hidden-child", title: "Hidden child", status: "running" },
+    event: {
+      type: "upsert",
+      id: "hidden-child",
+      title: "Hidden child",
+      status: "running",
+    },
   });
   await manager.flush();
 
@@ -7903,7 +8447,10 @@ test("onAgentAttention is not called for delegated child agents", async () => {
       title: "Delegated Child Agent",
     },
     undefined,
-    { labels: { [PARENT_AGENT_ID_LABEL]: "parent-agent" }, workspaceId: undefined },
+    {
+      labels: { [PARENT_AGENT_ID_LABEL]: "parent-agent" },
+      workspaceId: undefined,
+    },
   );
 
   await manager.runAgent(agent.id, "hello");
@@ -7924,7 +8471,11 @@ test("clearAgentAttention on errored agent stays cleared until a new error trans
       const attempt = this.attempt;
       const turnId = `fail-turn-${attempt}`;
       setTimeout(() => {
-        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "turn_started",
+          provider: this.provider,
+          turnId,
+        });
         this.pushEvent({
           type: "turn_failed",
           provider: this.provider,
@@ -8135,7 +8686,9 @@ test("acknowledged cancellation settles a pending run before it has a turn id", 
     expect(manager.getAgent(agent.id)?.lifecycle).toBe("idle");
     expect(manager.hasInFlightRun(agent.id)).toBe(true);
 
-    await expect(manager.cancelAgentRun(agent.id)).resolves.toEqual({ status: "settled" });
+    await expect(manager.cancelAgentRun(agent.id)).resolves.toEqual({
+      status: "settled",
+    });
     expect(manager.hasInFlightRun(agent.id)).toBe(false);
     expect(manager.getAgent(agent.id)?.lifecycle).toBe("idle");
 
@@ -8227,7 +8780,10 @@ test("fires onAgentArchived for archived parent and cascaded children", async ()
   const liveChild = await manager.createAgent(
     { provider: "codex", cwd: workdir, title: "Child" },
     undefined,
-    { labels: { [PARENT_AGENT_ID_LABEL]: liveParent.id }, workspaceId: undefined },
+    {
+      labels: { [PARENT_AGENT_ID_LABEL]: liveParent.id },
+      workspaceId: undefined,
+    },
   );
 
   await manager.archiveAgent(liveParent.id);
@@ -8576,7 +9132,10 @@ test("archiveAgent re-reads a child before deciding whether to cascade", async (
       if (parentIsArchived && staleChild) {
         await super.upsert({
           ...staleChild,
-          labels: { ...staleChild.labels, [MOBILE_OPEN_AGENT_TAB_LABEL]: "true" },
+          labels: {
+            ...staleChild.labels,
+            [MOBILE_OPEN_AGENT_TAB_LABEL]: "true",
+          },
         });
       }
       return records;
@@ -8680,9 +9239,17 @@ test("archiveAgent cascade closes a running child runtime", async () => {
     override async startTurn(): Promise<{ turnId: string }> {
       const turnId = "running-child-turn";
       void (async () => {
-        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "turn_started",
+          provider: this.provider,
+          turnId,
+        });
         await finishRun.promise;
-        this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "turn_completed",
+          provider: this.provider,
+          turnId,
+        });
       })();
       return { turnId };
     }
@@ -8910,80 +9477,1125 @@ test("archiveAgent cascade surfaces partial child archive failures", async () =>
   );
 });
 
-test("turn_failed emits a system error assistant timeline message and keeps error lifecycle", async () => {
-  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-turn-failed-"));
-  const storagePath = join(workdir, "agents");
-  const storage = new AgentStorage(storagePath, logger);
-
-  class TurnFailedSession extends TestAgentSession {
-    override async startTurn(): Promise<{ turnId: string }> {
-      const turnId = "turn-failed-1";
-      setTimeout(() => {
-        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+test.each(["close", "archive", "shutdown"])(
+  "controlled %s does not notify process teardown",
+  async (action) => {
+    const workdir = mkdtempSync(join(tmpdir(), "paseo-controlled-close-"));
+    const notices: unknown[] = [];
+    class ClosingSession extends TestAgentSession {
+      override async close(): Promise<void> {
         this.pushEvent({
           type: "turn_failed",
           provider: this.provider,
-          error: "invalid model id",
-          turnId,
+          error: "Claude stopped unexpectedly (signal SIGTERM)",
+          turnId: "active-1",
         });
+        this.pushEvent({
+          type: "provider_subagent",
+          provider: this.provider,
+          event: { type: "upsert", id: "closing-child", status: "failed" },
+        });
+        await super.close();
+      }
+    }
+    const session = new ClosingSession({ provider: "codex", cwd: workdir });
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const manager = new AgentManager({
+      clients: {
+        codex: new (class extends TestAgentClient {
+          override async createSession(): Promise<AgentSession> {
+            return session;
+          }
+        })(),
+      },
+      registry: storage,
+      logger,
+      onTurnFailure: async (notice) => {
+        notices.push(notice);
+      },
+    });
+    try {
+      const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+        workspaceId: undefined,
+      });
+      session.pushEvent({ type: "turn_started", provider: "codex", turnId: "active-1" });
+      await vi.waitFor(() => expect(manager.getAgent(agent.id)?.lifecycle).toBe("running"));
+      if (action === "shutdown") manager.prepareForShutdown();
+      if (action === "archive") await manager.archiveAgent(agent.id);
+      else await manager.closeAgent(agent.id);
+      await manager.flush();
+      expect(notices).toEqual([]);
+    } finally {
+      await storage.flush();
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each(["invalid model id", "Claude stopped unexpectedly (signal SIGTERM)"])(
+  "turn_failed notifies and preserves error lifecycle: %s",
+  async (failureText) => {
+    const notices: import("./turn-failure-outbox.js").TurnFailureNotice[] = [];
+    const workdir = mkdtempSync(join(tmpdir(), "agent-manager-turn-failed-"));
+    const storagePath = join(workdir, "agents");
+    const storage = new AgentStorage(storagePath, logger);
+
+    class TurnFailedSession extends TestAgentSession {
+      override async startTurn(): Promise<{ turnId: string }> {
+        const turnId = "turn-failed-1";
+        setTimeout(() => {
+          this.pushEvent({
+            type: "turn_started",
+            provider: this.provider,
+            turnId,
+          });
+          this.pushEvent({
+            type: "provider_subagent",
+            provider: this.provider,
+            event: { type: "upsert", id: "failed-child", status: "failed" },
+          });
+          this.pushEvent({
+            type: "turn_failed",
+            provider: this.provider,
+            error: failureText,
+            turnId,
+          });
+        }, 0);
+        return { turnId };
+      }
+    }
+
+    class TurnFailedClient implements AgentClient {
+      readonly provider = "codex" as const;
+      readonly capabilities = TEST_CAPABILITIES;
+
+      async isAvailable(): Promise<boolean> {
+        return true;
+      }
+
+      async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+        return new TurnFailedSession(config);
+      }
+
+      async resumeSession(config?: Partial<AgentSessionConfig>): Promise<AgentSession> {
+        return new TurnFailedSession({
+          provider: "codex",
+          cwd: config?.cwd ?? process.cwd(),
+        });
+      }
+    }
+
+    const manager = new AgentManager({
+      clients: {
+        codex: new TurnFailedClient(),
+      },
+      registry: storage,
+      logger,
+      idFactory: () => "00000000-0000-4000-8000-000000000131",
+      onTurnFailure: async (notice) => {
+        if (notice.code === "subagent_failed")
+          expect(manager.getAgent(notice.agentId)?.lifecycle).toBe("running");
+        notices.push(notice);
+      },
+    });
+
+    const agent = await manager.createAgent(
+      {
+        provider: "codex",
+        cwd: workdir,
+        title: "Turn failed test",
+      },
+      undefined,
+      { workspaceId: undefined },
+    );
+
+    await expect(manager.runAgent(agent.id, "hello")).rejects.toThrow(failureText);
+
+    const snapshot = manager.getAgent(agent.id);
+    expect(snapshot?.lifecycle).toBe("error");
+    expect(snapshot?.lastError).toBe(failureText);
+
+    const systemErrors = manager
+      .getTimeline(agent.id)
+      .filter(
+        (item): item is Extract<AgentTimelineItem, { type: "assistant_message" }> =>
+          item.type === "assistant_message" && item.text.includes("[System Error]"),
+      );
+    expect(systemErrors).toHaveLength(1);
+    expect(systemErrors[0]?.text).toContain(failureText);
+    expect(notices).toEqual([
+      expect.objectContaining({
+        agentId: agent.id,
+        code: "subagent_failed",
+        failureKind: "subagent_failed",
+      }),
+      {
+        agentId: agent.id,
+        turnId: "turn-failed-1",
+        provider: "codex",
+        code: null,
+        failureKind: null,
+      },
+    ]);
+  },
+);
+
+test.each([
+  {
+    name: "context overflow",
+    failureKind: "context_overflow" as const,
+    failureText: "Prompt is too long",
+  },
+  {
+    name: "unresolved prior turn",
+    failureKind: "conversation_unresolved" as const,
+    failureText: "API Error: 409 Conversation has an unresolved prior request",
+  },
+  {
+    name: "active-request ambiguity",
+    failureKind: "conversation_unresolved" as const,
+    failureText: "API Error: 409 Conversation already has an active request",
+  },
+  {
+    name: "missing CCProxy continuation",
+    failureKind: "conversation_unresolved" as const,
+    failureText: "API Error: 409 Conversation continuation was not found",
+  },
+  {
+    name: "resumed-session model rejection",
+    failureKind: "resume_model_unavailable" as const,
+    failureText:
+      "There's an issue with the selected model (claude-opus-5). It may not exist or you may not have access to it. Run --model to pick a different model.",
+  },
+  {
+    name: "resumed-session model rejection with variant display text",
+    failureKind: "resume_model_unavailable" as const,
+    failureText: "Selected model claude-opus-5 is unavailable for this resumed request.",
+  },
+])(
+  "$name rolls into exactly one fresh family session without resuming or copying history",
+  async ({ failureKind, failureText }) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-manager-context-overflow-"));
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const durableTimelineStore = new RecordingTimelineStore();
+    const oldAgentId = "00000000-0000-4000-8000-000000000201";
+    const successorAgentId = "00000000-0000-4000-8000-000000000202";
+    const createdSessions: TestAgentSession[] = [];
+    const startedPrompts: AgentPromptInput[] = [];
+    const queuedPrompt = "After recovery, run the remaining integration test once.";
+
+    class OverflowSession extends TestAgentSession {
+      private lastTurnId = "continuation-turn";
+
+      constructor(
+        config: AgentSessionConfig,
+        private readonly nativeSessionId: string,
+        private readonly overflows: boolean,
+      ) {
+        super(config);
+      }
+
+      override async startTurn(prompt: AgentPromptInput): Promise<{ turnId: string }> {
+        startedPrompts.push(prompt);
+        const turnId = this.overflows
+          ? "overflow-turn"
+          : `continuation-turn-${startedPrompts.length}`;
+        this.lastTurnId = turnId;
+        setTimeout(() => {
+          this.pushEvent({
+            type: "turn_started",
+            provider: this.provider,
+            turnId,
+          });
+          if (!this.overflows) {
+            this.pushEvent({
+              type: "timeline",
+              provider: this.provider,
+              turnId,
+              item: {
+                type: "user_message",
+                text: typeof prompt === "string" ? prompt : "unexpected structured handoff",
+              },
+            });
+            if (prompt === queuedPrompt) {
+              this.pushEvent({
+                type: "turn_completed",
+                provider: this.provider,
+                turnId,
+              });
+            }
+            return;
+          }
+          this.pushEvent({
+            type: "timeline",
+            provider: this.provider,
+            turnId,
+            item: {
+              type: "user_message",
+              text: "Finish the MR review and report blockers.",
+            },
+          });
+          this.pushEvent({
+            type: "timeline",
+            provider: this.provider,
+            turnId,
+            item: {
+              type: "assistant_message",
+              text: "The diff is reviewed; tests remain.",
+            },
+          });
+          this.pushEvent({
+            type: "timeline",
+            provider: this.provider,
+            turnId,
+            item: {
+              type: "tool_call",
+              callId: "question-1",
+              name: "AskUserQuestion",
+              status: "completed",
+              detail: {
+                type: "unknown",
+                input: { questions: [{ question: "Run the full suite?" }] },
+                output: { answers: { "Run the full suite?": "Yes" } },
+              },
+              error: null,
+            },
+          });
+          this.pushEvent({
+            type: "turn_failed",
+            provider: this.provider,
+            turnId,
+            error: failureText,
+            failureKind,
+          });
+          // A repeated provider terminal must not allocate another continuation.
+          this.pushEvent({
+            type: "turn_failed",
+            provider: this.provider,
+            turnId,
+            error: failureText,
+            failureKind,
+          });
+        }, 0);
+        return { turnId };
+      }
+
+      complete(): void {
+        this.pushEvent({
+          type: "timeline",
+          provider: this.provider,
+          turnId: this.lastTurnId,
+          item: { type: "assistant_message", text: "Review complete." },
+        });
+        this.pushEvent({
+          type: "turn_completed",
+          provider: this.provider,
+          outputProvenance: "provider",
+          turnId: this.lastTurnId,
+        });
+      }
+
+      override describePersistence(): AgentPersistenceHandle {
+        return { provider: "codex", sessionId: this.nativeSessionId };
+      }
+    }
+
+    class OverflowClient extends TestAgentClient {
+      constructor(private readonly overflowFirstSession = true) {
+        super();
+      }
+
+      override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+        const index = createdSessions.length;
+        const session = new OverflowSession(
+          config,
+          index === 0 ? "old-full-native-session" : "fresh-native-session",
+          this.overflowFirstSession && index === 0,
+        );
+        createdSessions.push(session);
+        return session;
+      }
+    }
+
+    const client = new OverflowClient();
+    const ids = [oldAgentId, successorAgentId];
+    const manager = new AgentManager({
+      clients: { codex: client },
+      registry: storage,
+      durableTimelineStore,
+      logger,
+      idFactory: () => ids.shift() ?? randomUUID(),
+    });
+
+    const old = await manager.createAgent(
+      { provider: "codex", cwd: workdir, model: "gpt-5.4" },
+      undefined,
+      { initialTitle: "Long review", workspaceId: "review-workspace" },
+    );
+    await manager.appendTimelineItem(old.id, {
+      type: "user_message",
+      text: `old-transcript-marker-${"x".repeat(2_000)}`,
+    });
+    await storage.enqueuePendingPrompt(old.id, {
+      id: "queued-after-rollover",
+      prompt: queuedPrompt,
+    });
+
+    await expect(manager.runAgent(old.id, "ignored provider echo")).rejects.toThrow(failureText);
+    await vi.waitFor(() => expect(createdSessions).toHaveLength(2));
+    await vi.waitFor(async () => {
+      const records = await storage.list();
+      expect(records).toHaveLength(2);
+      expect(records.find((record) => record.id === oldAgentId)?.archivedAt).toBeTruthy();
+    });
+
+    const records = await storage.list();
+    const predecessor = records.find((record) => record.id === oldAgentId)!;
+    const successor = records.find((record) => record.id === successorAgentId)!;
+    expect(successor.labels[CONVERSATION_FAMILY_PREDECESSOR_LABEL]).toBe(oldAgentId);
+    expect(successor.labels[CONVERSATION_FAMILY_ID_LABEL]).toBeTruthy();
+    expect(successor.labels[CONVERSATION_FAMILY_CURRENT_LABEL]).toBe(successorAgentId);
+    expect(successor.labels[CONVERSATION_FAMILY_NAME_LABEL]).toBe("Long review");
+    expect(successor.labels[CONVERSATION_FAMILY_POSITION_LABEL]).toBe("1");
+    expect(successor.labels[CONVERSATION_FAMILY_RESUME_MODEL_ROLLOVER_LABEL]).toBe(
+      failureKind === "resume_model_unavailable" ? "true" : undefined,
+    );
+    expect(predecessor.persistence?.sessionId).toBe("old-full-native-session");
+    expect(predecessor.lastFailureKind).toBe(failureKind);
+    expect(successor.persistence?.sessionId).toBe("fresh-native-session");
+    expect(predecessor.labels[CONVERSATION_FAMILY_CURRENT_LABEL]).toBe(successorAgentId);
+    expect(predecessor.labels[CONVERSATION_FAMILY_POSITION_LABEL]).toBe("0");
+    expect(successor.labels[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]).toBe("1");
+    expect(successor.labels[CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL]).toBeTruthy();
+    expect(client.resumeOverrides).toHaveLength(0);
+    expect(startedPrompts).toHaveLength(2);
+    const continuationPrompt = startedPrompts[1];
+    expect(typeof continuationPrompt).toBe("string");
+    expect(continuationPrompt).toContain("Finish the MR review and report blockers.");
+    expect(continuationPrompt).toContain("Run the full suite?");
+    expect(continuationPrompt).toContain("Yes");
+    expect(continuationPrompt).not.toContain("old-transcript-marker");
+    expect(continuationPrompt).not.toContain("old-full-native-session");
+    expect(continuationPrompt).not.toContain(failureText);
+    expect(manager.getAgent(successorAgentId)?.lifecycle).toBe("running");
+    expect(manager.getTimeline(successorAgentId)).not.toContainEqual(
+      expect.objectContaining({ type: "user_message" }),
+    );
+
+    (createdSessions[1] as OverflowSession).complete();
+    await vi.waitFor(() => expect(startedPrompts).toHaveLength(3));
+    await vi.waitFor(() => expect(manager.getAgent(successorAgentId)?.lifecycle).toBe("idle"));
+    await vi.waitFor(async () => {
+      expect(
+        (await storage.get(oldAgentId))?.labels[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL],
+      ).toBeUndefined();
+      expect(
+        (await storage.get(successorAgentId))?.labels[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL],
+      ).toBeUndefined();
+    });
+    expect(startedPrompts[2]).toBe(queuedPrompt);
+    await expect(manager.ensureAgentFailureContinuation(oldAgentId, failureKind)).resolves.toBe(
+      successorAgentId,
+    );
+    expect(createdSessions).toHaveLength(2);
+    expect(client.resumeOverrides).toHaveLength(0);
+
+    // Simulate a daemon crash between durable successor creation and the final
+    // family-pointer/archive writes. A restart repairs the same family instead
+    // of creating or resuming another native session.
+    const storedPredecessor = (await storage.get(oldAgentId))!;
+    const storedSuccessor = (await storage.get(successorAgentId))!;
+    await storage.upsert({
+      ...storedPredecessor,
+      archivedAt: null,
+      labels: {
+        ...storedPredecessor.labels,
+        [CONVERSATION_FAMILY_CURRENT_LABEL]: oldAgentId,
+      },
+    });
+    await storage.upsert({
+      ...storedSuccessor,
+      labels: {
+        ...storedSuccessor.labels,
+        [CONVERSATION_FAMILY_CURRENT_LABEL]: oldAgentId,
+      },
+    });
+
+    const restartClient = new OverflowClient(false);
+    const restartStorage = new AgentStorage(join(workdir, "agents"), logger);
+    const restartedManager = new AgentManager({
+      clients: { codex: restartClient },
+      registry: restartStorage,
+      durableTimelineStore,
+      logger,
+    });
+    await expect(
+      restartedManager.ensureAgentFailureContinuation(oldAgentId, failureKind),
+    ).resolves.toBe(successorAgentId);
+    expect(restartClient.createdConfigs).toHaveLength(0);
+    expect(restartClient.resumeOverrides).toHaveLength(0);
+    const repairedStorage = restartStorage;
+    expect((await repairedStorage.get(oldAgentId))?.archivedAt).toBeTruthy();
+    expect((await repairedStorage.get(oldAgentId))?.labels[CONVERSATION_FAMILY_CURRENT_LABEL]).toBe(
+      successorAgentId,
+    );
+    expect(
+      (await repairedStorage.get(successorAgentId))?.labels[CONVERSATION_FAMILY_CURRENT_LABEL],
+    ).toBe(successorAgentId);
+    if (failureKind === "resume_model_unavailable") {
+      const secondGeneration = (await repairedStorage.get(successorAgentId))!;
+      await repairedStorage.upsert({
+        ...secondGeneration,
+        lastStatus: "error",
+        lastError: failureText,
+        lastFailureKind: failureKind,
+        requiresAttention: true,
+        attentionReason: "error",
+        attentionTimestamp: new Date().toISOString(),
+      });
+
+      const secondSuccessorId = await restartedManager.ensureAgentFailureContinuation(
+        successorAgentId,
+        failureKind,
+        failureText,
+      );
+      expect(secondSuccessorId).toBeTruthy();
+      expect(secondSuccessorId).not.toBe(successorAgentId);
+      await vi.waitFor(async () => {
+        expect((await repairedStorage.get(successorAgentId))?.archivedAt).toBeTruthy();
+      });
+
+      const secondRolloverRecords = await repairedStorage.list();
+      expect(secondRolloverRecords).toHaveLength(3);
+      expect(
+        secondRolloverRecords.find((record) => record.id === secondSuccessorId)?.labels[
+          CONVERSATION_FAMILY_POSITION_LABEL
+        ],
+      ).toBe("2");
+      for (const record of secondRolloverRecords) {
+        expect(record.labels[CONVERSATION_FAMILY_CURRENT_LABEL]).toBe(secondSuccessorId);
+      }
+      await expect(
+        restartedManager.ensureAgentFailureContinuation(successorAgentId, failureKind, failureText),
+      ).resolves.toBe(secondSuccessorId);
+      expect(createdSessions).toHaveLength(3);
+      expect(restartClient.resumeOverrides).toHaveLength(0);
+      await restartedManager.closeAgent(secondSuccessorId!).catch(() => undefined);
+    }
+  },
+);
+
+test("rollover budget survives a daemon restart and parks the current failed family", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-rollover-budget-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const agentId = "00000000-0000-4000-8000-000000000291";
+  const familyId = "family-budget-survives-restart";
+  const firstManager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    registry: storage,
+    logger,
+  });
+  await firstManager.createAgent({ provider: "codex", cwd: workdir, model: "gpt-5.4" }, agentId, {
+    workspaceId: undefined,
+    labels: {
+      [CONVERSATION_FAMILY_ID_LABEL]: familyId,
+      [CONVERSATION_FAMILY_CURRENT_LABEL]: agentId,
+      [CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]: "2",
+      [CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL]: new Date(
+        Date.now() - 61 * 60 * 1_000,
+      ).toISOString(),
+    },
+  });
+
+  const restartClient = new TestAgentClient();
+  const restartedManager = new AgentManager({
+    clients: { codex: restartClient },
+    registry: storage,
+    logger,
+  });
+  await ensureAgentLoaded(agentId, {
+    agentManager: restartedManager,
+    agentStorage: storage,
+    logger,
+  });
+  await storage.upsert({
+    ...(await storage.get(agentId))!,
+    lastError: "API Error: 409 Conversation already has an active request",
+  });
+  await restartedManager.appendTimelineItem(agentId, {
+    type: "user_message",
+    text: "Continue once the provider is available.",
+  });
+
+  await expect(
+    restartedManager.ensureAgentFailureContinuation(agentId, "conversation_unresolved"),
+  ).resolves.toBeNull();
+  // The one session is only the restart load; no successor was created.
+  expect(restartClient.createdConfigs.length + restartClient.resumeOverrides.length).toBe(1);
+  const parked = (await storage.get(agentId))!;
+  expect(parked.archivedAt).toBeFalsy();
+  expect(parked.labels[CONVERSATION_FAMILY_CURRENT_LABEL]).toBe(agentId);
+  expect(parked.labels[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]).toBe("2");
+});
+
+test.each([
+  {
+    name: "blank provider completion",
+    text: undefined,
+    provider: "codex" as const,
+    outputProvenance: "provider" as const,
+  },
+  {
+    name: "same-provider local command completion",
+    text: "Locally synthesized.",
+    provider: "codex" as const,
+    outputProvenance: "local" as const,
+  },
+])(
+  "$name does not reset the family rollover budget",
+  async ({ text, provider, outputProvenance }) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-manager-rollover-reset-rejected-"));
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const client = new ControlledCompletionClient();
+    const agentId = "00000000-0000-4000-8000-000000000292";
+    const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+    try {
+      await manager.createAgent({ provider: "codex", cwd: workdir }, agentId, {
+        workspaceId: undefined,
+        labels: {
+          [CONVERSATION_FAMILY_ID_LABEL]: "family-rejects-empty-reset",
+          [CONVERSATION_FAMILY_CURRENT_LABEL]: agentId,
+          [CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]: "7",
+          [CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]: "2",
+          [CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL]: new Date().toISOString(),
+        },
+      });
+      const run = manager.runAgent(agentId, "complete without provider-backed output");
+      await vi.waitFor(() => expect(manager.getAgent(agentId)?.lifecycle).toBe("running"));
+      client.sessions[0]!.complete({
+        ...(text === undefined ? {} : { text }),
+        provider,
+        outputProvenance,
+      });
+      await run;
+
+      const record = await storage.get(agentId);
+      expect(record?.labels[CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]).toBe("7");
+      expect(record?.labels[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]).toBe("2");
+    } finally {
+      await manager.closeAgent(agentId).catch(() => undefined);
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
+
+test("a noncanonical family member cannot reset the rollover budget", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-rollover-reset-noncanonical-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new ControlledCompletionClient();
+  const agentId = "00000000-0000-4000-8000-000000000293";
+  const currentId = "00000000-0000-4000-8000-000000000294";
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  try {
+    await manager.createAgent({ provider: "codex", cwd: workdir }, agentId, {
+      workspaceId: undefined,
+      labels: {
+        [CONVERSATION_FAMILY_ID_LABEL]: "family-rejects-noncanonical-reset",
+        [CONVERSATION_FAMILY_CURRENT_LABEL]: currentId,
+        [CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]: "4",
+        [CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]: "1",
+        [CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL]: new Date().toISOString(),
+      },
+    });
+    const run = manager.runAgent(agentId, "complete on an old family member");
+    await vi.waitFor(() => expect(manager.getAgent(agentId)?.lifecycle).toBe("running"));
+    client.sessions[0]!.complete({ text: "This output came from the old member." });
+    await run;
+
+    const record = await storage.get(agentId);
+    expect(record?.labels[CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]).toBe("4");
+    expect(record?.labels[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]).toBe("1");
+  } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("a substantive provider reply on the current member resets the rollover budget", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-rollover-reset-current-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new ControlledCompletionClient();
+  const agentId = "00000000-0000-4000-8000-000000000295";
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  try {
+    await manager.createAgent({ provider: "codex", cwd: workdir }, agentId, {
+      workspaceId: undefined,
+      labels: {
+        [CONVERSATION_FAMILY_ID_LABEL]: "family-accepts-substantive-reset",
+        [CONVERSATION_FAMILY_CURRENT_LABEL]: agentId,
+        [CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]: "9",
+        [CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]: "2",
+        [CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL]: new Date().toISOString(),
+      },
+    });
+    const run = manager.runAgent(agentId, "finish this turn cleanly");
+    await vi.waitFor(() => expect(manager.getAgent(agentId)?.lifecycle).toBe("running"));
+    client.sessions[0]!.complete({ text: "The requested work is complete." });
+    await run;
+
+    await vi.waitFor(async () => {
+      const record = await storage.get(agentId);
+      expect(record?.labels[CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]).toBe("10");
+      expect(record?.labels[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]).toBeUndefined();
+      expect(record?.labels[CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL]).toBeUndefined();
+      expect(record?.labels[CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL]).toBeUndefined();
+    });
+  } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("a delayed clean completion cannot clear a newer failure reservation", async () => {
+  class BlockingListStorage extends AgentStorage {
+    private blockNext = false;
+    private readonly blocked = deferred<void>();
+    private readonly released = deferred<void>();
+
+    blockNextList(): void {
+      this.blockNext = true;
+    }
+
+    waitUntilBlocked(): Promise<void> {
+      return this.blocked.promise;
+    }
+
+    releaseList(): void {
+      this.released.resolve();
+    }
+
+    override async list(): Promise<StoredAgentRecord[]> {
+      if (this.blockNext) {
+        this.blockNext = false;
+        this.blocked.resolve();
+        await this.released.promise;
+      }
+      return await super.list();
+    }
+  }
+
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-rollover-reset-race-"));
+  const storage = new BlockingListStorage(join(workdir, "agents"), logger);
+  const client = new ControlledCompletionClient();
+  const currentId = "00000000-0000-4000-8000-000000000296";
+  const successorId = "00000000-0000-4000-8000-000000000297";
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    idFactory: () => successorId,
+  });
+  try {
+    await manager.createAgent({ provider: "codex", cwd: workdir }, currentId, {
+      workspaceId: undefined,
+      labels: {
+        [CONVERSATION_FAMILY_ID_LABEL]: "family-reset-race",
+        [CONVERSATION_FAMILY_CURRENT_LABEL]: currentId,
+        [CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]: "1",
+        [CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]: "1",
+        [CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL]: new Date().toISOString(),
+      },
+    });
+    await manager.appendTimelineItem(currentId, {
+      type: "user_message",
+      text: "finish while recovery is being reserved",
+    });
+    const run = manager.runAgent(currentId, "finish while recovery is being reserved");
+    await vi.waitFor(() => expect(manager.getAgent(currentId)?.lifecycle).toBe("running"));
+
+    storage.blockNextList();
+    const rollover = manager.ensureAgentFailureContinuation(
+      currentId,
+      "conversation_unresolved",
+      "API Error: 409 Conversation has an unresolved prior request",
+    );
+    await storage.waitUntilBlocked();
+    client.sessions[0]!.complete({ text: "A late reply from the prior native session." });
+    storage.releaseList();
+
+    await run;
+    await expect(rollover).resolves.toBe(successorId);
+    await vi.waitFor(async () => {
+      expect((await storage.get(currentId))?.archivedAt).toBeTruthy();
+    });
+    const successor = await storage.get(successorId);
+    expect(successor?.labels[CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]).toBe("2");
+    expect(successor?.labels[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]).toBe("2");
+  } finally {
+    await manager.closeAgent(successorId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("two rollovers survive restart and the third failure parks the family", async () => {
+  class HangingSession extends TestAgentSession {
+    override async startTurn(): Promise<{ turnId: string }> {
+      const turnId = randomUUID();
+      setTimeout(
+        () => this.pushEvent({ type: "turn_started", provider: this.provider, turnId }),
+        0,
+      );
+      return { turnId };
+    }
+  }
+
+  class HangingClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new HangingSession(config);
+    }
+  }
+
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-rollover-budget-restart-chain-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const allIds = [
+    "00000000-0000-4000-8000-000000000298",
+    "00000000-0000-4000-8000-000000000299",
+    "00000000-0000-4000-8000-000000000300",
+  ];
+  const ids = [...allIds];
+  const manager = new AgentManager({
+    clients: { codex: new HangingClient() },
+    registry: storage,
+    logger,
+    idFactory: () => ids.shift() ?? randomUUID(),
+  });
+  try {
+    const original = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.appendTimelineItem(original.id, {
+      type: "user_message",
+      text: "Finish the queued validation without repeating completed work.",
+    });
+    const failureText = "API Error: 409 Conversation has an unresolved prior request";
+    const generationOne = await manager.ensureAgentFailureContinuation(
+      original.id,
+      "conversation_unresolved",
+      failureText,
+    );
+    expect(generationOne).toBe("00000000-0000-4000-8000-000000000299");
+    const generationTwo = await manager.ensureAgentFailureContinuation(
+      generationOne!,
+      "conversation_unresolved",
+      failureText,
+    );
+    expect(generationTwo).toBe("00000000-0000-4000-8000-000000000300");
+
+    const restartedStorage = new AgentStorage(join(workdir, "agents"), logger);
+    const restartedManager = new AgentManager({
+      clients: { codex: new HangingClient() },
+      registry: restartedStorage,
+      logger,
+      idFactory: () => "00000000-0000-4000-8000-000000000301",
+    });
+    await expect(
+      restartedManager.ensureAgentFailureContinuation(
+        generationTwo!,
+        "conversation_unresolved",
+        failureText,
+      ),
+    ).resolves.toBeNull();
+
+    const records = await restartedStorage.list();
+    expect(records).toHaveLength(3);
+    const current = records.find((record) => record.id === generationTwo);
+    expect(current?.archivedAt).toBeFalsy();
+    expect(current?.labels[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]).toBe("2");
+    expect(current?.labels[CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL]).toBe("true");
+  } finally {
+    for (const id of allIds) await manager.closeAgent(id).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("an expired rollover window starts a new automatic recovery budget", async () => {
+  class HangingSession extends TestAgentSession {
+    override async startTurn(): Promise<{ turnId: string }> {
+      const turnId = randomUUID();
+      setTimeout(
+        () => this.pushEvent({ type: "turn_started", provider: this.provider, turnId }),
+        0,
+      );
+      return { turnId };
+    }
+  }
+
+  class HangingClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new HangingSession(config);
+    }
+  }
+
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-rollover-window-expiry-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const agentId = "00000000-0000-4000-8000-000000000302";
+  const successorId = "00000000-0000-4000-8000-000000000303";
+  const manager = new AgentManager({
+    clients: { codex: new HangingClient() },
+    registry: storage,
+    logger,
+    idFactory: () => successorId,
+  });
+  try {
+    await manager.createAgent({ provider: "codex", cwd: workdir }, agentId, {
+      workspaceId: undefined,
+      labels: {
+        [CONVERSATION_FAMILY_ID_LABEL]: "family-expired-window",
+        [CONVERSATION_FAMILY_CURRENT_LABEL]: agentId,
+        [CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]: "8",
+        [CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]: "2",
+        [CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL]: new Date(
+          Date.now() - 61 * 60 * 1_000,
+        ).toISOString(),
+      },
+    });
+    await manager.appendTimelineItem(agentId, {
+      type: "user_message",
+      text: "Retry after the bounded outage window expires.",
+    });
+    await expect(
+      manager.ensureAgentFailureContinuation(
+        agentId,
+        "conversation_unresolved",
+        "API Error: 409 Conversation has an unresolved prior request",
+      ),
+    ).resolves.toBe(successorId);
+
+    const successor = await storage.get(successorId);
+    expect(successor?.labels[CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]).toBe("9");
+    expect(successor?.labels[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]).toBe("1");
+    expect(successor?.labels[CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL]).toBeUndefined();
+  } finally {
+    await manager.closeAgent(successorId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("a repeated rollover consumes the failed queued prompt and transfers only the remaining FIFO", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-repeated-queued-rollover-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const generationTwoId = "00000000-0000-4000-8000-000000000211";
+  const generationThreeId = "00000000-0000-4000-8000-000000000212";
+  const startedPrompts: AgentPromptInput[] = [];
+  const failureText =
+    "There's an issue with the selected model (claude-opus-5). It may not exist or you may not have access to it.";
+
+  class GenerationTwoSession extends TestAgentSession {
+    override async startTurn(prompt: AgentPromptInput): Promise<{ turnId: string }> {
+      startedPrompts.push(prompt);
+      const turnId = `generation-two-turn-${startedPrompts.length}`;
+      setTimeout(() => {
+        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        if (prompt === "queued request that fails") {
+          this.pushEvent({
+            type: "turn_failed",
+            provider: this.provider,
+            turnId,
+            error: failureText,
+            failureKind: "resume_model_unavailable",
+          });
+          return;
+        }
+        this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
       }, 0);
       return { turnId };
     }
   }
 
-  class TurnFailedClient implements AgentClient {
-    readonly provider = "codex" as const;
-    readonly capabilities = TEST_CAPABILITIES;
+  class RepeatedRolloverClient extends TestAgentClient {
+    private createCount = 0;
 
-    async isAvailable(): Promise<boolean> {
-      return true;
-    }
-
-    async createSession(config: AgentSessionConfig): Promise<AgentSession> {
-      return new TurnFailedSession(config);
-    }
-
-    async resumeSession(config?: Partial<AgentSessionConfig>): Promise<AgentSession> {
-      return new TurnFailedSession({
-        provider: "codex",
-        cwd: config?.cwd ?? process.cwd(),
-      });
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      this.createCount += 1;
+      if (this.createCount === 1) return new GenerationTwoSession(config);
+      return new (class extends TestAgentSession {
+        override async startTurn(prompt: AgentPromptInput): Promise<{ turnId: string }> {
+          startedPrompts.push(prompt);
+          return super.startTurn(prompt);
+        }
+      })(config);
     }
   }
 
+  const client = new RepeatedRolloverClient();
+  const ids = [generationTwoId, generationThreeId];
   const manager = new AgentManager({
-    clients: {
-      codex: new TurnFailedClient(),
-    },
+    clients: { codex: client },
     registry: storage,
     logger,
-    idFactory: () => "00000000-0000-4000-8000-000000000131",
+    idFactory: () => ids.shift() ?? randomUUID(),
   });
 
-  const agent = await manager.createAgent(
-    {
-      provider: "codex",
-      cwd: workdir,
-      title: "Turn failed test",
-    },
-    undefined,
-    { workspaceId: undefined },
-  );
-
-  await expect(manager.runAgent(agent.id, "hello")).rejects.toThrow("invalid model id");
-
-  const snapshot = manager.getAgent(agent.id);
-  expect(snapshot?.lifecycle).toBe("error");
-  expect(snapshot?.lastError).toBe("invalid model id");
-
-  const systemErrors = manager
-    .getTimeline(agent.id)
-    .filter(
-      (item): item is Extract<AgentTimelineItem, { type: "assistant_message" }> =>
-        item.type === "assistant_message" && item.text.includes("[System Error]"),
+  try {
+    const generationTwo = await manager.createAgent(
+      { provider: "codex", cwd: workdir, model: "gpt-5.4" },
+      undefined,
+      {
+        initialTitle: "Repeated rollover",
+        labels: {
+          [CONVERSATION_FAMILY_ID_LABEL]: "repeated-rollover-family",
+          [CONVERSATION_FAMILY_CURRENT_LABEL]: generationTwoId,
+          [CONVERSATION_FAMILY_NAME_LABEL]: "Repeated rollover",
+          [CONVERSATION_FAMILY_POSITION_LABEL]: "2",
+        },
+        workspaceId: undefined,
+      },
     );
-  expect(systemErrors).toHaveLength(1);
-  expect(systemErrors[0]?.text).toContain("invalid model id");
+    await manager.runAgent(generationTwo.id, "establish a completed turn");
+    await manager.appendTimelineItem(generationTwo.id, {
+      type: "user_message",
+      text: "queued request that fails",
+    });
+    await storage.enqueuePendingPrompt(generationTwo.id, {
+      id: "queued-failure",
+      prompt: "queued request that fails",
+    });
+    await storage.enqueuePendingPrompt(generationTwo.id, {
+      id: "queued-after-failure",
+      prompt: "queued request after recovery",
+    });
+
+    await manager.drainStoredPendingPrompts(generationTwo.id);
+    await vi.waitFor(async () => {
+      expect((await storage.get(generationTwoId))?.archivedAt).toBeTruthy();
+      expect(await storage.listPendingPrompts(generationThreeId)).toEqual([]);
+    });
+
+    expect(await storage.listPendingPrompts(generationTwoId)).toEqual([]);
+    expect(startedPrompts[0]).toBe("establish a completed turn");
+    expect(startedPrompts[1]).toBe("queued request that fails");
+    expect(typeof startedPrompts[2]).toBe("string");
+    expect(startedPrompts[2]).toContain("queued request that fails");
+    expect(startedPrompts[3]).toBe("queued request after recovery");
+    expect((await storage.get(generationThreeId))?.labels[CONVERSATION_FAMILY_POSITION_LABEL]).toBe(
+      "3",
+    );
+  } finally {
+    await manager.closeAgent(generationThreeId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("a repeated rollover recovers the durable request when predecessor rows are unavailable", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-family-handoff-rollover-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const durableTimelineStore = new RecordingTimelineStore();
+  const originalId = "00000000-0000-4000-8000-000000000221";
+  const currentId = "00000000-0000-4000-8000-000000000222";
+  const nextId = "00000000-0000-4000-8000-000000000223";
+  const startedPrompts: AgentPromptInput[] = [];
+  const failureText = "API Error: 409 Conversation continuation was not found";
+
+  class RecordingSession extends TestAgentSession {
+    override async startTurn(prompt: AgentPromptInput): Promise<{ turnId: string }> {
+      startedPrompts.push(prompt);
+      return super.startTurn(prompt);
+    }
+  }
+
+  class RecordingClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new RecordingSession(config);
+    }
+  }
+
+  const ids = [originalId, currentId, nextId];
+  const manager = new AgentManager({
+    clients: { codex: new RecordingClient() },
+    registry: storage,
+    durableTimelineStore,
+    logger,
+    idFactory: () => ids.shift() ?? randomUUID(),
+  });
+
+  try {
+    const original = await manager.createAgent(
+      { provider: "codex", cwd: workdir, model: "gpt-5.4" },
+      undefined,
+      {
+        initialTitle: "Long-running regression",
+        labels: {
+          [CONVERSATION_FAMILY_ID_LABEL]: "long-running-regression-family",
+          [CONVERSATION_FAMILY_CURRENT_LABEL]: currentId,
+          [CONVERSATION_FAMILY_NAME_LABEL]: "Long-running regression",
+          [CONVERSATION_FAMILY_POSITION_LABEL]: "0",
+        },
+        workspaceId: undefined,
+      },
+    );
+    await manager.appendTimelineItem(original.id, {
+      type: "user_message",
+      text: "Run the Lantau UPF regressions and report the results.",
+    });
+
+    const current = await manager.createAgent(
+      { provider: "codex", cwd: workdir, model: "gpt-5.4" },
+      undefined,
+      {
+        initialTitle: "Long-running regression",
+        labels: {
+          [CONVERSATION_FAMILY_ID_LABEL]: "long-running-regression-family",
+          [CONVERSATION_FAMILY_CURRENT_LABEL]: currentId,
+          [CONVERSATION_FAMILY_NAME_LABEL]: "Long-running regression",
+          [CONVERSATION_FAMILY_POSITION_LABEL]: "1",
+          [CONVERSATION_FAMILY_PREDECESSOR_LABEL]: originalId,
+        },
+        workspaceId: undefined,
+      },
+    );
+    await manager.appendTimelineItem(current.id, {
+      type: "user_message",
+      text: "<paseo-system>\nContinue the previous handoff.\n</paseo-system>",
+    });
+    await manager.appendTimelineItem(current.id, {
+      type: "assistant_message",
+      text: "The corpus is ready and the mutation harness is half complete.",
+    });
+
+    const storedOriginal = (await storage.get(originalId))!;
+    await storage.upsert({
+      ...storedOriginal,
+      archivedAt: new Date().toISOString(),
+      lastStatus: "closed",
+    });
+    const storedCurrent = (await storage.get(currentId))!;
+    await storage.upsert({
+      ...storedCurrent,
+      continuationRequest: "Run the Lantau UPF regressions and report the results.",
+      lastStatus: "error",
+      lastError: failureText,
+      lastFailureKind: "conversation_unresolved",
+    });
+    await durableTimelineStore.deleteAgent(originalId);
+
+    await expect(
+      manager.ensureAgentFailureContinuation(currentId, "conversation_unresolved", failureText),
+    ).resolves.toBe(nextId);
+
+    await vi.waitFor(() => expect(startedPrompts).toHaveLength(1));
+    expect(startedPrompts[0]).toContain("Run the Lantau UPF regressions and report the results.");
+    expect(startedPrompts[0]).toContain(
+      "The corpus is ready and the mutation harness is half complete.",
+    );
+    expect(startedPrompts[0]).not.toContain("Continue the previous handoff");
+    expect((await storage.get(nextId))?.labels[CONVERSATION_FAMILY_POSITION_LABEL]).toBe("2");
+    expect((await storage.get(nextId))?.continuationRequest).toBe(
+      "Run the Lantau UPF regressions and report the results.",
+    );
+  } finally {
+    await manager.closeAgent(nextId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
 });
 
 test("turn_failed surfaces provider code and diagnostic in system error message", async () => {
@@ -8995,7 +10607,11 @@ test("turn_failed surfaces provider code and diagnostic in system error message"
     override async startTurn(): Promise<{ turnId: string }> {
       const turnId = "turn-detailed-fail-1";
       setTimeout(() => {
-        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "turn_started",
+          provider: this.provider,
+          turnId,
+        });
         this.pushEvent({
           type: "turn_failed",
           provider: this.provider,
@@ -9074,7 +10690,11 @@ test("permission request notifies once without forcing unread attention state", 
     override async startTurn(): Promise<{ turnId: string }> {
       const turnId = "turn-perm-1";
       setTimeout(async () => {
-        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "turn_started",
+          provider: this.provider,
+          turnId,
+        });
         this.pushEvent({
           type: "permission_requested",
           provider: this.provider,
@@ -9094,7 +10714,11 @@ test("permission request notifies once without forcing unread attention state", 
           resolution: { behavior: "allow" },
           turnId,
         });
-        this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "turn_completed",
+          provider: this.provider,
+          turnId,
+        });
       }, 0);
       return { turnId };
     }
@@ -9149,7 +10773,9 @@ test("permission request notifies once without forcing unread attention state", 
 
   const withPermissionPending = manager.getAgent(agent.id);
   expect(withPermissionPending?.pendingPermissions.size).toBe(1);
-  expect(withPermissionPending?.attention).toEqual({ requiresAttention: false });
+  expect(withPermissionPending?.attention).toEqual({
+    requiresAttention: false,
+  });
 
   // Release permission resolution and drain the rest of the stream
   releasePermissionResolution.resolve();
@@ -9199,7 +10825,12 @@ test("respondToPermission updates currentModeId after plan approval", async () =
     async *streamHistory(): AsyncGenerator<AgentStreamEvent> {}
 
     async getRuntimeInfo() {
-      return { provider: this.provider, sessionId: this.id, model: null, modeId: sessionMode };
+      return {
+        provider: this.provider,
+        sessionId: this.id,
+        model: null,
+        modeId: sessionMode,
+      };
     }
 
     async getAvailableModes() {
@@ -9500,7 +11131,9 @@ test("respondToPermission emits refreshed state before permission_resolved", asy
     if (event.type === "agent_state" && event.agent.id === snapshot.id) {
       const fastMode = event.agent.features?.find((feature) => feature.id === "fast_mode");
       seen.push(
-        `state:${event.agent.currentModeId}:${String(fastMode?.type === "toggle" ? fastMode.value : null)}`,
+        `state:${event.agent.currentModeId}:${String(
+          fastMode?.type === "toggle" ? fastMode.value : null,
+        )}`,
       );
       return;
     }
@@ -9541,7 +11174,11 @@ test("close during in-flight stream does not clear persistence sessionId", async
       const turnId = `turn-${++this.turnIdCounter}`;
       // Push turn_started, then block until closed
       setTimeout(() => {
-        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "turn_started",
+          provider: this.provider,
+          turnId,
+        });
         // The turn will be canceled when close() is called
       }, 0);
       return { turnId };
@@ -9852,7 +11489,11 @@ test("a stored-only archive waits for an in-flight resume and then closes it", a
       return super.resumeSession(handle, config, launchContext);
     }
   })();
-  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+  });
 
   try {
     const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
@@ -9896,7 +11537,11 @@ test("a stored-only archive closes a shared resume before a later protected load
       return super.resumeSession(handle, config, launchContext);
     }
   })();
-  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+  });
 
   try {
     const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
@@ -9953,7 +11598,11 @@ test("a shared agent load upgrades provider history hydration to broadcast", asy
       })({ provider: "codex", cwd: config?.cwd ?? workdir });
     }
   })();
-  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+  });
 
   try {
     const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
@@ -9962,7 +11611,10 @@ test("a shared agent load upgrades provider history hydration to broadcast", asy
     await manager.closeAgent(agent.id);
     await manager.deleteAgentState(agent.id);
     const events: AgentManagerEvent[] = [];
-    manager.subscribe((event) => events.push(event), { agentId: agent.id, replayState: false });
+    manager.subscribe((event) => events.push(event), {
+      agentId: agent.id,
+      replayState: false,
+    });
 
     const quietLoad = ensureAgentLoaded(agent.id, {
       agentManager: manager,
@@ -10001,7 +11653,11 @@ test("explicit close cancels running provider subagents before resume", async ()
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-closed-provider-child-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
   const client = new SessionRecordingAgentClient();
-  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+  });
 
   try {
     const parent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
@@ -10085,7 +11741,11 @@ test("load waits for an in-flight explicit close and creates one resumed runtime
       return super.resumeSession(handle, config);
     }
   })();
-  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+  });
 
   try {
     const created = await manager.createAgent(
@@ -10096,8 +11756,16 @@ test("load waits for an in-flight explicit close and creates one resumed runtime
     const close = manager.closeAgent(created.id);
     await closeStarted.promise;
     const loads = Promise.all([
-      ensureAgentLoaded(created.id, { agentManager: manager, agentStorage: storage, logger }),
-      ensureAgentLoaded(created.id, { agentManager: manager, agentStorage: storage, logger }),
+      ensureAgentLoaded(created.id, {
+        agentManager: manager,
+        agentStorage: storage,
+        logger,
+      }),
+      ensureAgentLoaded(created.id, {
+        agentManager: manager,
+        agentStorage: storage,
+        logger,
+      }),
     ]);
 
     expect(client.resumeCount).toBe(0);
@@ -10167,7 +11835,11 @@ test("provider close failure retains the runtime for cleanup instead of allowing
       })(config);
     }
   })();
-  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+  });
 
   try {
     const created = await manager.createAgent(
@@ -10182,7 +11854,11 @@ test("provider close failure retains the runtime for cleanup instead of allowing
     expect(stored?.archivedAt).toBeFalsy();
 
     await expect(
-      ensureAgentLoaded(created.id, { agentManager: manager, agentStorage: storage, logger }),
+      ensureAgentLoaded(created.id, {
+        agentManager: manager,
+        agentStorage: storage,
+        logger,
+      }),
     ).resolves.toMatchObject({ id: created.id, lifecycle: "idle" });
   } finally {
     await manager.closeAgent("00000000-0000-4000-8000-000000000217").catch(() => undefined);
@@ -10201,7 +11877,11 @@ test("hydrateTimeline keeps provider user_message items when no canonical user h
       yield {
         type: "timeline",
         provider: this.provider,
-        item: { type: "user_message", text: "hello from user", messageId: "msg_history_1" },
+        item: {
+          type: "user_message",
+          text: "hello from user",
+          messageId: "msg_history_1",
+        },
       };
       yield {
         type: "timeline",
@@ -10211,7 +11891,11 @@ test("hydrateTimeline keeps provider user_message items when no canonical user h
       yield {
         type: "timeline",
         provider: this.provider,
-        item: { type: "user_message", text: "second question", messageId: "msg_history_2" },
+        item: {
+          type: "user_message",
+          text: "second question",
+          messageId: "msg_history_2",
+        },
       };
       yield {
         type: "timeline",
@@ -10276,7 +11960,11 @@ test("hydrateTimeline preserves provider replay timestamps and marks missing one
         type: "timeline",
         provider: this.provider,
         timestamp: "2026-05-01T10:00:00.000Z",
-        item: { type: "user_message", text: "hello", messageId: "msg_history_1" },
+        item: {
+          type: "user_message",
+          text: "hello",
+          messageId: "msg_history_1",
+        },
       };
       yield {
         type: "timeline",
@@ -10322,7 +12010,10 @@ test("hydrateTimeline preserves provider replay timestamps and marks missing one
   );
 
   await manager.hydrateTimelineFromProvider(snapshot.id, { force: true });
-  const timeline = manager.fetchTimeline(snapshot.id, { direction: "tail", limit: 0 }).rows;
+  const timeline = manager.fetchTimeline(snapshot.id, {
+    direction: "tail",
+    limit: 0,
+  }).rows;
 
   expect(timeline).toHaveLength(2);
   expect(timeline[0]).toMatchObject({
@@ -10355,7 +12046,11 @@ test("provider user_message is recorded from the live stream", async () => {
         item: { type: "assistant_message", text: "continuation reply" },
         turnId,
       });
-      this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+      this.pushEvent({
+        type: "turn_completed",
+        provider: this.provider,
+        turnId,
+      });
       return { turnId };
     }
   }
@@ -10416,12 +12111,19 @@ test("canonical submitted prompt keeps wire identity while rewind resolves provi
       const turnId = "turn-submitted-user-message";
       const text = typeof prompt === "string" ? prompt : "";
       setTimeout(async () => {
-        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "turn_started",
+          provider: this.provider,
+          turnId,
+        });
         this.pushEvent({
           type: "timeline",
           provider: this.provider,
           turnId,
-          item: { type: "assistant_message", text: "output before provider echo" },
+          item: {
+            type: "assistant_message",
+            text: "output before provider echo",
+          },
         });
         await allowProviderEcho.promise;
         this.pushEvent({
@@ -10435,7 +12137,11 @@ test("canonical submitted prompt keeps wire identity while rewind resolves provi
             clientMessageId: options?.clientMessageId,
           },
         });
-        this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "turn_completed",
+          provider: this.provider,
+          turnId,
+        });
       }, 0);
       return { turnId };
     }
@@ -10541,7 +12247,10 @@ test("canonical submitted prompt keeps wire identity while rewind resolves provi
         seq: 2,
         timestamp: expect.any(String),
         turnId: "turn-submitted-user-message",
-        item: { type: "assistant_message", text: "output before provider echo" },
+        item: {
+          type: "assistant_message",
+          text: "output before provider echo",
+        },
       },
     ]);
 
@@ -10626,7 +12335,10 @@ test("authoritative timeline records a daemon-handled submitted prompt before it
       { type: "assistant_message", text: "Handled by the daemon" },
     ]);
 
-    const timeline = manager.fetchTimeline(snapshot.id, { direction: "tail", limit: 20 }).rows;
+    const timeline = manager.fetchTimeline(snapshot.id, {
+      direction: "tail",
+      limit: 20,
+    }).rows;
     expect(timeline.map((row) => row.item)).toEqual([
       {
         type: "user_message",
@@ -10658,14 +12370,22 @@ test("replaceAgentRun succeeds when foreground turn terminal event is never deli
       const turnNum = this.turnIdCounter;
 
       setTimeout(async () => {
-        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "turn_started",
+          provider: this.provider,
+          turnId,
+        });
         if (turnNum === 1) {
           // First turn: emit turn_started but NEVER emit a terminal event.
           // This simulates the provider suppressing the result.
         } else {
           // Subsequent turns: complete normally
           await allowSecondRunToEnd.promise;
-          this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+          this.pushEvent({
+            type: "turn_completed",
+            provider: this.provider,
+            turnId,
+          });
         }
       }, 0);
       return { turnId };
@@ -10783,7 +12503,10 @@ test.each([
     const includedClient = new RecordingPersistedAgentsClient(includedProvider);
     const skippedClient = new RecordingPersistedAgentsClient(skippedProvider);
     const manager = new AgentManager({
-      clients: { [includedProvider]: includedClient, [skippedProvider]: skippedClient },
+      clients: {
+        [includedProvider]: includedClient,
+        [skippedProvider]: skippedClient,
+      },
       providerDefinitions,
       logger,
     });

@@ -57,6 +57,7 @@ const agent: AgentSnapshotPayload = {
     supportsMcpServers: false,
     supportsReasoningStream: false,
     supportsToolInvocations: true,
+    supportsInFlightSteering: false,
     supportsRewindConversation: false,
     supportsRewindFiles: false,
     supportsRewindBoth: false,

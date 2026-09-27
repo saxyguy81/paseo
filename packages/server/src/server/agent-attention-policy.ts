@@ -76,5 +76,5 @@ export function computeNotificationPlan({
 }
 
 export function isPushEligibleAttentionReason(reason: AgentAttentionReason): boolean {
-  return reason !== "error";
+  return reason === "finished" || reason === "permission" || reason === "error";
 }

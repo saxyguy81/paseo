@@ -93,7 +93,15 @@ function resolveManagedAgentCore(overrides: ManagedAgentOverrides): ManagedAgent
   const session = lifecycle === "closed" ? null : (overrides.session ?? ({} as AgentSession));
   const activeForegroundTurnId =
     overrides.activeForegroundTurnId ?? (lifecycle === "running" ? "test-turn-id" : null);
-  return { provider, cwd, lifecycle, config, session, activeForegroundTurnId, now };
+  return {
+    provider,
+    cwd,
+    lifecycle,
+    config,
+    session,
+    activeForegroundTurnId,
+    now,
+  };
 }
 
 function createManagedAgent(overrides: ManagedAgentOverrides = {}): ManagedAgent {
@@ -192,7 +200,212 @@ describe("AgentStorage", () => {
     const reloaded = new AgentStorage(storagePath, logger);
     const [persisted] = await reloaded.list();
     expect(persisted.cwd).toBe("/tmp/project");
-    expect(persisted.config?.providerOptions).toEqual({ allowedTools: ["Read"] });
+    expect(persisted.config?.providerOptions).toEqual({
+      allowedTools: ["Read"],
+    });
+  });
+
+  test("persists and atomically claims queued prompts across storage reloads", async () => {
+    await storage.applySnapshot(createManagedAgent({ id: "agent-queue" }));
+
+    await expect(
+      storage.enqueuePendingPrompt("agent-queue", {
+        id: "message-1",
+        prompt: "second request",
+      }),
+    ).resolves.toEqual({ enqueued: true, position: 1 });
+    await expect(
+      storage.enqueuePendingPrompt("agent-queue", {
+        id: "message-1",
+        prompt: "duplicate",
+      }),
+    ).resolves.toEqual({ enqueued: false, position: 1 });
+
+    const reloaded = new AgentStorage(storagePath, logger);
+    await expect(reloaded.listPendingPrompts("agent-queue")).resolves.toMatchObject([
+      {
+        id: "message-1",
+        prompt: "second request",
+        state: "queued",
+        attemptCount: 0,
+      },
+    ]);
+    await expect(reloaded.claimPendingPrompt("agent-queue")).resolves.toMatchObject({
+      id: "message-1",
+      state: "dispatching",
+      attemptCount: 1,
+    });
+    await expect(reloaded.claimPendingPrompt("agent-queue")).resolves.toBeNull();
+
+    await reloaded.releasePendingPrompt("agent-queue", "message-1");
+    await expect(reloaded.claimPendingPrompt("agent-queue")).resolves.toMatchObject({
+      id: "message-1",
+      state: "dispatching",
+      attemptCount: 2,
+    });
+    await reloaded.completePendingPrompt("agent-queue", "message-1");
+    await expect(reloaded.listPendingPrompts("agent-queue")).resolves.toEqual([]);
+  });
+
+  test("persists measured context usage for admission after daemon restart", async () => {
+    await storage.applySnapshot(
+      createManagedAgent({
+        id: "agent-context-usage",
+        lastUsage: {
+          contextWindowMaxTokens: 200_000,
+          contextWindowUsedTokens: 163_000,
+        },
+      }),
+    );
+
+    const reloaded = new AgentStorage(storagePath, logger);
+    await expect(reloaded.get("agent-context-usage")).resolves.toMatchObject({
+      lastUsage: {
+        contextWindowMaxTokens: 200_000,
+        contextWindowUsedTokens: 163_000,
+      },
+    });
+  });
+
+  test("loads pre-upgrade records with missing or zero context-window metadata", async () => {
+    await storage.applySnapshot(
+      createManagedAgent({
+        id: "agent-zero-context-window",
+        lastUsage: {
+          contextWindowMaxTokens: 0,
+          contextWindowUsedTokens: 0,
+        },
+      }),
+    );
+    await storage.applySnapshot(createManagedAgent({ id: "agent-no-context-usage" }));
+
+    const reloaded = new AgentStorage(storagePath, logger);
+    await expect(reloaded.get("agent-zero-context-window")).resolves.toMatchObject({
+      lastUsage: {
+        contextWindowMaxTokens: 0,
+        contextWindowUsedTokens: 0,
+      },
+    });
+    await expect(reloaded.get("agent-no-context-usage")).resolves.not.toBeNull();
+  });
+
+  test("stores a synthetic preflight ahead of its user prompt and settles it once", async () => {
+    await storage.applySnapshot(createManagedAgent({ id: "agent-preflight" }));
+    await storage.enqueuePendingPrompt("agent-preflight", {
+      id: "message-after-compact",
+      prompt: "continue after compact",
+    });
+    await storage.claimPendingPrompt("agent-preflight");
+
+    await expect(
+      storage.insertPendingPromptPreflight("agent-preflight", "message-after-compact", {
+        key: "claude_context_compaction",
+        prompt: "/compact [PASEO_INTERNAL_CONTEXT_PREFLIGHT] preserve state",
+      }),
+    ).resolves.toBe(true);
+    await expect(storage.listPendingPrompts("agent-preflight")).resolves.toMatchObject([
+      {
+        id: expect.stringMatching(/^paseo-internal-preflight:/),
+        state: "queued",
+      },
+      { id: "message-after-compact", state: "queued", attemptCount: 1 },
+    ]);
+
+    const preflight = await storage.claimPendingPrompt("agent-preflight");
+    await storage.recordPendingPromptPreflightBoundary("agent-preflight", preflight!.id);
+    await expect(storage.get("agent-preflight")).resolves.toMatchObject({
+      completedPromptPreflightIds: [preflight!.id],
+    });
+    const beforeSettlement = await storage.get("agent-preflight");
+    if (!beforeSettlement) throw new Error("Expected stored preflight agent");
+    await storage.upsert({
+      ...beforeSettlement,
+      lastUsage: {
+        contextWindowMaxTokens: 200_000,
+        contextWindowUsedTokens: 163_000,
+      },
+    });
+    await storage.settlePendingPromptPreflight("agent-preflight", preflight!.id, {
+      clearContextUsage: true,
+    });
+    await expect(storage.get("agent-preflight")).resolves.toMatchObject({
+      lastUsage: { contextWindowMaxTokens: 200_000 },
+    });
+    expect((await storage.get("agent-preflight"))?.lastUsage).not.toHaveProperty(
+      "contextWindowUsedTokens",
+    );
+    await expect(storage.get("agent-preflight")).resolves.toMatchObject({
+      completedPromptPreflightIds: ["message-after-compact"],
+    });
+    await expect(storage.claimPendingPrompt("agent-preflight")).resolves.toMatchObject({
+      id: "message-after-compact",
+      attemptCount: 2,
+    });
+    await storage.completePendingPrompt("agent-preflight", "message-after-compact");
+    await expect(storage.get("agent-preflight")).resolves.toMatchObject({
+      completedPromptPreflightIds: [],
+    });
+  });
+
+  test("waits for only the pending prompt ids captured at the caller boundary", async () => {
+    await storage.applySnapshot(createManagedAgent({ id: "agent-wait-boundary" }));
+    await storage.enqueuePendingPrompt("agent-wait-boundary", {
+      id: "message-before-wait",
+      prompt: "first accepted request",
+    });
+
+    let settled = false;
+    const wait = storage
+      .waitForPendingPromptIds("agent-wait-boundary", ["message-before-wait"])
+      .then(() => {
+        settled = true;
+        return undefined;
+      });
+    await storage.enqueuePendingPrompt("agent-wait-boundary", {
+      id: "message-after-wait",
+      prompt: "unrelated later request",
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    await storage.completePendingPrompt("agent-wait-boundary", "message-before-wait");
+    await wait;
+    expect(settled).toBe(true);
+    await expect(storage.listPendingPrompts("agent-wait-boundary")).resolves.toMatchObject([
+      { id: "message-after-wait" },
+    ]);
+  });
+
+  test("moves queued and interrupted dispatches to a context-overflow successor", async () => {
+    await storage.applySnapshot(createManagedAgent({ id: "agent-overflowed" }));
+    await storage.applySnapshot(createManagedAgent({ id: "agent-successor" }));
+    await storage.enqueuePendingPrompt("agent-overflowed", {
+      id: "message-dispatching",
+      prompt: "continue the first queued request",
+    });
+    await storage.claimPendingPrompt("agent-overflowed");
+    await storage.insertPendingPromptPreflight("agent-overflowed", "message-dispatching", {
+      key: "claude_context_compaction",
+      prompt: "/compact [PASEO_INTERNAL_CONTEXT_PREFLIGHT] preserve state",
+    });
+    await storage.claimPendingPrompt("agent-overflowed");
+    await storage.enqueuePendingPrompt("agent-overflowed", {
+      id: "message-queued",
+      prompt: "then run the next request",
+    });
+    await storage.enqueuePendingPrompt("agent-successor", {
+      id: "message-after-redirect",
+      prompt: "a message submitted after the family pointer moved",
+    });
+
+    await storage.transferPendingPrompts("agent-overflowed", "agent-successor");
+
+    await expect(storage.listPendingPrompts("agent-overflowed")).resolves.toEqual([]);
+    await expect(storage.listPendingPrompts("agent-successor")).resolves.toMatchObject([
+      { id: "message-dispatching", state: "queued", attemptCount: 1 },
+      { id: "message-queued", state: "queued", attemptCount: 0 },
+      { id: "message-after-redirect", state: "queued", attemptCount: 0 },
+    ]);
   });
 
   test("applySnapshot stores and reloads featureValues when present", async () => {
@@ -213,7 +426,9 @@ describe("AgentStorage", () => {
     const reloaded = new AgentStorage(storagePath, logger);
     const persisted = await reloaded.get("agent-feature-values");
     expect(persisted?.config?.featureValues).toEqual({ fast_mode: true });
-    expect(buildSessionConfig(persisted!).featureValues).toEqual({ fast_mode: true });
+    expect(buildSessionConfig(persisted!).featureValues).toEqual({
+      fast_mode: true,
+    });
   });
 
   test("applySnapshot keeps featureValues absent when they were never set", async () => {
@@ -325,7 +540,9 @@ describe("AgentStorage", () => {
 
   test("applySnapshot accepts explicit title overrides", async () => {
     const agentId = "agent-override";
-    await storage.applySnapshot(createManagedAgent({ id: agentId }), { title: "Provided Title" });
+    await storage.applySnapshot(createManagedAgent({ id: agentId }), {
+      title: "Provided Title",
+    });
 
     const record = await storage.get(agentId);
     expect(record?.title).toBe("Provided Title");
@@ -467,7 +684,10 @@ describe("AgentStorage", () => {
       createManagedAgent({ id: "workspace-agent", workspaceId: "workspace-1" }),
     );
     await storage.applySnapshot(
-      createManagedAgent({ id: "other-workspace-agent", workspaceId: "workspace-2" }),
+      createManagedAgent({
+        id: "other-workspace-agent",
+        workspaceId: "workspace-2",
+      }),
     );
 
     await expect(storage.listByWorkspace("workspace-1")).resolves.toMatchObject([

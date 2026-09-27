@@ -1331,6 +1331,7 @@ describe("translateOpenCodeEvent", () => {
       {
         type: "turn_completed",
         provider: "opencode",
+        outputProvenance: "provider",
         usage: undefined,
       },
     ]);

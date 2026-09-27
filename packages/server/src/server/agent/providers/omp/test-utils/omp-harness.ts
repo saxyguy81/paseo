@@ -410,6 +410,13 @@ export class OmpHarness {
     return this.events.filter((event) => event.type === "turn_completed").length;
   }
 
+  turnCompletions() {
+    return this.events.filter(
+      (event): event is Extract<AgentStreamEvent, { type: "turn_completed" }> =>
+        event.type === "turn_completed",
+    );
+  }
+
   usageUpdates() {
     return this.events.flatMap((event) => (event.type === "usage_updated" ? [event.usage] : []));
   }

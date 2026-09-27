@@ -19,6 +19,7 @@ import { parsePcm16MonoWav, wordSimilarity } from "./test-utils/dictation-e2e.js
 import type {
   AgentClient,
   AgentPersistenceHandle,
+  AgentPromptInput,
   AgentRunResult,
   AgentSession,
   AgentSessionConfig,
@@ -316,6 +317,105 @@ class StubAgentClient implements AgentClient {
   }
 }
 
+interface DeferredGate {
+  promise: Promise<void>;
+  release: () => void;
+}
+
+function createDeferredGate(): DeferredGate {
+  let release!: () => void;
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { promise, release };
+}
+
+class StaleErrorRecoverySession extends StubAgentSession {
+  readonly acceptedPrompts: string[] = [];
+  readonly retryAccepted = createDeferredGate();
+  readonly currentFailureAccepted = createDeferredGate();
+  readonly allowRetryStart = createDeferredGate();
+  readonly allowRetryCompletion = createDeferredGate();
+  readonly allowCurrentFailure = createDeferredGate();
+  private readonly subscribers = new Set<(event: AgentStreamEvent) => void>();
+  private turnOrdinal = 0;
+
+  constructor() {
+    super({
+      sessionId: "stale-error-recovery-session",
+      supportsStreaming: true,
+    });
+  }
+
+  override async startTurn(prompt: AgentPromptInput): Promise<{ turnId: string }> {
+    const text = typeof prompt === "string" ? prompt : JSON.stringify(prompt);
+    this.acceptedPrompts.push(text);
+    const turnId = `stale-error-turn-${++this.turnOrdinal}`;
+
+    if (text === "first turn fails") {
+      setTimeout(() => {
+        this.emit({ type: "turn_started", provider: this.provider, turnId });
+        this.emit({
+          type: "turn_failed",
+          provider: this.provider,
+          turnId,
+          error: "previous provider failure",
+        });
+      }, 0);
+      return { turnId };
+    }
+
+    if (text === "retry after stale error") {
+      this.retryAccepted.release();
+      await this.allowRetryStart.promise;
+      this.emit({ type: "turn_started", provider: this.provider, turnId });
+      void this.allowRetryCompletion.promise.then(() => {
+        this.emit({ type: "turn_completed", provider: this.provider, turnId });
+        return undefined;
+      });
+      return { turnId };
+    }
+
+    if (text === "current start fails") {
+      this.currentFailureAccepted.release();
+      await this.allowCurrentFailure.promise;
+      throw new Error("current provider start failed");
+    }
+
+    throw new Error(`Unexpected test prompt: ${text}`);
+  }
+
+  override subscribe(callback: (event: AgentStreamEvent) => void): () => void {
+    this.subscribers.add(callback);
+    return () => {
+      this.subscribers.delete(callback);
+    };
+  }
+
+  private emit(event: AgentStreamEvent): void {
+    for (const callback of this.subscribers) {
+      callback(event);
+    }
+  }
+}
+
+class StaleErrorRecoveryClient extends StubAgentClient {
+  constructor(readonly session: StaleErrorRecoverySession) {
+    super({
+      sessionId: session.id,
+      supportsStreaming: true,
+    });
+  }
+
+  override async createSession(): Promise<AgentSession> {
+    return this.session;
+  }
+
+  override async resumeSession(): Promise<AgentSession> {
+    return this.session;
+  }
+}
+
 class RecordingMcpResumeClient implements AgentClient {
   readonly provider = "codex" as const;
   readonly capabilities;
@@ -432,6 +532,76 @@ test("createAgent fails when the initial turn cannot start", async () => {
     await daemon.close();
   }
 });
+
+test("DaemonClient waits for a retry to start instead of reporting the previous run error", async () => {
+  const cwd = tmpCwd();
+  const session = new StaleErrorRecoverySession();
+  const daemon = await createTestPaseoDaemon({
+    agentClients: { codex: new StaleErrorRecoveryClient(session) },
+  });
+  const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+
+  try {
+    await client.connect();
+    await client.fetchAgents({ subscribe: { subscriptionId: "stale-error-retry" } });
+    const agent = await client.createAgent({ provider: "codex", cwd });
+
+    await client.sendMessage(agent.id, "first turn fails");
+    const failed = await client.waitForAgentUpsert(
+      agent.id,
+      (snapshot) => snapshot.status === "error",
+      5_000,
+    );
+    expect(failed.lastError).toBe("previous provider failure");
+
+    const retry = client.sendAgentMessage(agent.id, "retry after stale error");
+    await session.retryAccepted.promise;
+    const retryBeforeStart = await Promise.race([
+      retry.then(
+        () => "resolved" as const,
+        () => "rejected" as const,
+      ),
+      new Promise<"pending">((resolve) => setImmediate(() => resolve("pending"))),
+    ]);
+    expect(retryBeforeStart).toBe("pending");
+    expect(
+      session.acceptedPrompts.filter((prompt) => prompt === "retry after stale error"),
+    ).toHaveLength(1);
+
+    session.allowRetryStart.release();
+    await expect(retry).resolves.toBeUndefined();
+    await client.waitForAgentUpsert(agent.id, (snapshot) => snapshot.status === "running", 5_000);
+
+    session.allowRetryCompletion.release();
+    await client.waitForAgentUpsert(agent.id, (snapshot) => snapshot.status === "idle", 5_000);
+
+    const currentFailure = client.sendMessage(agent.id, "current start fails");
+    await session.currentFailureAccepted.promise;
+    const failureBeforeProviderRejects = await Promise.race([
+      currentFailure.then(
+        () => "resolved" as const,
+        () => "rejected" as const,
+      ),
+      new Promise<"pending">((resolve) => setImmediate(() => resolve("pending"))),
+    ]);
+    expect(failureBeforeProviderRejects).toBe("pending");
+
+    session.allowCurrentFailure.release();
+    await expect(currentFailure).rejects.toThrow("current provider start failed");
+    expect(session.acceptedPrompts).toEqual([
+      "first turn fails",
+      "retry after stale error",
+      "current start fails",
+    ]);
+  } finally {
+    session.allowRetryStart.release();
+    session.allowRetryCompletion.release();
+    session.allowCurrentFailure.release();
+    await client.close();
+    await daemon.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+}, 30_000);
 
 function createUninterruptibleClient(): AgentClient {
   return new StubAgentClient({

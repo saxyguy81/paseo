@@ -80,6 +80,9 @@ STT_CONFIDENCE_THRESHOLD=-3.0  # Optional: reject low-confidence clips
 STT_DEBUG_AUDIO_DIR=.stt-debug # Optional: persist raw dictation audio for debugging
 PASEO_HOME=~/.paseo        # Runtime state directory (agents/, etc.)
 PASEO_LISTEN=127.0.0.1:6767  # Listen address (host:port or /path/to/socket)
+PASEO_WEB_PUSH_VAPID_PUBLIC_KEY=   # Optional browser/PWA Web Push public key
+PASEO_WEB_PUSH_VAPID_PRIVATE_KEY=  # Secret; keep outside git
+PASEO_WEB_PUSH_VAPID_SUBJECT=mailto:operator@example.com
 ```
 
 `PASEO_HOME` defaults to `~/.paseo` and isolates runtime artifacts like `agents/`. `PASEO_LISTEN` controls the daemon listen address. For blue/green testing you can run a parallel server without touching production state:
@@ -87,6 +90,24 @@ PASEO_LISTEN=127.0.0.1:6767  # Listen address (host:port or /path/to/socket)
 ```bash
 PASEO_HOME=~/.paseo-blue PASEO_LISTEN=127.0.0.1:7777 npm run dev
 ```
+
+Browser and installed iPhone PWA notifications require all three VAPID variables.
+Generate one key pair with `npx web-push generate-vapid-keys`, keep the private key
+in the daemon's secret launch environment, and restart the daemon after changing it.
+Subscriptions are leased and stored privately under `PASEO_HOME`; no VAPID secret is
+sent to the client. Registration fails closed unless the browser endpoint is an HTTPS
+Chrome FCM endpoint (`fcm.googleapis.com/wp/` or the legacy `/fcm/send/` path) or an
+Apple Web Push endpoint under `*.push.apple.com`. Query strings, fragments,
+credentials, and non-default ports are rejected. At most 32 browser subscriptions
+are retained, each has a 24-hour renewable lease, and deliveries use a 10-second
+socket timeout. Complete but malformed VAPID configuration disables Web Push with a
+sanitized warning instead of preventing Paseo from starting.
+
+The web origin owns one browser `PushSubscription`, so Paseo registers it with only
+the host selected in Settings. To move notifications to another host, turn them off
+for the current host first; Paseo persists only that non-secret host selection in the
+browser. Revocation credentials stay in memory and are never written to browser
+storage or logs.
 
 ## Tech Stack
 

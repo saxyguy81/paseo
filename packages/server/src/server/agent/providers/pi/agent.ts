@@ -1730,7 +1730,7 @@ export class PiRpcAgentSession implements AgentSession {
       return;
     }
     this.emitBufferedNoTurnOutputs(turnId);
-    this.completeTurn(turnId, []);
+    this.completeTurn(turnId, [], "local");
   }
 
   private async completePromptIfHandledWithoutTurn(turnId: string): Promise<void> {
@@ -1754,7 +1754,7 @@ export class PiRpcAgentSession implements AgentSession {
     }
 
     this.emitBufferedNoTurnOutputs(turnId);
-    this.completeTurn(turnId, []);
+    this.completeTurn(turnId, [], "local");
   }
 
   private clearNoTurnBuffers(): void {
@@ -2418,7 +2418,7 @@ export class PiRpcAgentSession implements AgentSession {
         });
       }
       if (!this.activeTurnStarted) {
-        this.completeTurn(turnId, []);
+        this.completeTurn(turnId, [], "local");
       }
       return;
     }
@@ -2461,7 +2461,11 @@ export class PiRpcAgentSession implements AgentSession {
     return mapToolDetail(toolCall, result);
   }
 
-  private completeTurn(turnId: string | undefined, messages: PiAgentMessage[]): void {
+  private completeTurn(
+    turnId: string | undefined,
+    messages: PiAgentMessage[],
+    outputProvenance: "provider" | "local" = "provider",
+  ): void {
     const errorMessage = latestPiErrorMessage(messages);
     if (
       this.interruptingTurn &&
@@ -2494,6 +2498,7 @@ export class PiRpcAgentSession implements AgentSession {
     this.emit({
       type: "turn_completed",
       provider: this.provider,
+      outputProvenance,
       turnId,
     });
     void this.refreshAfterTurn(finalUsage);

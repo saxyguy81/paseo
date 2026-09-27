@@ -10,6 +10,17 @@ import {
   type AgentLifecycleStatus,
 } from "@getpaseo/protocol/agent-lifecycle";
 import {
+  CONVERSATION_FAMILY_CURRENT_LABEL,
+  CONVERSATION_FAMILY_HIDDEN_LABEL,
+  CONVERSATION_FAMILY_ID_LABEL,
+  CONVERSATION_FAMILY_NAME_LABEL,
+  CONVERSATION_FAMILY_POSITION_LABEL,
+  CONVERSATION_FAMILY_PREDECESSOR_LABEL,
+  CONVERSATION_FAMILY_RESUME_MODEL_ROLLOVER_LABEL,
+  CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL,
+  CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL,
+  CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL,
+  CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL,
   getParentAgentIdFromLabels,
   hasOpenAgentTab,
   isDelegatedAgent,
@@ -37,6 +48,7 @@ import {
   type AgentPermissionResponse,
   type AgentPermissionResult,
   type AgentPersistenceHandle,
+  type AgentPromptAdmissionDecision,
   type AgentProviderNotice,
   type AgentPromptInput,
   type AgentProvider,
@@ -55,7 +67,8 @@ import {
   type ListImportableSessionsOptions,
 } from "./agent-sdk-types.js";
 import { buildArchivedAgentRecord, type ArchivedStoredAgentRecord } from "./agent-archive.js";
-import type { StoredAgentRecord, AgentStorage } from "./agent-storage.js";
+import { isStoredPendingPromptPreflight } from "./agent-storage.js";
+import type { StoredAgentRecord, StoredPendingAgentPrompt, AgentStorage } from "./agent-storage.js";
 import type { AgentOwner } from "./agent-owner.js";
 import {
   InMemoryAgentTimelineStore,
@@ -89,12 +102,26 @@ import {
   type ProviderSubagentDescriptor,
   type ProviderSubagentStoreEvent,
 } from "./provider-subagents/store.js";
+import { buildAgentFreshSessionContinuationPrompt } from "./activity-curator.js";
+import {
+  type ConversationRolloverFailureKind,
+  isConversationRolloverFailureKind,
+  isConversationRolloverFailureText,
+} from "./context-overflow.js";
 import { withTimeout } from "../../utils/promise-timeout.js";
 import { extractAttention } from "../persistence-hooks.js";
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
 const IMPORTABLE_SESSION_LIST_TIMEOUT_MS = 90_000;
+// Constrain correlated provider outages without imposing a lifetime family cap.
+const AUTOMATIC_CONVERSATION_ROLLOVER_LIMIT = 2;
+const AUTOMATIC_CONVERSATION_ROLLOVER_WINDOW_MS = 60 * 60 * 1_000;
+const TRANSIENT_PROMPT_RETRY_BASE_DELAY_MS = 30_000;
+const TRANSIENT_PROMPT_RETRY_MAX_DELAY_MS = 5 * 60_000;
+const TRANSIENT_PROMPT_RECOVERY_PROMPT = `<paseo-system>
+The latest user request failed before any work began because the model API was temporarily unavailable. Continue that unfinished request now. Do not repeat completed work.
+</paseo-system>`;
 const STORED_AGENT_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: false,
   supportsSessionPersistence: true,
@@ -102,6 +129,7 @@ const STORED_AGENT_CAPABILITIES: AgentCapabilityFlags = {
   supportsMcpServers: false,
   supportsReasoningStream: false,
   supportsToolInvocations: true,
+  supportsInFlightSteering: false,
   supportsRewindConversation: false,
   supportsRewindFiles: false,
   supportsRewindBoth: false,
@@ -117,6 +145,207 @@ function submittedPromptText(prompt: AgentPromptInput): string {
     .flatMap((block) => (block.type === "text" && !("mimeType" in block) ? [block.text] : []))
     .join("\n")
     .trim();
+}
+
+function isProviderTeardownFailure(error: string): boolean {
+  const normalized = error.toLowerCase();
+  return normalized.includes("stopped unexpectedly") && normalized.includes("sigterm");
+}
+
+function parseFamilyPosition(value: string | null | undefined): number {
+  const position = Number(value);
+  return Number.isInteger(position) && position >= 0 ? position : 0;
+}
+
+function parseAutomaticRolloverCount(value: string | null | undefined): number {
+  const count = Number(value);
+  return Number.isInteger(count) && count >= 0 ? count : 0;
+}
+
+function parseAutomaticRolloverEpoch(value: string | null | undefined): number {
+  const epoch = Number(value);
+  return Number.isInteger(epoch) && epoch >= 0 ? epoch : 0;
+}
+
+function parseAutomaticRolloverWindowStartedAt(value: string | null | undefined): Date | null {
+  if (!value) return null;
+  const timestamp = new Date(value);
+  return Number.isNaN(timestamp.getTime()) ? null : timestamp;
+}
+
+interface ConversationRolloverState {
+  epoch: number;
+  count: number;
+  windowStartedAt: Date | null;
+  parked: boolean;
+}
+
+function readConversationRolloverState(
+  familyMembers: readonly StoredAgentRecord[],
+  now: Date,
+): ConversationRolloverState {
+  const memberStates = familyMembers.map((member) => ({
+    epoch: parseAutomaticRolloverEpoch(member.labels?.[CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]),
+    count: parseAutomaticRolloverCount(member.labels?.[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]),
+    windowStartedAt: parseAutomaticRolloverWindowStartedAt(
+      member.labels?.[CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL],
+    ),
+    parked: member.labels?.[CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL] === "true",
+  }));
+  const epoch = Math.max(0, ...memberStates.map((state) => state.epoch));
+  const currentEpochStates = memberStates.filter((state) => state.epoch === epoch);
+  const activeStates = currentEpochStates.filter(
+    (state): state is typeof state & { windowStartedAt: Date } =>
+      state.windowStartedAt !== null &&
+      now.getTime() - state.windowStartedAt.getTime() < AUTOMATIC_CONVERSATION_ROLLOVER_WINDOW_MS,
+  );
+  if (activeStates.length === 0) {
+    return { epoch, count: 0, windowStartedAt: null, parked: false };
+  }
+  return {
+    epoch,
+    count: Math.max(...activeStates.map((state) => state.count)),
+    windowStartedAt: new Date(
+      Math.min(...activeStates.map((state) => state.windowStartedAt.getTime())),
+    ),
+    parked: activeStates.some((state) => state.parked),
+  };
+}
+
+function isConversationFamilyDurablyParked(familyMembers: readonly StoredAgentRecord[]): boolean {
+  const epoch = Math.max(
+    0,
+    ...familyMembers.map((member) =>
+      parseAutomaticRolloverEpoch(member.labels?.[CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]),
+    ),
+  );
+  return familyMembers.some(
+    (member) =>
+      parseAutomaticRolloverEpoch(member.labels?.[CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]) ===
+        epoch && member.labels?.[CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL] === "true",
+  );
+}
+
+function conversationRolloverStatePatch(state: ConversationRolloverState): AgentLabelPatch {
+  return {
+    [CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL]: String(state.epoch),
+    [CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL]:
+      state.windowStartedAt?.toISOString() ?? null,
+    [CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL]: state.count > 0 ? String(state.count) : null,
+    [CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL]: state.parked ? "true" : null,
+  };
+}
+
+function hasSubstantiveAssistantReply(rows: readonly AgentTimelineRow[], turnId: string): boolean {
+  return rows.some(
+    (row) =>
+      row.turnId === turnId &&
+      row.item.type === "assistant_message" &&
+      row.item.text.trim().length > 0,
+  );
+}
+
+function findConversationSuccessor(
+  records: readonly StoredAgentRecord[],
+  predecessorId: string,
+): StoredAgentRecord | undefined {
+  return records.find(
+    (record) => record.labels?.[CONVERSATION_FAMILY_PREDECESSOR_LABEL] === predecessorId,
+  );
+}
+
+function latestSubstantiveUserRequest(rows: readonly AgentTimelineRow[]): string | null {
+  const row = rows.findLast(
+    (candidate) =>
+      candidate.item.type === "user_message" &&
+      candidate.item.text.trim().length > 0 &&
+      !isSystemInjectedEnvelope(candidate.item.text),
+  );
+  return row?.item.type === "user_message" ? row.item.text.trim() : null;
+}
+
+function inheritedConversationRequest(
+  records: readonly StoredAgentRecord[],
+  failedMember: StoredAgentRecord,
+): string | null {
+  const familyId = failedMember.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim();
+  if (!familyId) return failedMember.continuationRequest?.trim() || null;
+  const recordById = new Map(records.map((record) => [record.id, record]));
+  const visited = new Set<string>();
+  let cursor: StoredAgentRecord | undefined = failedMember;
+  while (
+    cursor &&
+    !visited.has(cursor.id) &&
+    cursor.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim() === familyId
+  ) {
+    visited.add(cursor.id);
+    const request = cursor.continuationRequest?.trim();
+    if (request) return request;
+    const predecessorId = cursor.labels?.[CONVERSATION_FAMILY_PREDECESSOR_LABEL]?.trim();
+    cursor = predecessorId ? recordById.get(predecessorId) : undefined;
+  }
+  return null;
+}
+
+function isEligibleConversationPredecessor(
+  predecessor: StoredAgentRecord,
+  agentId: string,
+  failureKind: ConversationRolloverFailureKind,
+  latestError: string | null | undefined,
+  liveFailureKind: ConversationRolloverFailureKind | undefined,
+): boolean {
+  const currentFamilyMember = predecessor.labels?.[CONVERSATION_FAMILY_CURRENT_LABEL]?.trim();
+  // The Claude provider is the sole authority for resume_model_unavailable. It
+  // only emits that durable kind after a resumed session or a completed turn
+  // proves the model was usable, so each new family generation may recover
+  // once without turning a genuine fresh-session access failure into a loop.
+  const failureIsAuthoritative =
+    failureKind === "resume_model_unavailable"
+      ? liveFailureKind === failureKind || predecessor.lastFailureKind === failureKind
+      : isConversationRolloverFailureText(failureKind, latestError);
+  return (!currentFamilyMember || currentFamilyMember === agentId) && failureIsAuthoritative;
+}
+
+function buildConversationSuccessorMetadata(
+  records: readonly StoredAgentRecord[],
+  predecessor: StoredAgentRecord,
+  successorId: string,
+  failureKind: ConversationRolloverFailureKind,
+): { familyName: string; labels: Record<string, string> } {
+  const familyId = predecessor.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim() || randomUUID();
+  const familyMembers = records.filter(
+    (record) =>
+      record.id === predecessor.id || record.labels?.[CONVERSATION_FAMILY_ID_LABEL] === familyId,
+  );
+  const highestPosition = Math.max(
+    parseFamilyPosition(predecessor.labels?.[CONVERSATION_FAMILY_POSITION_LABEL]),
+    ...familyMembers.map((record) =>
+      parseFamilyPosition(record.labels?.[CONVERSATION_FAMILY_POSITION_LABEL]),
+    ),
+  );
+  const familyName =
+    predecessor.labels?.[CONVERSATION_FAMILY_NAME_LABEL]?.trim() ||
+    predecessor.title?.trim() ||
+    "Conversation";
+  const labels = Object.fromEntries(
+    Object.entries(predecessor.labels ?? {}).filter(
+      ([label]) =>
+        label !== CONVERSATION_FAMILY_HIDDEN_LABEL &&
+        label !== CONVERSATION_FAMILY_RESUME_MODEL_ROLLOVER_LABEL &&
+        !isOpenAgentTabLabel(label),
+    ),
+  );
+  Object.assign(labels, {
+    [CONVERSATION_FAMILY_ID_LABEL]: familyId,
+    [CONVERSATION_FAMILY_CURRENT_LABEL]: successorId,
+    [CONVERSATION_FAMILY_NAME_LABEL]: familyName,
+    [CONVERSATION_FAMILY_POSITION_LABEL]: String(highestPosition + 1),
+    [CONVERSATION_FAMILY_PREDECESSOR_LABEL]: predecessor.id,
+  });
+  if (failureKind === "resume_model_unavailable") {
+    labels[CONVERSATION_FAMILY_RESUME_MODEL_ROLLOVER_LABEL] = "true";
+  }
+  return { familyName, labels };
 }
 
 export class AgentManagerShuttingDownError extends Error {
@@ -317,6 +546,7 @@ export interface CreateAgentOptions {
 }
 
 export interface AgentManagerOptions {
+  onTurnFailure?: (notice: import("./turn-failure-outbox.js").TurnFailureNotice) => Promise<void>;
   pluginLifecycle?: PluginLifecycle;
   clients?: ProviderClientMap;
   providerDefinitions?: ProviderEnabledMap;
@@ -338,7 +568,26 @@ export interface AgentManagerOptions {
     agentId: string;
     expectedTurnId: string;
   }) => Promise<void>;
+  transientPromptRetryBaseDelayMs?: number;
+  transientPromptRetryMaxDelayMs?: number;
   logger: Logger;
+}
+
+function resolveTransientPromptRetryDelays(options: AgentManagerOptions): {
+  baseMs: number;
+  maxMs: number;
+} {
+  const baseMs = Math.max(
+    0,
+    options.transientPromptRetryBaseDelayMs ?? TRANSIENT_PROMPT_RETRY_BASE_DELAY_MS,
+  );
+  return {
+    baseMs,
+    maxMs: Math.max(
+      baseMs,
+      options.transientPromptRetryMaxDelayMs ?? TRANSIENT_PROMPT_RETRY_MAX_DELAY_MS,
+    ),
+  };
 }
 
 export type ActiveTurnSteerDispatchResult =
@@ -429,6 +678,7 @@ interface ManagedAgentBase {
   activeTurnStartedAt: Date | null;
   lastUsage?: AgentUsage;
   lastError?: string;
+  lastFailureKind?: ConversationRolloverFailureKind;
   attention: AttentionState;
   foregroundTurnWaiters: Set<ForegroundTurnWaiter>;
   finalizedForegroundTurnIds: Set<string>;
@@ -739,6 +989,10 @@ export class AgentManager {
   private readonly inFlightAgentCloses = new Map<string, Promise<void>>();
   private readonly reloadedSessionCloses = new WeakMap<AgentSession, Promise<void>>();
   private readonly lifecycleMutationTails = new Map<string, Promise<void>>();
+  private readonly conversationRollovers = new Map<string, Promise<string | null>>();
+  private readonly conversationFamilyMutationTails = new Map<string, Promise<void>>();
+  private readonly pendingPromptDrainTasks = new Map<string, Promise<void>>();
+  private readonly pendingPromptRetryTimers = new Map<string, NodeJS.Timeout>();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private readonly mcpAuthToken: string | null;
@@ -750,11 +1004,17 @@ export class AgentManager {
   ) => ProviderPaseoToolsPolicy | undefined;
   private appendSystemPrompt: string;
   private onAgentAttention?: AgentAttentionCallback;
+  private onTurnFailure?: AgentManagerOptions["onTurnFailure"];
+  private readonly diagnosticLastAt = new Map<string, number>();
+  /** Agents whose runtime Paseo is closing on purpose; their teardown is not a failure. */
+  private readonly controlledCloseAgentIds = new Set<string>();
   private onAgentArchived?: AgentArchivedCallback;
   private onWorkspaceStateMayHaveChanged?: (params: { cwd: string }) => void;
   private logger: Logger;
   private readonly rescueTimeouts: Required<AgentManagerRescueTimeouts>;
   private readonly beforeSteerUnavailableFallback?: AgentManagerOptions["beforeSteerUnavailableFallback"];
+  private readonly transientPromptRetryBaseDelayMs: number;
+  private readonly transientPromptRetryMaxDelayMs: number;
   private acceptingAgentRegistrations = true;
 
   constructor(options: AgentManagerOptions) {
@@ -763,13 +1023,17 @@ export class AgentManager {
     this.registry = options?.registry;
     this.durableTimelineStore = options?.durableTimelineStore;
     this.onAgentAttention = options?.onAgentAttention;
+    this.onTurnFailure = options.onTurnFailure;
     this.onWorkspaceStateMayHaveChanged = options?.onWorkspaceStateMayHaveChanged;
     this.mcpBaseUrl = options?.mcpBaseUrl ?? null;
     this.mcpAuthToken = options?.mcpAuthToken ?? null;
     this.configurePaseoTools(options);
     this.resolvePaseoToolPolicy = options.resolvePaseoToolPolicy ?? (() => undefined);
     this.appendSystemPrompt = options.appendSystemPrompt ?? "";
-    this.logger = options.logger.child({ module: "agent", component: "agent-manager" });
+    this.logger = options.logger.child({
+      module: "agent",
+      component: "agent-manager",
+    });
     this.rescueTimeouts = {
       reloadSessionCloseMs:
         options.rescueTimeouts?.reloadSessionCloseMs ?? RELOAD_SESSION_CLOSE_TIMEOUT_MS,
@@ -777,6 +1041,9 @@ export class AgentManager {
         options.rescueTimeouts?.interruptSessionMs ?? INTERRUPT_SESSION_TIMEOUT_MS,
     };
     this.beforeSteerUnavailableFallback = options.beforeSteerUnavailableFallback;
+    const transientPromptRetryDelays = resolveTransientPromptRetryDelays(options);
+    this.transientPromptRetryBaseDelayMs = transientPromptRetryDelays.baseMs;
+    this.transientPromptRetryMaxDelayMs = transientPromptRetryDelays.maxMs;
     this.agentStreamCoalescer = new AgentStreamCoalescer({
       windowMs: options.agentStreamCoalesceWindowMs ?? AGENT_STREAM_COALESCE_DEFAULT_WINDOW_MS,
       timers: { setTimeout, clearTimeout },
@@ -852,6 +1119,8 @@ export class AgentManager {
 
   prepareForShutdown(): void {
     this.acceptingAgentRegistrations = false;
+    for (const timer of this.pendingPromptRetryTimers.values()) clearTimeout(timer);
+    this.pendingPromptRetryTimers.clear();
   }
 
   setPaseoToolsEnabled(enabled: boolean): void {
@@ -945,6 +1214,306 @@ export class AgentManager {
     );
   }
 
+  hasSubmittedPrompt(agentId: string, clientMessageId: string): boolean {
+    const row = this.timelineStore.getSubmittedUserMessage(agentId, clientMessageId);
+    return row?.item.type === "user_message" && row.item.deliveryStatus !== "rejected";
+  }
+
+  planPromptAdmission(agentId: string, prompt: AgentPromptInput): AgentPromptAdmissionDecision {
+    const agent = this.requireSessionAgent(agentId);
+    return (
+      agent.session.planPromptAdmission?.(prompt, agent.lastUsage) ?? {
+        type: "dispatch",
+      }
+    );
+  }
+
+  /**
+   * Drain the durable prompt FIFO for one agent. AgentManager owns this loop so
+   * family rollover, daemon recovery, and live WebSocket sends all share the
+   * same single-writer boundary.
+   */
+  async drainStoredPendingPrompts(agentId: string): Promise<void> {
+    const existing = this.pendingPromptDrainTasks.get(agentId);
+    if (existing) {
+      return await existing;
+    }
+    const drain = this.consumeStoredPendingPromptQueue(agentId);
+    this.pendingPromptDrainTasks.set(agentId, drain);
+    try {
+      await drain;
+    } finally {
+      if (this.pendingPromptDrainTasks.get(agentId) === drain) {
+        this.pendingPromptDrainTasks.delete(agentId);
+      }
+    }
+  }
+
+  private async consumeStoredPendingPromptQueue(agentId: string): Promise<void> {
+    const registry = this.requireRegistry();
+    while (!this.hasInFlightRun(agentId)) {
+      if (await this.isAgentPromptRecoveryParked(agentId)) return;
+      const pending = await registry.claimPendingPrompt(agentId);
+      if (!pending) return;
+      const admission = await this.prepareStoredPromptAdmission(agentId, pending, registry);
+      if (admission === "continue") continue;
+      if (admission === "stop") return;
+
+      const observation = await this.observeStoredPromptRun(agentId, pending, registry);
+      const shouldContinue = isStoredPendingPromptPreflight(pending)
+        ? await this.settleStoredPreflight(agentId, pending, observation, registry)
+        : await this.settleStoredUserPrompt(agentId, pending, observation, registry);
+      if (!shouldContinue) return;
+    }
+  }
+
+  private async prepareStoredPromptAdmission(
+    agentId: string,
+    pending: StoredPendingAgentPrompt,
+    registry: AgentStorage,
+  ): Promise<"ready" | "continue" | "stop"> {
+    if (isStoredPendingPromptPreflight(pending)) return "ready";
+    const stored = await registry.get(agentId);
+    if (stored?.completedPromptPreflightIds.includes(pending.id)) {
+      return "ready";
+    }
+    let admission: AgentPromptAdmissionDecision;
+    try {
+      admission = this.planPromptAdmission(agentId, pending.prompt);
+      if (admission.type === "preflight") {
+        await registry.insertPendingPromptPreflight(agentId, pending.id, admission, {
+          preserveClaimedAttempt: this.hasSubmittedPrompt(agentId, pending.id),
+        });
+      }
+    } catch (error) {
+      // No provider request was opened. Restore the durable claim so a later
+      // daemon recovery or explicit send can retry it exactly once.
+      await registry.releasePendingPrompt(agentId, pending.id);
+      this.logger.error(
+        { err: error, agentId, messageId: pending.id },
+        "Failed to prepare durable prompt admission",
+      );
+      return "stop";
+    }
+    if (admission.type === "dispatch") return "ready";
+    if (admission.type === "preflight") return "continue";
+
+    // This item can never become dispatchable without changing the message.
+    // Persist it as locally rejected before removing its FIFO claim. The
+    // rejected delivery status is deliberately not provider-submission proof.
+    const agent = this.requireSessionAgent(agentId);
+    try {
+      this.recordSubmittedPrompt(agent, pending.prompt, pending.id, {
+        deliveryStatus: "rejected",
+      });
+      await this.flush();
+      await registry.completePendingPrompt(agentId, pending.id);
+    } catch (error) {
+      await registry.releasePendingPrompt(agentId, pending.id);
+      this.logger.error(
+        { err: error, agentId, messageId: pending.id },
+        "Failed to persist rejected durable prompt",
+      );
+      return "stop";
+    }
+    try {
+      await this.handleStreamEvent(agent, {
+        type: "turn_failed",
+        provider: agent.provider,
+        error: admission.message,
+        code: "prompt_admission_rejected",
+      });
+    } catch (error) {
+      // The durable rejected user row is the authoritative record. A
+      // notification failure must not resurrect it as provider work.
+      this.logger.error(
+        { err: error, agentId, messageId: pending.id },
+        "Failed to publish prompt admission rejection",
+      );
+    }
+    return "continue";
+  }
+
+  private async observeStoredPromptRun(
+    agentId: string,
+    pending: StoredPendingAgentPrompt,
+    registry: AgentStorage,
+  ): Promise<{
+    started: boolean;
+    terminal: "completed" | "failed" | "canceled" | null;
+    failureKind?: Extract<AgentStreamEvent, { type: "turn_failed" }>["failureKind"];
+    preflightBoundaryObserved: boolean;
+    error?: unknown;
+  }> {
+    const preflight = isStoredPendingPromptPreflight(pending);
+    const replayingSubmittedPrompt = !preflight && this.hasSubmittedPrompt(agentId, pending.id);
+    const prompt = replayingSubmittedPrompt ? TRANSIENT_PROMPT_RECOVERY_PROMPT : pending.prompt;
+    const observation: {
+      started: boolean;
+      terminal: "completed" | "failed" | "canceled" | null;
+      failureKind?: Extract<AgentStreamEvent, { type: "turn_failed" }>["failureKind"];
+      preflightBoundaryObserved: boolean;
+      error?: unknown;
+    } = {
+      started: false,
+      terminal: null,
+      preflightBoundaryObserved: false,
+    };
+    // A recovery prompt is a system continuation of a user message already in both
+    // timelines. Do not reuse that message's provider UUID or append a second user row.
+    const runOptions = replayingSubmittedPrompt ? undefined : { clientMessageId: pending.id };
+    try {
+      for await (const event of this.streamAgent(agentId, prompt, runOptions)) {
+        if (event.type === "turn_started") observation.started = true;
+        if (event.type === "turn_completed") observation.terminal = "completed";
+        if (event.type === "turn_canceled") observation.terminal = "canceled";
+        if (event.type === "turn_failed") {
+          observation.terminal = "failed";
+          observation.failureKind = event.failureKind;
+        }
+        if (
+          preflight &&
+          event.type === "timeline" &&
+          event.item.type === "compaction" &&
+          event.item.status === "completed"
+        ) {
+          observation.preflightBoundaryObserved = true;
+          await registry.recordPendingPromptPreflightBoundary(agentId, pending.id);
+        }
+      }
+    } catch (error) {
+      observation.error = error;
+    }
+    return observation;
+  }
+
+  private async settleStoredPreflight(
+    agentId: string,
+    pending: StoredPendingAgentPrompt,
+    observation: Awaited<ReturnType<AgentManager["observeStoredPromptRun"]>>,
+    registry: AgentStorage,
+  ): Promise<boolean> {
+    const { error, failureKind, preflightBoundaryObserved, started, terminal } = observation;
+    if (error) {
+      if (preflightBoundaryObserved) {
+        await registry.settlePendingPromptPreflight(agentId, pending.id, {
+          clearContextUsage: true,
+        });
+        this.clearPromptAdmissionContextUsage(agentId);
+      } else if (!started) {
+        await registry.releasePendingPrompt(agentId, pending.id);
+      } else {
+        await registry.settlePendingPromptPreflight(agentId, pending.id);
+      }
+      this.logger.error(
+        { err: error, agentId, preflightId: pending.id, started },
+        "Context preflight failed to settle",
+      );
+      // A thrown stream error without a clean terminal event has no reliable
+      // failure classification. Continue only when the stream also delivered
+      // a clean completion; otherwise stop rather than race rollover/recovery.
+      return preflightBoundaryObserved && terminal === "completed";
+    }
+    if (preflightBoundaryObserved || terminal === "completed") {
+      await registry.settlePendingPromptPreflight(agentId, pending.id, {
+        clearContextUsage: true,
+      });
+      this.clearPromptAdmissionContextUsage(agentId);
+      return !isConversationRolloverFailureKind(failureKind);
+    }
+    if (failureKind === "retryable_api" && pending.attemptCount < 2) {
+      await registry.releasePendingPrompt(agentId, pending.id);
+      this.scheduleTransientPromptRetry(agentId, pending.attemptCount);
+      return false;
+    }
+    await registry.settlePendingPromptPreflight(agentId, pending.id);
+    // The original user item remains queued, and the measured high-context
+    // usage stays intact. A later explicit send or daemon recovery must run a
+    // fresh preflight before dispatching it; it must not silently bypass the
+    // safety margin after authentication, model, quota, or cancellation errors.
+    return false;
+  }
+
+  clearPromptAdmissionContextUsage(agentId: string): void {
+    const agent = this.agents.get(agentId);
+    if (!agent) return;
+    if (agent.lastUsage?.contextWindowUsedTokens === undefined) return;
+    const remainingUsage = { ...agent.lastUsage };
+    delete remainingUsage.contextWindowUsedTokens;
+    agent.lastUsage = Object.keys(remainingUsage).length ? remainingUsage : undefined;
+    this.emitState(agent);
+  }
+
+  private async settleStoredUserPrompt(
+    agentId: string,
+    pending: StoredPendingAgentPrompt,
+    observation: Awaited<ReturnType<AgentManager["observeStoredPromptRun"]>>,
+    registry: AgentStorage,
+  ): Promise<boolean> {
+    const { error, failureKind, started, terminal } = observation;
+    if (error) {
+      if (started) await registry.completePendingPrompt(agentId, pending.id);
+      else await registry.releasePendingPrompt(agentId, pending.id);
+      this.logger.error(
+        { err: error, agentId, messageId: pending.id, started },
+        "Durable queued prompt failed to settle",
+      );
+      return started;
+    }
+    if (!started) {
+      await registry.releasePendingPrompt(agentId, pending.id);
+      return false;
+    }
+    if (failureKind === "retryable_api" && pending.attemptCount < 2) {
+      await registry.releasePendingPrompt(agentId, pending.id);
+      this.scheduleTransientPromptRetry(agentId, pending.attemptCount);
+      return false;
+    }
+    await registry.completePendingPrompt(agentId, pending.id);
+    if (terminal === null) {
+      this.logger.error(
+        { agentId, messageId: pending.id },
+        "Durable queued prompt ended without a terminal event",
+      );
+      return true;
+    }
+    // The rollover task transfers the remaining FIFO to the fresh family
+    // member and that member drains it after its bounded handoff settles.
+    return !isConversationRolloverFailureKind(failureKind);
+  }
+
+  private scheduleTransientPromptRetry(agentId: string, attemptCount: number): void {
+    if (!this.acceptingAgentRegistrations || this.pendingPromptRetryTimers.has(agentId)) return;
+    const exponent = Math.max(0, Math.min(attemptCount - 1, 10));
+    const delayMs = Math.min(
+      this.transientPromptRetryMaxDelayMs,
+      this.transientPromptRetryBaseDelayMs * 2 ** exponent,
+    );
+    const timer = setTimeout(() => {
+      this.pendingPromptRetryTimers.delete(agentId);
+      if (!this.acceptingAgentRegistrations || !this.agents.has(agentId)) return;
+      const activeDrain = this.pendingPromptDrainTasks.get(agentId);
+      const retry = () =>
+        this.drainStoredPendingPrompts(agentId).catch((error) => {
+          this.logger.error(
+            { err: error, agentId },
+            "Failed to retry durable prompt after transient API failure",
+          );
+        });
+      if (activeDrain) {
+        void activeDrain.then(retry, retry);
+      } else {
+        void retry();
+      }
+    }, delayMs);
+    timer.unref?.();
+    this.pendingPromptRetryTimers.set(agentId, timer);
+    this.logger.warn(
+      { agentId, attemptCount, delayMs },
+      "Retained durable prompt for retry after transient API failure",
+    );
+  }
+
   subscribe(callback: AgentSubscriber, options?: SubscribeOptions): () => void {
     const targetAgentId =
       options?.agentId == null ? null : validateAgentId(options.agentId, "subscribe");
@@ -990,6 +1559,40 @@ export class AgentManager {
     return Array.from(this.agents.values())
       .filter((agent) => !agent.internal)
       .map((agent) => Object.assign({}, agent));
+  }
+
+  async reportDiagnosticIncident(input: {
+    agentId?: string;
+    incidentId: string;
+    code: string;
+  }): Promise<boolean> {
+    if (!this.onTurnFailure || !this.acceptingAgentRegistrations) return false;
+    const record = input.agentId
+      ? (this.getAgent(input.agentId) ?? (await this.registry?.get(input.agentId)))
+      : null;
+    if (input.agentId && !record) return false;
+    const agentId =
+      record?.labels?.[CONVERSATION_FAMILY_CURRENT_LABEL] || record?.id || "service:paseo-client";
+    const key = input.code === "subagent_failed" ? input.incidentId : `${agentId}:${input.code}`;
+    const now = Date.now();
+    if (now - (this.diagnosticLastAt.get(key) ?? 0) < 300_000) return true;
+    await this.onTurnFailure({
+      agentId,
+      turnId: input.incidentId,
+      provider: record?.provider || "system",
+      code: input.code,
+      failureKind: input.code.startsWith("client_") ? "client_failure" : input.code,
+    });
+    this.diagnosticLastAt.set(key, now);
+    this.trimDiagnosticHistory(now);
+    return true;
+  }
+
+  private trimDiagnosticHistory(now: number): void {
+    if (this.diagnosticLastAt.size > 2000) {
+      for (const [oldKey, timestamp] of this.diagnosticLastAt)
+        if (now - timestamp >= 300_000) this.diagnosticLastAt.delete(oldKey);
+    }
   }
 
   async listImportableSessions(
@@ -1094,7 +1697,9 @@ export class AgentManager {
   }
 
   async listDraftCommands(config: AgentSessionConfig): Promise<AgentSlashCommand[]> {
-    const normalizedConfig = await this.normalizeConfig(config, { resolveDefaultModel: false });
+    const normalizedConfig = await this.normalizeConfig(config, {
+      resolveDefaultModel: false,
+    });
     const client = this.requireClient(normalizedConfig.provider);
     if (!normalizedConfig.model) {
       return [];
@@ -1131,7 +1736,9 @@ export class AgentManager {
   }
 
   async listDraftFeatures(config: AgentSessionConfig): Promise<AgentFeature[]> {
-    const normalizedConfig = await this.normalizeConfig(config, { resolveDefaultModel: false });
+    const normalizedConfig = await this.normalizeConfig(config, {
+      resolveDefaultModel: false,
+    });
     const client = this.requireClient(normalizedConfig.provider);
     if (!normalizedConfig.model && !client.listFeatures) {
       return [];
@@ -1189,9 +1796,496 @@ export class AgentManager {
     return this.timelineStore.getRows(id);
   }
 
+  /**
+   * Ensure an unrecoverable native conversation has one fresh writable continuation.
+   * The durable predecessor marker is the idempotency key across daemon restarts.
+   */
+  async ensureAgentFailureContinuation(
+    agentId: string,
+    failureKind: ConversationRolloverFailureKind,
+    persistedFailureText?: string,
+  ): Promise<string | null> {
+    const existing = this.conversationRollovers.get(agentId);
+    if (existing) {
+      return existing;
+    }
+    const record = await this.requireRegistry().get(agentId);
+    if (!record) return null;
+    const familyKey = record.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim() || agentId;
+    const rollover = this.runConversationFamilyMutation(familyKey, () =>
+      this.ensureAgentFailureContinuationUnlocked(agentId, failureKind, persistedFailureText),
+    );
+    this.conversationRollovers.set(agentId, rollover);
+    try {
+      return await rollover;
+    } finally {
+      if (this.conversationRollovers.get(agentId) === rollover) {
+        this.conversationRollovers.delete(agentId);
+      }
+    }
+  }
+
+  private async ensureAgentFailureContinuationUnlocked(
+    agentId: string,
+    failureKind: ConversationRolloverFailureKind,
+    persistedFailureText?: string,
+  ): Promise<string | null> {
+    const registry = this.requireRegistry();
+    const records = await registry.list();
+    const predecessor = records.find((record) => record.id === agentId);
+    if (!predecessor) {
+      return null;
+    }
+    const priorSuccessor = findConversationSuccessor(records, agentId);
+    if (predecessor.archivedAt) {
+      return priorSuccessor?.id ?? null;
+    }
+    if (priorSuccessor) {
+      await this.repairConversationFamily(agentId, priorSuccessor.id);
+      return priorSuccessor.id;
+    }
+
+    const latestError =
+      persistedFailureText ?? this.agents.get(agentId)?.lastError ?? predecessor.lastError;
+    const liveFailureKind = this.agents.get(agentId)?.lastFailureKind;
+    if (
+      !isEligibleConversationPredecessor(
+        predecessor,
+        agentId,
+        failureKind,
+        latestError,
+        liveFailureKind,
+      )
+    ) {
+      return null;
+    }
+    const rows = await this.getConversationFamilyRolloverTimelineRows(records, predecessor);
+    const continuationRequest =
+      latestSubstantiveUserRequest(rows) ?? inheritedConversationRequest(records, predecessor);
+    const prompt = buildAgentFreshSessionContinuationPrompt({
+      rows,
+      failureKind,
+      outstandingRequest: continuationRequest,
+    });
+    if (!prompt) {
+      this.logger.warn(
+        { agentId },
+        "Fresh conversation continuation was not created because no bounded handoff was safe",
+      );
+      return null;
+    }
+
+    const successorId = this.idFactory();
+    const { familyName, labels } = buildConversationSuccessorMetadata(
+      records,
+      predecessor,
+      successorId,
+      failureKind,
+    );
+    const familyId = labels[CONVERSATION_FAMILY_ID_LABEL]!;
+    const familyMembers = records.filter(
+      (record) =>
+        record.id === predecessor.id || record.labels?.[CONVERSATION_FAMILY_ID_LABEL] === familyId,
+    );
+    const automaticRolloverState = await this.reserveConversationRolloverBudget(
+      familyId,
+      familyMembers,
+      agentId,
+    );
+    if (!automaticRolloverState) {
+      return null;
+    }
+    labels[CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL] = String(automaticRolloverState.epoch);
+    labels[CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL] =
+      automaticRolloverState.windowStartedAt!.toISOString();
+    labels[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL] = String(automaticRolloverState.count);
+    delete labels[CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL];
+    const successor = await this.createAgent(buildStoredAgentConfig(predecessor), successorId, {
+      labels,
+      initialTitle: familyName,
+      workspaceId: predecessor.workspaceId,
+      owner: predecessor.owner,
+    });
+
+    if (continuationRequest) {
+      const successorRecord = await registry.get(successor.id);
+      if (!successorRecord) {
+        throw new Error("Conversation rollover successor is missing from storage");
+      }
+      await registry.upsert({ ...successorRecord, continuationRequest });
+    }
+
+    await this.repairConversationFamily(agentId, successor.id);
+
+    const continuation = this.consumeFreshSessionContinuation(successor.id, prompt);
+    this.trackBackgroundTask(continuation);
+    return successor.id;
+  }
+
+  /**
+   * Reserve recovery before creating a successor. The family-wide labels are
+   * the restart-safe circuit breaker; an interrupted repair chooses the most
+   * restrictive active state rather than granting another automatic attempt.
+   */
+  private async reserveConversationRolloverBudget(
+    familyId: string,
+    familyMembers: readonly StoredAgentRecord[],
+    agentId: string,
+  ): Promise<ConversationRolloverState | null> {
+    const now = new Date();
+    const currentState = readConversationRolloverState(familyMembers, now);
+    if (isConversationFamilyDurablyParked(familyMembers)) {
+      this.logger.warn(
+        {
+          agentId,
+          familyId,
+          count: currentState.count,
+          limit: AUTOMATIC_CONVERSATION_ROLLOVER_LIMIT,
+        },
+        "Conversation rollover family remains parked pending explicit user retry",
+      );
+      return null;
+    }
+    if (currentState.count >= AUTOMATIC_CONVERSATION_ROLLOVER_LIMIT) {
+      const parkedState: ConversationRolloverState = {
+        ...currentState,
+        epoch: currentState.epoch + 1,
+        parked: true,
+      };
+      for (const member of familyMembers) {
+        await this.writeLabels(member.id, conversationRolloverStatePatch(parkedState));
+      }
+      this.logger.warn(
+        {
+          agentId,
+          familyId,
+          count: parkedState.count,
+          limit: AUTOMATIC_CONVERSATION_ROLLOVER_LIMIT,
+        },
+        "Conversation rollover budget exhausted; leaving the current conversation failed",
+      );
+      return null;
+    }
+    const nextState: ConversationRolloverState = {
+      epoch: currentState.epoch + 1,
+      count: currentState.count + 1,
+      windowStartedAt: currentState.windowStartedAt ?? now,
+      parked: false,
+    };
+    for (const member of familyMembers) {
+      await this.writeLabels(member.id, conversationRolloverStatePatch(nextState));
+    }
+    return nextState;
+  }
+
+  private async resetConversationRolloverBudget(params: {
+    agentId: string;
+    familyId: string;
+    expectedEpoch: number;
+    turnId: string;
+  }): Promise<void> {
+    await this.runConversationFamilyMutation(params.familyId, async () => {
+      const records = await this.requireRegistry().list();
+      const familyMembers = records.filter(
+        (record) => record.labels?.[CONVERSATION_FAMILY_ID_LABEL] === params.familyId,
+      );
+      const current = familyMembers.find((member) => member.id === params.agentId);
+      if (
+        !current ||
+        current.archivedAt ||
+        current.labels?.[CONVERSATION_FAMILY_CURRENT_LABEL] !== params.agentId ||
+        current.labels?.[CONVERSATION_FAMILY_HIDDEN_LABEL] === "true"
+      ) {
+        return;
+      }
+      const state = readConversationRolloverState(familyMembers, new Date());
+      if (state.epoch !== params.expectedEpoch || state.count === 0) return;
+      if (
+        !hasSubstantiveAssistantReply(this.timelineStore.getRows(params.agentId), params.turnId)
+      ) {
+        return;
+      }
+      const resetState: ConversationRolloverState = {
+        epoch: state.epoch + 1,
+        count: 0,
+        windowStartedAt: null,
+        parked: false,
+      };
+      for (const member of familyMembers) {
+        await this.writeLabels(member.id, conversationRolloverStatePatch(resetState));
+      }
+    });
+  }
+
+  /**
+   * A new user prompt is an explicit decision to retry a family that automatic
+   * recovery parked. Start that prompt on a fresh native session, never on the
+   * session whose repeated failures exhausted the budget.
+   */
+  async prepareAgentPromptTarget(agentId: string): Promise<string> {
+    const registry = this.requireRegistry();
+    const initialRecord = await registry.get(agentId);
+    if (!initialRecord) return agentId;
+    const familyId = initialRecord.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim();
+    if (!familyId) return agentId;
+
+    return await this.runConversationFamilyMutation(familyId, async () => {
+      const records = await registry.list();
+      const requested = records.find((record) => record.id === agentId);
+      if (!requested) return agentId;
+      const currentId =
+        requested.labels?.[CONVERSATION_FAMILY_CURRENT_LABEL]?.trim() || requested.id;
+      const current = records.find((record) => record.id === currentId) ?? requested;
+      const familyMembers = records.filter(
+        (record) =>
+          record.id === current.id || record.labels?.[CONVERSATION_FAMILY_ID_LABEL] === familyId,
+      );
+      const priorSuccessor = findConversationSuccessor(records, current.id);
+      if (priorSuccessor) {
+        await this.repairConversationFamily(current.id, priorSuccessor.id);
+        return priorSuccessor.id;
+      }
+
+      const state = readConversationRolloverState(familyMembers, new Date());
+      if (!isConversationFamilyDurablyParked(familyMembers)) return current.id;
+
+      const successorId = this.idFactory();
+      const fallbackFailureKind: ConversationRolloverFailureKind = "conversation_unresolved";
+      const { familyName, labels } = buildConversationSuccessorMetadata(
+        records,
+        current,
+        successorId,
+        isConversationRolloverFailureKind(current.lastFailureKind)
+          ? current.lastFailureKind
+          : fallbackFailureKind,
+      );
+      const resetState: ConversationRolloverState = {
+        epoch: state.epoch + 1,
+        count: 0,
+        windowStartedAt: null,
+        parked: false,
+      };
+      labels[CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL] = String(resetState.epoch);
+      delete labels[CONVERSATION_FAMILY_ROLLOVER_WINDOW_STARTED_AT_LABEL];
+      delete labels[CONVERSATION_FAMILY_ROLLOVER_COUNT_LABEL];
+      delete labels[CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL];
+
+      const successor = await this.createAgent(buildStoredAgentConfig(current), successorId, {
+        labels,
+        initialTitle: familyName,
+        workspaceId: current.workspaceId,
+        owner: current.owner,
+      });
+      if (current.continuationRequest) {
+        const successorRecord = await registry.get(successor.id);
+        if (!successorRecord) {
+          throw new Error("Explicit conversation retry successor is missing from storage");
+        }
+        await registry.upsert({
+          ...successorRecord,
+          continuationRequest: current.continuationRequest,
+        });
+      }
+      await this.repairConversationFamily(current.id, successor.id);
+      const repairedFamily = (await registry.list()).filter(
+        (record) => record.labels?.[CONVERSATION_FAMILY_ID_LABEL] === familyId,
+      );
+      for (const member of repairedFamily) {
+        await this.writeLabels(member.id, conversationRolloverStatePatch(resetState));
+      }
+      this.logger.info(
+        { agentId: current.id, successorId: successor.id, familyId },
+        "Started explicit retry on a fresh conversation family member",
+      );
+      return successor.id;
+    });
+  }
+
+  /**
+   * Resolve the current family member and perform prompt admission while the
+   * same family mutation lane used by explicit retry and FIFO transfer is held.
+   * This prevents a system notification from enqueueing on a predecessor
+   * after an explicit retry has moved the family to a fresh canonical member.
+   */
+  async withConversationFamilyPromptTarget<T>(
+    agentId: string,
+    operation: (targetAgentId: string, recoveryParked: boolean) => Promise<T>,
+  ): Promise<T> {
+    const registry = this.requireRegistry();
+    const initial = await registry.get(agentId);
+    if (!initial) return await operation(agentId, false);
+    const familyId = initial.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim();
+    if (!familyId) {
+      return await operation(
+        agentId,
+        initial.labels?.[CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL] === "true",
+      );
+    }
+
+    return await this.runConversationFamilyMutation(familyId, async () => {
+      const records = await registry.list();
+      const requested = records.find((record) => record.id === agentId) ?? initial;
+      const currentId =
+        requested.labels?.[CONVERSATION_FAMILY_CURRENT_LABEL]?.trim() || requested.id;
+      const current = records.find((record) => record.id === currentId) ?? requested;
+      const familyMembers = records.filter(
+        (record) => record.labels?.[CONVERSATION_FAMILY_ID_LABEL] === familyId,
+      );
+      return await operation(current.id, isConversationFamilyDurablyParked(familyMembers));
+    });
+  }
+
+  async isAgentPromptRecoveryParked(agentId: string): Promise<boolean> {
+    const records = await this.requireRegistry().list();
+    const requested = records.find((record) => record.id === agentId);
+    if (!requested) return false;
+    const familyId = requested.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim();
+    if (!familyId) {
+      return requested.labels?.[CONVERSATION_FAMILY_ROLLOVER_PARKED_LABEL] === "true";
+    }
+    const familyMembers = records.filter(
+      (record) => record.labels?.[CONVERSATION_FAMILY_ID_LABEL] === familyId,
+    );
+    return isConversationFamilyDurablyParked(familyMembers);
+  }
+
+  private async getConversationFamilyRolloverTimelineRows(
+    records: readonly StoredAgentRecord[],
+    failedMember: StoredAgentRecord,
+  ): Promise<readonly AgentTimelineRow[]> {
+    const familyId = failedMember.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim();
+    if (!familyId) {
+      return await this.getConversationMemberRolloverTimelineRows(failedMember.id);
+    }
+
+    const recordById = new Map(records.map((record) => [record.id, record]));
+    const members: StoredAgentRecord[] = [];
+    const visited = new Set<string>();
+    let cursorMember: StoredAgentRecord | undefined = failedMember;
+    while (
+      cursorMember &&
+      !visited.has(cursorMember.id) &&
+      cursorMember.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim() === familyId
+    ) {
+      visited.add(cursorMember.id);
+      members.unshift(cursorMember);
+      const predecessorId = cursorMember.labels?.[CONVERSATION_FAMILY_PREDECESSOR_LABEL]?.trim();
+      cursorMember = predecessorId ? recordById.get(predecessorId) : undefined;
+    }
+
+    const familySegments: AgentTimelineRow[][] = [];
+    for (let index = members.length - 1; index >= 0; index -= 1) {
+      const member = members[index];
+      if (!member) continue;
+      const rows = [...(await this.getConversationMemberRolloverTimelineRows(member.id))];
+      familySegments.unshift(rows);
+      if (
+        rows.some(
+          (row) =>
+            row.item.type === "user_message" &&
+            row.item.text.trim().length > 0 &&
+            !isSystemInjectedEnvelope(row.item.text),
+        )
+      ) {
+        break;
+      }
+    }
+    const familyRows = familySegments.flat();
+    return familyRows.map((row, index) => Object.assign({}, row, { seq: index + 1 }));
+  }
+
+  private async getConversationMemberRolloverTimelineRows(
+    agentId: string,
+  ): Promise<readonly AgentTimelineRow[]> {
+    if (this.agents.has(agentId)) {
+      return this.timelineStore.getRows(agentId);
+    }
+    return this.durableTimelineStore?.getCommittedRows(agentId) ?? [];
+  }
+
+  private async repairConversationFamily(
+    predecessorId: string,
+    successorId: string,
+  ): Promise<void> {
+    const records = await this.requireRegistry().list();
+    const predecessor = records.find((record) => record.id === predecessorId);
+    const successor = records.find((record) => record.id === successorId);
+    if (!predecessor || !successor) {
+      throw new Error("Conversation rollover family members are missing from storage");
+    }
+    const familyId =
+      successor.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim() ||
+      predecessor.labels?.[CONVERSATION_FAMILY_ID_LABEL]?.trim();
+    if (!familyId) {
+      throw new Error("Conversation rollover successor has no conversation family id");
+    }
+    const familyName =
+      successor.labels?.[CONVERSATION_FAMILY_NAME_LABEL]?.trim() ||
+      predecessor.labels?.[CONVERSATION_FAMILY_NAME_LABEL]?.trim() ||
+      predecessor.title?.trim() ||
+      "Conversation";
+    const familyMembers = records.filter(
+      (record) =>
+        record.id === predecessorId ||
+        record.id === successorId ||
+        record.labels?.[CONVERSATION_FAMILY_ID_LABEL] === familyId,
+    );
+    for (const member of familyMembers) {
+      await this.writeLabels(member.id, {
+        [CONVERSATION_FAMILY_ID_LABEL]: familyId,
+        [CONVERSATION_FAMILY_CURRENT_LABEL]: successorId,
+        [CONVERSATION_FAMILY_NAME_LABEL]: familyName,
+        [CONVERSATION_FAMILY_POSITION_LABEL]: String(
+          parseFamilyPosition(member.labels?.[CONVERSATION_FAMILY_POSITION_LABEL]),
+        ),
+      });
+    }
+    await this.requireRegistry().transferPendingPrompts(predecessorId, successorId);
+    await this.archiveConversationPredecessor(predecessorId);
+  }
+
+  private async archiveConversationPredecessor(agentId: string): Promise<void> {
+    await this.runLifecycleMutation(agentId, async () => {
+      // closeAgent takes this same lifecycle lane, so close the runtime directly.
+      if (this.agents.has(agentId)) {
+        await this.closeAgentRuntime(agentId);
+      }
+      const record = await this.requireRegistry().get(agentId);
+      if (!record || record.archivedAt) {
+        return;
+      }
+      await this.markRecordArchived(record);
+      this.discardRetainedAgentState(agentId);
+    });
+  }
+
+  private async consumeFreshSessionContinuation(agentId: string, prompt: string): Promise<void> {
+    try {
+      let completed = false;
+      for await (const event of this.streamAgent(agentId, prompt)) {
+        // Consuming the stream owns the foreground run; events are persisted by AgentManager.
+        if (event.type === "turn_completed") completed = true;
+      }
+      if (completed) {
+        await this.drainStoredPendingPrompts(agentId);
+      }
+    } catch (error) {
+      this.logger.error({ err: error, agentId }, "Fresh conversation continuation failed");
+    }
+  }
+
   fetchTimeline(id: string, options?: AgentTimelineFetchOptions): AgentTimelineFetchResult {
     this.requireAgent(id);
     return this.timelineStore.fetch(id, options);
+  }
+
+  announceTimelineReplacement(agentId: string): void {
+    this.requireAgent(agentId);
+    this.dispatch({
+      type: "timeline_replacement",
+      agentId,
+      epoch: this.timelineStore.getEpoch(agentId),
+    });
   }
 
   listProviderSubagents(parentAgentId: string): ProviderSubagentDescriptor[] {
@@ -1309,6 +2403,9 @@ export class AgentManager {
       labels?: Record<string, string>;
       workspaceId?: string;
       owner?: AgentOwner;
+      lastUsage?: AgentUsage;
+      lastError?: string;
+      lastFailureKind?: ConversationRolloverFailureKind;
       attention?: AttentionState;
     },
     resumeOptions?: AgentResumeSessionOptions,
@@ -1341,6 +2438,9 @@ export class AgentManager {
       labels?: Record<string, string>;
       workspaceId?: string;
       owner?: AgentOwner;
+      lastUsage?: AgentUsage;
+      lastError?: string;
+      lastFailureKind?: ConversationRolloverFailureKind;
       attention?: AttentionState;
     },
     resumeOptions?: AgentResumeSessionOptions,
@@ -1427,7 +2527,9 @@ export class AgentManager {
     const resolvedAgentId = validateAgentId(this.idFactory(), "importProviderSession");
     this.requireEnabledProvider(input.provider);
 
-    const client = await this.requireAvailableClient({ provider: input.provider });
+    const client = await this.requireAvailableClient({
+      provider: input.provider,
+    });
     if (!client.importSession) {
       throw new Error(`Provider '${input.provider}' does not support importing sessions`);
     }
@@ -1496,7 +2598,10 @@ export class AgentManager {
   reloadAgentSession(
     agentId: string,
     overrides?: Partial<AgentSessionConfig>,
-    options?: { rehydrateFromDisk?: boolean },
+    options?: {
+      rehydrateFromDisk?: boolean;
+      broadcastProviderSubagentReset?: boolean;
+    },
   ): Promise<ManagedAgent> {
     return this.trackAgentRegistrationOperation(
       this.runLifecycleMutation(agentId, () =>
@@ -1505,10 +2610,26 @@ export class AgentManager {
     );
   }
 
+  /**
+   * Wipe the in-memory timeline so registerSession mints a new epoch and
+   * hydrateTimelineFromProvider reconstructs the freshly read provider history.
+   */
+  private resetTimelineForRehydrate(agentId: string, broadcastSubagentReset: boolean): void {
+    this.timelineStore.delete(agentId);
+    for (const event of this.providerSubagents.deleteParent(agentId)) {
+      if (broadcastSubagentReset) {
+        this.dispatch({ type: "provider_subagent", event });
+      }
+    }
+  }
+
   private async reloadAgentSessionInternal(
     agentId: string,
     overrides?: Partial<AgentSessionConfig>,
-    options?: { rehydrateFromDisk?: boolean },
+    options?: {
+      rehydrateFromDisk?: boolean;
+      broadcastProviderSubagentReset?: boolean;
+    },
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     let existing = this.requireSessionAgent(agentId);
@@ -1520,6 +2641,7 @@ export class AgentManager {
     const preservedHistoryPrimed = existing.historyPrimed;
     const preservedLastUsage = existing.lastUsage;
     const preservedLastError = existing.lastError;
+    const preservedLastFailureKind = existing.lastFailureKind;
     const preservedAttention = existing.attention;
     const handle = existing.persistence;
     const provider = handle?.provider ?? existing.provider;
@@ -1571,12 +2693,7 @@ export class AgentManager {
       this.assertAcceptingAgentRegistrations();
 
       if (rehydrateFromDisk) {
-        // Wipe the in-memory timeline so registerSession mints a new epoch and
-        // hydrateTimelineFromProvider re-streams the freshly read provider history.
-        this.timelineStore.delete(agentId);
-        for (const event of this.providerSubagents.deleteParent(agentId)) {
-          this.dispatch({ type: "provider_subagent", event });
-        }
+        this.resetTimelineForRehydrate(agentId, options?.broadcastProviderSubagentReset !== false);
       }
 
       // Preserve existing labels and timeline during reload.
@@ -1591,6 +2708,7 @@ export class AgentManager {
         historyPrimed: rehydrateFromDisk ? false : preservedHistoryPrimed,
         lastUsage: preservedLastUsage,
         lastError: preservedLastError,
+        lastFailureKind: preservedLastFailureKind,
         attention: preservedAttention,
         restoring: true,
       });
@@ -1707,7 +2825,15 @@ export class AgentManager {
     await this.drainSessionEvents(agentId);
     // Retain ownership until shutdown succeeds. A failed close may still own a
     // native writer, so publishing a resumable closed snapshot would orphan it.
-    await agent.session.close();
+    // The session stays subscribed meanwhile, so mark the close as controlled:
+    // the provider exit it causes must not notify as a turn failure.
+    this.controlledCloseAgentIds.add(agentId);
+    try {
+      await agent.session.close();
+      await this.drainSessionEvents(agentId);
+    } finally {
+      this.controlledCloseAgentIds.delete(agentId);
+    }
     this.cancelRunningProviderSubagents(agentId);
     const closedAgent = this.prepareAgentForClosure(agent, "agent closed");
 
@@ -1904,8 +3030,9 @@ export class AgentManager {
         persistence: record.persistence ?? null,
         historyPrimed: true,
         lastUserMessageAt: record.lastUserMessageAt ? new Date(record.lastUserMessageAt) : null,
-        lastUsage: undefined,
+        lastUsage: record.lastUsage,
         lastError: record.lastError ?? undefined,
+        lastFailureKind: record.lastFailureKind ?? undefined,
         attention,
         internal: record.internal,
         labels: record.labels,
@@ -1990,7 +3117,10 @@ export class AgentManager {
 
     await agent.session.setFeature(featureId, value);
     await this.drainSessionEvents(agentId);
-    agent.config.featureValues = { ...agent.config.featureValues, [featureId]: value };
+    agent.config.featureValues = {
+      ...agent.config.featureValues,
+      [featureId]: value,
+    };
     this.touchUpdatedAt(agent);
     this.emitState(agent);
   }
@@ -2031,7 +3161,9 @@ export class AgentManager {
       return { record, live: true };
     }
 
-    const nextRecord = await this.writeStoredMetadata(agentId, { labels: patch });
+    const nextRecord = await this.writeStoredMetadata(agentId, {
+      labels: patch,
+    });
     return { record: nextRecord, live: false };
   }
 
@@ -2304,6 +3436,26 @@ export class AgentManager {
     return result;
   }
 
+  private async runConversationFamilyMutation<T>(
+    familyKey: string,
+    mutation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = this.conversationFamilyMutationTails.get(familyKey) ?? Promise.resolve();
+    const run = previous.catch(() => undefined).then(mutation);
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.conversationFamilyMutationTails.set(familyKey, tail);
+    try {
+      return await run;
+    } finally {
+      if (this.conversationFamilyMutationTails.get(familyKey) === tail) {
+        this.conversationFamilyMutationTails.delete(familyKey);
+      }
+    }
+  }
+
   async runAgent(
     agentId: string,
     prompt: AgentPromptInput,
@@ -2373,7 +3525,9 @@ export class AgentManager {
         });
         return;
       }
-      this.dispatchStream(agent.id, event, { timestamp: new Date().toISOString() });
+      this.dispatchStream(agent.id, event, {
+        timestamp: new Date().toISOString(),
+      });
     };
     void (async () => {
       try {
@@ -2502,12 +3656,14 @@ export class AgentManager {
     const agent = existingAgent;
     const isReplacement = agent.pendingReplacement;
     agent.lastError = undefined;
+    agent.lastFailureKind = undefined;
 
     const pendingRun = this.runs.createPendingRun(agentId);
 
     const streamForwarder = async function* streamForwarder(this: AgentManager) {
       let turnId: string;
       let turnStream: ReturnType<AgentRunState["createTurnStream"]> | null = null;
+      let conversationRollover = false;
       turnId = await this.startPendingForegroundTurn({
         agent,
         agentId,
@@ -2583,6 +3739,12 @@ export class AgentManager {
         };
         yield acceptedTurnStartedEvent;
         for await (const event of turnStream.events(isTurnTerminalEvent)) {
+          if (
+            event.type === "turn_failed" &&
+            isConversationRolloverFailureKind(event.failureKind)
+          ) {
+            conversationRollover = true;
+          }
           yield event;
         }
       } finally {
@@ -2592,6 +3754,17 @@ export class AgentManager {
         this.runs.settleForegroundRun(agentId, pendingRun.token);
         if (!agent.activeForegroundTurnId) {
           await this.refreshRuntimeInfo(agent);
+        }
+        if (!conversationRollover) {
+          // Do not await: a queue-owned run is itself holding the drain task.
+          // Its loop advances after this generator settles; direct runs need a
+          // fresh drain task so messages queued behind them cannot be stranded.
+          void this.drainStoredPendingPrompts(agentId).catch((error) => {
+            this.logger.error(
+              { err: error, agentId },
+              "Failed to drain prompts after foreground turn settled",
+            );
+          });
         }
       }
     }.call(this);
@@ -2620,7 +3793,10 @@ export class AgentManager {
     const persistenceHandle =
       mutableAgent.session.describePersistence() ??
       (mutableAgent.runtimeInfo?.sessionId
-        ? { provider: mutableAgent.provider, sessionId: mutableAgent.runtimeInfo.sessionId }
+        ? {
+            provider: mutableAgent.provider,
+            sessionId: mutableAgent.runtimeInfo.sessionId,
+          }
         : null);
     if (persistenceHandle) {
       mutableAgent.persistence = attachPersistenceCwd(persistenceHandle, mutableAgent.cwd);
@@ -2997,7 +4173,9 @@ export class AgentManager {
       const bufferedResolution = agent.bufferedPermissionResolutions.get(requestId);
       if (bufferedResolution) {
         agent.bufferedPermissionResolutions.delete(requestId);
-        this.dispatchStream(agent.id, bufferedResolution, { timestamp: new Date().toISOString() });
+        this.dispatchStream(agent.id, bufferedResolution, {
+          timestamp: new Date().toISOString(),
+        });
       }
 
       return result;
@@ -3159,7 +4337,10 @@ export class AgentManager {
         { agentId, provider: agent.provider, messageId, mode },
         "agent.rewind.start",
       );
-      await invokeRewindCapability(agent.session, { messageId: providerMessageId, mode });
+      await invokeRewindCapability(agent.session, {
+        messageId: providerMessageId,
+        mode,
+      });
       if (mode !== "files") {
         await this.hydrateTimelineFromProvider(agentId, {
           force: true,
@@ -3446,6 +4627,7 @@ export class AgentManager {
       historyPrimed?: boolean;
       lastUsage?: AgentUsage;
       lastError?: string;
+      lastFailureKind?: ConversationRolloverFailureKind;
       attention?: AttentionState;
       /**
        * Bringing a known agent back, rather than starting a new one. Its timestamps and
@@ -3609,6 +4791,7 @@ export class AgentManager {
           historyPrimed?: boolean;
           lastUsage?: AgentUsage;
           lastError?: string;
+          lastFailureKind?: ConversationRolloverFailureKind;
           attention?: AttentionState;
           persistence?: AgentPersistenceHandle;
           workspaceId?: string;
@@ -3650,6 +4833,7 @@ export class AgentManager {
       lastUserMessageAt: options?.lastUserMessageAt ?? null,
       lastUsage: options?.lastUsage,
       lastError: options?.lastError,
+      lastFailureKind: options?.lastFailureKind,
       attention: resolveInitialAttention(options?.attention),
       internal: config.internal ?? false,
       labels: options?.labels ?? {},
@@ -3810,8 +4994,23 @@ export class AgentManager {
     event: AgentStreamEvent,
   ): Promise<void> {
     if (event.type === "provider_subagent") {
+      const previous = this.providerSubagents.get(agent.id, event.event.id);
       const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
       this.dispatch({ type: "provider_subagent", event: update });
+      if (
+        update.type === "upsert" &&
+        update.subagent.status === "failed" &&
+        previous?.status !== "failed" &&
+        !this.controlledCloseAgentIds.has(agent.id) &&
+        (!agent.labels?.[CONVERSATION_FAMILY_CURRENT_LABEL] ||
+          agent.labels[CONVERSATION_FAMILY_CURRENT_LABEL] === agent.id)
+      ) {
+        await this.reportDiagnosticIncident({
+          agentId: agent.id,
+          code: "subagent_failed",
+          incidentId: `subagent:${agent.persistence?.sessionId || agent.id}:${update.subagent.id}`,
+        });
+      }
       return;
     }
     const turnId = getAgentStreamEventTurnId(event);
@@ -3988,7 +5187,9 @@ export class AgentManager {
     this.agentStreamCoalescer.flushAndDiscard(agent.id);
     await this.deleteCommittedTimeline(agent.id);
     this.timelineStore.delete(agent.id);
-    this.timelineStore.initialize(agent.id, { timestamp: new Date().toISOString() });
+    this.timelineStore.initialize(agent.id, {
+      timestamp: new Date().toISOString(),
+    });
     agent.historyPrimed = true;
 
     for (const event of this.providerSubagents.deleteParent(agent.id)) {
@@ -4164,7 +5365,10 @@ export class AgentManager {
       );
     }
 
-    const flags: StreamEventFlags = { shouldDispatchEvent: true, shouldNotifyWaiters: true };
+    const flags: StreamEventFlags = {
+      shouldDispatchEvent: true,
+      shouldNotifyWaiters: true,
+    };
 
     const dispatchPromise = this.dispatchStreamEventByType({
       agent,
@@ -4188,13 +5392,47 @@ export class AgentManager {
       }
 
       if (flags.shouldDispatchEvent) {
-        this.dispatchStream(agent.id, event, { timestamp: new Date().toISOString() });
+        this.dispatchStream(agent.id, event, {
+          timestamp: new Date().toISOString(),
+        });
       }
     }
 
     this.traceHandleStreamEventEnd(agent, event, eventTurnId, flags);
 
+    this.scheduleConversationContinuation(
+      agent,
+      event,
+      options?.fromHistory === true,
+      terminalDisposition,
+    );
+
     return flags.shouldNotifyWaiters;
+  }
+
+  private scheduleConversationContinuation(
+    agent: ActiveManagedAgent,
+    event: AgentStreamEvent,
+    fromHistory: boolean,
+    terminalDisposition: ActiveTurnTerminalDisposition,
+  ): void {
+    if (
+      this.acceptingAgentRegistrations &&
+      !fromHistory &&
+      event.type === "turn_failed" &&
+      isConversationRolloverFailureKind(event.failureKind) &&
+      terminalDisposition !== "stale"
+    ) {
+      const rollover = this.ensureAgentFailureContinuation(agent.id, event.failureKind)
+        .then(() => undefined)
+        .catch((error) => {
+          this.logger.error(
+            { err: error, agentId: agent.id },
+            "Failed to create fresh conversation continuation",
+          );
+        });
+      this.trackBackgroundTask(rollover);
+    }
   }
 
   private traceHandleStreamEventStart(
@@ -4280,7 +5518,10 @@ export class AgentManager {
         agent.currentModeId = event.currentModeId;
         agent.availableModes = event.availableModes;
         if (agent.runtimeInfo) {
-          agent.runtimeInfo = { ...agent.runtimeInfo, modeId: event.currentModeId };
+          agent.runtimeInfo = {
+            ...agent.runtimeInfo,
+            modeId: event.currentModeId,
+          };
         }
         flags.shouldDispatchEvent = false;
         this.emitState(agent);
@@ -4289,7 +5530,10 @@ export class AgentManager {
         agent.runtimeInfo = event.runtimeInfo;
         if (!agent.persistence && event.runtimeInfo.sessionId) {
           agent.persistence = attachPersistenceCwd(
-            { provider: agent.provider, sessionId: event.runtimeInfo.sessionId },
+            {
+              provider: agent.provider,
+              sessionId: event.runtimeInfo.sessionId,
+            },
             agent.cwd,
           );
         }
@@ -4339,7 +5583,12 @@ export class AgentManager {
         });
         return undefined;
       case "turn_started":
-        this.onStreamTurnStarted({ agent, eventTurnId, isForegroundEvent, flags });
+        this.onStreamTurnStarted({
+          agent,
+          eventTurnId,
+          isForegroundEvent,
+          flags,
+        });
         return undefined;
       case "permission_requested":
         this.onStreamPermissionRequested(agent, event);
@@ -4439,6 +5688,29 @@ export class AgentManager {
     // data accumulated during streaming isn't lost when the provider omits
     // it from the completion event.
     agent.lastError = undefined;
+    agent.lastFailureKind = undefined;
+    const familyId = agent.labels[CONVERSATION_FAMILY_ID_LABEL]?.trim();
+    if (
+      familyId &&
+      event.provider === agent.provider &&
+      event.outputProvenance === "provider" &&
+      eventTurnId
+    ) {
+      const reset = this.resetConversationRolloverBudget({
+        agentId: agent.id,
+        familyId,
+        expectedEpoch: parseAutomaticRolloverEpoch(
+          agent.labels[CONVERSATION_FAMILY_ROLLOVER_EPOCH_LABEL],
+        ),
+        turnId: eventTurnId,
+      }).catch((error) => {
+        this.logger.error(
+          { err: error, agentId: agent.id },
+          "Failed to reset conversation rollover budget after clean completion",
+        );
+      });
+      this.trackBackgroundTask(reset);
+    }
     if (
       !isForegroundEvent &&
       !agent.activeForegroundTurnId &&
@@ -4475,11 +5747,46 @@ export class AgentManager {
       },
       "handleStreamEvent: turn_failed",
     );
+    if (
+      agent.lastFailureKind !== undefined &&
+      event.failureKind === undefined &&
+      isProviderTeardownFailure(event.error)
+    ) {
+      // The supervisor can signal a provider subprocess a few milliseconds
+      // before the worker enters prepareForShutdown(). A synthetic SIGTERM
+      // failure from that race must not replace an earlier durable rollover
+      // failure, or startup reconciliation will no longer know the native
+      // conversation is poisoned and needs a fresh family member.
+      this.logger.info(
+        {
+          agentId: agent.id,
+          provider: agent.provider,
+          eventTurnId,
+          preservedFailureKind: agent.lastFailureKind,
+        },
+        "Ignoring provider teardown failure that would replace a durable conversation failure",
+      );
+      return;
+    }
+    if (!this.acceptingAgentRegistrations) {
+      // Provider runtimes can emit a synthetic failure while closeAllAgents is
+      // terminating their subprocesses. That event is not a user turn and
+      // must not overwrite a durable failure classification that startup
+      // reconciliation still needs after an upgrade or daemon restart.
+      this.logger.info(
+        { agentId: agent.id, provider: agent.provider, eventTurnId },
+        "Ignoring provider turn failure during agent manager shutdown",
+      );
+      return;
+    }
     if (terminalDisposition === "stale") return;
     if (!isForegroundEvent && !agent.activeForegroundTurnId) {
       agent.lifecycle = "error";
     }
     agent.lastError = event.error;
+    agent.lastFailureKind = isConversationRolloverFailureKind(event.failureKind)
+      ? event.failureKind
+      : undefined;
     await this.appendSystemErrorTimelineMessage(
       agent,
       event.provider,
@@ -4487,8 +5794,36 @@ export class AgentManager {
       options,
     );
     this.resolvePendingPermissionsForAgent(agent, event.provider, options, "Turn failed");
+    await this.persistTurnFailureNotice(agent, event, eventTurnId, options?.fromHistory === true);
     if (!isForegroundEvent && !agent.activeForegroundTurnId) {
       this.emitState(agent);
+    }
+  }
+
+  private async persistTurnFailureNotice(
+    agent: ActiveManagedAgent,
+    event: Extract<AgentStreamEvent, { type: "turn_failed" }>,
+    eventTurnId: string | undefined,
+    fromHistory: boolean,
+  ): Promise<void> {
+    const currentFamilyMember = agent.labels?.[CONVERSATION_FAMILY_CURRENT_LABEL];
+    if (
+      !fromHistory &&
+      !this.controlledCloseAgentIds.has(agent.id) &&
+      (!currentFamilyMember || currentFamilyMember === agent.id)
+    ) {
+      await this.onTurnFailure?.({
+        agentId: agent.id,
+        turnId: eventTurnId ?? agent.activeForegroundTurnId ?? randomUUID(),
+        provider: event.provider,
+        code: event.code && /^[a-zA-Z0-9_.-]{1,100}$/.test(event.code) ? event.code : null,
+        failureKind: event.failureKind ?? null,
+      }).catch((error) =>
+        this.logger.error(
+          { err: error, agentId: agent.id },
+          "Could not persist failed-turn notification",
+        ),
+      );
     }
   }
 
@@ -4522,6 +5857,7 @@ export class AgentManager {
       agent.lifecycle = "idle";
     }
     agent.lastError = undefined;
+    agent.lastFailureKind = undefined;
     this.resolvePendingPermissionsForAgent(agent, event.provider, options, "Interrupted");
     if (!isForegroundEvent && !agent.activeForegroundTurnId) {
       this.emitState(agent);
@@ -4652,9 +5988,26 @@ export class AgentManager {
     agent: ActiveManagedAgent,
     prompt: AgentPromptInput,
     clientMessageId: string,
-    options?: { messageId?: string; providerMessageId?: string; turnId?: string },
+    options?: {
+      messageId?: string;
+      providerMessageId?: string;
+      turnId?: string;
+      deliveryStatus?: "rejected";
+    },
   ): void {
-    if (this.timelineStore.getSubmittedUserMessage(agent.id, clientMessageId)) {
+    const existing = this.timelineStore.getSubmittedUserMessage(agent.id, clientMessageId);
+    if (existing) {
+      if (
+        existing.item.type === "user_message" &&
+        existing.item.deliveryStatus === "rejected" &&
+        options?.deliveryStatus !== "rejected"
+      ) {
+        const submitted = this.timelineStore.markUserMessageProviderSubmitted(
+          agent.id,
+          clientMessageId,
+        );
+        if (submitted) this.enqueueDurableTimelineUpdate(agent.id, submitted);
+      }
       return;
     }
     this.touchUpdatedAt(agent);
@@ -4663,6 +6016,7 @@ export class AgentManager {
       type: "user_message",
       text: submittedPromptText(prompt),
       clientMessageId,
+      ...(options?.deliveryStatus ? { deliveryStatus: options.deliveryStatus } : {}),
       ...(options?.messageId ? { messageId: options.messageId } : {}),
     };
     this.recordAndDispatchTimelineItem(agent.id, item, agent.provider, options?.turnId, options);
@@ -5216,9 +6570,9 @@ export class AgentManager {
     if (!client) {
       const configuredProviders = this.getConfiguredProviderIds();
       throw new Error(
-        `Unknown provider '${options.provider}'. Configured providers: ${formatProviderList(
-          configuredProviders,
-        )}.`,
+        `Unknown provider '${
+          options.provider
+        }'. Configured providers: ${formatProviderList(configuredProviders)}.`,
       );
     }
 

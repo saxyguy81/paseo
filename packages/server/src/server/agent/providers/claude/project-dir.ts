@@ -30,6 +30,19 @@ export function claudeProjectDirSync(cwd: string, options?: ClaudeProjectDirOpti
   return join(projectsRoot, encode(canonical));
 }
 
+/**
+ * Encode the path exactly as it was recorded, without resolving its current
+ * symlink target. Older Claude sessions can remain under this directory after
+ * a checkout is moved and the recorded cwd is replaced by a symlink.
+ */
+export function claudeProjectDirFromInputSync(
+  cwd: string,
+  options?: ClaudeProjectDirOptions,
+): string {
+  const projectsRoot = join(resolveConfigDir(options), "projects");
+  return join(projectsRoot, encode(normalizeProjectPath(cwd)));
+}
+
 async function canonicalize(input: string): Promise<string> {
   try {
     return normalizeProjectPath(await realpath(input));

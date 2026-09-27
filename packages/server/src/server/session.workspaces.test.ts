@@ -592,6 +592,7 @@ function createSessionForWorkspaceTests(
     clearAgentAttention: async () => {},
     markAgentUnread: async () => {},
     notifyAgentState: () => {},
+    announceTimelineReplacement: () => {},
     ...options.agentManager,
   });
   const workspaceRegistry: SessionOptions["workspaceRegistry"] = options.workspaceRegistry ?? {

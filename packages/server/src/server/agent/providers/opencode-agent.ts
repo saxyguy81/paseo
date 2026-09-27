@@ -134,6 +134,7 @@ const OPENCODE_CAPABILITIES: AgentCapabilityFlags = {
   supportsMcpServers: true,
   supportsReasoningStream: true,
   supportsToolInvocations: true,
+  supportsInFlightSteering: true,
   supportsRewindConversation: false,
   supportsRewindFiles: false,
   supportsRewindBoth: true,
@@ -2310,7 +2311,12 @@ export function translateOpenCodeEvent(
     case "session.idle":
       if (event.properties.sessionID === state.sessionId) {
         resetOpenCodeTurnTrackingState(state);
-        events.push({ type: "turn_completed", provider: "opencode", usage: undefined });
+        events.push({
+          type: "turn_completed",
+          provider: "opencode",
+          outputProvenance: "provider",
+          usage: undefined,
+        });
       }
       break;
     case "session.error":
@@ -3129,7 +3135,12 @@ function appendOpenCodeSessionStatus(
   const { status } = event.properties;
   if (status.type === "idle") {
     resetOpenCodeTurnTrackingState(state);
-    events.push({ type: "turn_completed", provider: "opencode", usage: undefined });
+    events.push({
+      type: "turn_completed",
+      provider: "opencode",
+      outputProvenance: "provider",
+      usage: undefined,
+    });
     return;
   }
   if (status.type === "retry") {
@@ -4277,7 +4288,10 @@ class OpenCodeAgentSession implements AgentSession {
     if (dispatchMessageId === null) {
       if (runnerStatus === "idle") {
         this.suppressAssistantMessagesUntilIdle.active = false;
-        this.finishForegroundTurn({ type: "turn_completed", provider: "opencode" }, turnId);
+        this.finishForegroundTurn(
+          { type: "turn_completed", provider: "opencode", outputProvenance: "provider" },
+          turnId,
+        );
       }
       return;
     }

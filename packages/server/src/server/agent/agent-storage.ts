@@ -7,8 +7,17 @@ import { writeJsonFileAtomic } from "../atomic-file.js";
 import { AgentFeatureSchema, AgentStatusSchema } from "../messages.js";
 import { toStoredAgentRecord } from "./agent-projections.js";
 import type { ManagedAgent } from "./agent-manager.js";
-import type { AgentSessionConfig } from "./agent-sdk-types.js";
+import type {
+  AgentPromptInput,
+  AgentPromptPreflight,
+  AgentSessionConfig,
+} from "./agent-sdk-types.js";
 import { AgentOwnerSchema, daemonExecutionKey, type DaemonAgentOwner } from "./agent-owner.js";
+import {
+  buildInternalPromptPreflightId,
+  INTERNAL_PROMPT_PREFLIGHT_ID_PREFIX,
+  isInternalPromptPreflightId,
+} from "./prompt-preflight.js";
 
 const SERIALIZABLE_CONFIG_SCHEMA = z
   .object({
@@ -20,7 +29,13 @@ const SERIALIZABLE_CONFIG_SCHEMA = z
     toolPolicy: z
       .object({
         preapproved: z.array(
-          z.object({ kind: z.literal("mcp"), server: z.string(), tool: z.string() }).strict(),
+          z
+            .object({
+              kind: z.literal("mcp"),
+              server: z.string(),
+              tool: z.string(),
+            })
+            .strict(),
         ),
       })
       .strict()
@@ -41,6 +56,30 @@ const PERSISTENCE_HANDLE_SCHEMA = z
   })
   .nullable()
   .optional();
+
+const STORED_PENDING_AGENT_PROMPT_SCHEMA = z
+  .object({
+    id: z.string().min(1),
+    prompt: z.custom<AgentPromptInput>(
+      (value) => typeof value === "string" || Array.isArray(value),
+      "Expected a string or structured agent prompt",
+    ),
+    createdAt: z.string(),
+    state: z.enum(["queued", "dispatching"]).default("queued"),
+    attemptCount: z.number().int().nonnegative().default(0),
+  })
+  .strict();
+
+// Preserve one schema-compatible slot for a synthetic context preflight. The
+// previous daemon accepts at most 32 queue records, so a rollback can still
+// read every file written by this release.
+const MAX_PENDING_USER_PROMPTS = 31;
+const MAX_STORED_PENDING_ITEMS = 32;
+export type StoredPendingAgentPrompt = z.infer<typeof STORED_PENDING_AGENT_PROMPT_SCHEMA>;
+
+export function isStoredPendingPromptPreflight(item: StoredPendingAgentPrompt): boolean {
+  return isInternalPromptPreflightId(item.id);
+}
 
 const STORED_AGENT_SCHEMA = z.object({
   id: z.string(),
@@ -69,12 +108,33 @@ const STORED_AGENT_SCHEMA = z.object({
   features: z.array(AgentFeatureSchema).optional(),
   persistence: PERSISTENCE_HANDLE_SCHEMA,
   lastError: z.string().nullable().optional(),
+  lastFailureKind: z
+    .enum(["context_overflow", "conversation_unresolved", "resume_model_unavailable"])
+    .nullable()
+    .optional(),
   requiresAttention: z.boolean().optional(),
   attentionReason: z.enum(["finished", "error", "permission"]).nullable().optional(),
   attentionTimestamp: z.string().nullable().optional(),
   internal: z.boolean().optional(),
   archivedAt: z.string().nullable().optional(),
   owner: AgentOwnerSchema.optional(),
+  continuationRequest: z.string().max(24_000).nullable().optional(),
+  pendingPrompts: z
+    .array(STORED_PENDING_AGENT_PROMPT_SCHEMA)
+    .max(MAX_STORED_PENDING_ITEMS)
+    .default([]),
+  completedPromptPreflightIds: z.array(z.string()).max(MAX_STORED_PENDING_ITEMS).default([]),
+  lastUsage: z
+    .object({
+      inputTokens: z.number().finite().optional(),
+      cachedInputTokens: z.number().finite().optional(),
+      outputTokens: z.number().finite().optional(),
+      totalCostUsd: z.number().finite().optional(),
+      contextWindowMaxTokens: z.number().finite().optional(),
+      contextWindowUsedTokens: z.number().finite().nonnegative().optional(),
+    })
+    .strict()
+    .optional(),
 });
 
 export type SerializableAgentConfig = Pick<
@@ -90,6 +150,16 @@ export type SerializableAgentConfig = Pick<
 >;
 
 export type StoredAgentRecord = z.infer<typeof STORED_AGENT_SCHEMA>;
+
+function clearContextWindowUsedTokens(
+  usage: StoredAgentRecord["lastUsage"],
+): StoredAgentRecord["lastUsage"] {
+  if (usage?.contextWindowUsedTokens === undefined) return usage;
+  const remaining = { ...usage };
+  delete remaining.contextWindowUsedTokens;
+  return Object.keys(remaining).length > 0 ? remaining : undefined;
+}
+
 export function parseStoredAgentRecord(value: unknown): StoredAgentRecord {
   return STORED_AGENT_SCHEMA.parse(value);
 }
@@ -99,6 +169,7 @@ export class AgentStorage {
   private pathById: Map<string, string> = new Map();
   private pathsById: Map<string, Set<string>> = new Map();
   private pendingWrites: Map<string, Promise<void>> = new Map();
+  private recordChangeListeners: Map<string, Set<() => void>> = new Map();
   private deleting: Set<string> = new Set();
   private daemonAgentIdsByExecution: Map<string, string> = new Map();
   private daemonExecutionKeysByAgentId: Map<string, string> = new Map();
@@ -155,6 +226,345 @@ export class AgentStorage {
     await this.queueRecordWrite(record);
   }
 
+  async enqueuePendingPrompt(
+    agentId: string,
+    input: Pick<StoredPendingAgentPrompt, "id" | "prompt">,
+  ): Promise<{ enqueued: boolean; position: number }> {
+    await this.load();
+    if (isInternalPromptPreflightId(input.id)) {
+      throw new Error(`Prompt id uses reserved prefix: ${INTERNAL_PROMPT_PREFLIGHT_ID_PREFIX}`);
+    }
+    let result: { enqueued: boolean; position: number } | null = null;
+    await this.queueRecordMutation(agentId, (existing) => {
+      if (!existing) {
+        throw new Error(`Agent ${agentId} not found`);
+      }
+      const duplicateIndex = existing.pendingPrompts.findIndex((item) => item.id === input.id);
+      if (duplicateIndex >= 0) {
+        result = { enqueued: false, position: duplicateIndex + 1 };
+        return existing;
+      }
+      const pendingUserPrompts = existing.pendingPrompts.filter(
+        (item) => !isStoredPendingPromptPreflight(item),
+      ).length;
+      if (pendingUserPrompts >= MAX_PENDING_USER_PROMPTS) {
+        throw new Error(
+          `Agent ${agentId} prompt queue is full (${MAX_PENDING_USER_PROMPTS} messages)`,
+        );
+      }
+      if (existing.pendingPrompts.length >= MAX_STORED_PENDING_ITEMS) {
+        throw new Error(
+          `Agent ${agentId} prompt queue is full (${MAX_STORED_PENDING_ITEMS} items)`,
+        );
+      }
+      const pendingPrompts = [
+        ...existing.pendingPrompts,
+        {
+          id: input.id,
+          prompt: input.prompt,
+          createdAt: new Date().toISOString(),
+          state: "queued" as const,
+          attemptCount: 0,
+        },
+      ];
+      result = { enqueued: true, position: pendingUserPrompts + 1 };
+      return { ...existing, pendingPrompts };
+    });
+    if (!result) {
+      throw new Error(`Failed to queue prompt for agent ${agentId}`);
+    }
+    return result;
+  }
+
+  async listPendingPrompts(agentId: string): Promise<StoredPendingAgentPrompt[]> {
+    const record = await this.get(agentId);
+    return (
+      record?.pendingPrompts.map((item) => ({
+        id: item.id,
+        prompt: item.prompt,
+        createdAt: item.createdAt,
+        state: item.state,
+        attemptCount: item.attemptCount,
+      })) ?? []
+    );
+  }
+
+  /**
+   * Wait until the exact durable prompts accepted before a caller's boundary
+   * have left the FIFO. Prompts accepted later are deliberately ignored.
+   */
+  async waitForPendingPromptIds(
+    agentId: string,
+    promptIds: readonly string[],
+    options?: { signal?: AbortSignal },
+  ): Promise<void> {
+    await this.load();
+    const targets = new Set(promptIds);
+    if (targets.size === 0) return;
+
+    const settled = () => {
+      const record = this.cache.get(agentId);
+      if (!record) return true;
+      return !record.pendingPrompts.some((prompt) => targets.has(prompt.id));
+    };
+    if (settled()) return;
+    if (options?.signal?.aborted) {
+      const error = new Error("wait_for_pending_prompts aborted");
+      error.name = "AbortError";
+      throw error;
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      let finished = false;
+      const listeners = this.recordChangeListeners.get(agentId) ?? new Set<() => void>();
+      this.recordChangeListeners.set(agentId, listeners);
+
+      const cleanup = () => {
+        listeners.delete(check);
+        if (listeners.size === 0) this.recordChangeListeners.delete(agentId);
+        options?.signal?.removeEventListener("abort", abort);
+      };
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        cleanup();
+        resolve();
+      };
+      const check = () => {
+        if (settled()) finish();
+      };
+      const abort = () => {
+        if (finished) return;
+        finished = true;
+        cleanup();
+        const error = new Error("wait_for_pending_prompts aborted");
+        error.name = "AbortError";
+        reject(error);
+      };
+
+      listeners.add(check);
+      options?.signal?.addEventListener("abort", abort, { once: true });
+      // Close the check/register race if a queued write settled between the
+      // initial observation above and listener installation.
+      check();
+    });
+  }
+
+  async claimPendingPrompt(agentId: string): Promise<StoredPendingAgentPrompt | null> {
+    await this.load();
+    let claimed: StoredPendingAgentPrompt | null = null;
+    await this.queueRecordMutation(agentId, (existing) => {
+      if (!existing) {
+        throw new Error(`Agent ${agentId} not found`);
+      }
+      const index = 0;
+      if (existing.pendingPrompts[index]?.state !== "queued") {
+        return existing;
+      }
+      const next = [...existing.pendingPrompts];
+      claimed = {
+        ...next[index]!,
+        state: "dispatching",
+        attemptCount: next[index]!.attemptCount + 1,
+      };
+      next[index] = claimed;
+      return { ...existing, pendingPrompts: next };
+    });
+    return claimed;
+  }
+
+  async insertPendingPromptPreflight(
+    agentId: string,
+    targetPromptId: string,
+    preflight: AgentPromptPreflight,
+    options?: { preserveClaimedAttempt?: boolean },
+  ): Promise<boolean> {
+    await this.load();
+    let inserted = false;
+    await this.queueRecordMutation(agentId, (existing) => {
+      if (!existing) throw new Error(`Agent ${agentId} not found`);
+      const targetIndex = existing.pendingPrompts.findIndex((item) => item.id === targetPromptId);
+      if (targetIndex < 0) return existing;
+      const target = existing.pendingPrompts[targetIndex]!;
+      if (isStoredPendingPromptPreflight(target)) return existing;
+
+      const preflightId = buildInternalPromptPreflightId(targetPromptId, preflight.key);
+      const duplicate = existing.pendingPrompts.some((item) => item.id === preflightId);
+      // The queue claim that discovered an initial preflight is admission work,
+      // not a provider attempt. Remove that claim from the retry budget. A
+      // submitted retry, however, already reached the provider and must retain
+      // its count so a later user dispatch cannot execute twice.
+      const queuedTarget = {
+        ...target,
+        state: "queued" as const,
+        attemptCount:
+          options?.preserveClaimedAttempt !== false
+            ? target.attemptCount
+            : Math.max(0, target.attemptCount - 1),
+      };
+      const pendingPrompts = [...existing.pendingPrompts];
+      pendingPrompts[targetIndex] = queuedTarget;
+      if (duplicate) return { ...existing, pendingPrompts };
+      if (pendingPrompts.length >= MAX_STORED_PENDING_ITEMS) {
+        throw new Error(`Agent ${agentId} prompt preflight queue is full`);
+      }
+
+      pendingPrompts.splice(targetIndex, 0, {
+        id: preflightId,
+        prompt: preflight.prompt,
+        createdAt: new Date().toISOString(),
+        state: "queued",
+        attemptCount: 0,
+      });
+      inserted = true;
+      return { ...existing, pendingPrompts };
+    });
+    return inserted;
+  }
+
+  async settlePendingPromptPreflight(
+    agentId: string,
+    preflightId: string,
+    options?: { clearContextUsage?: boolean },
+  ): Promise<void> {
+    await this.load();
+    await this.queueRecordMutation(agentId, (existing) => {
+      if (!existing) throw new Error(`Agent ${agentId} not found`);
+      const preflightIndex = existing.pendingPrompts.findIndex((item) => item.id === preflightId);
+      const preflight = existing.pendingPrompts[preflightIndex];
+      if (!preflight || !isStoredPendingPromptPreflight(preflight)) return existing;
+      const target = existing.pendingPrompts[preflightIndex + 1];
+      const lastUsage = options?.clearContextUsage
+        ? clearContextWindowUsedTokens(existing.lastUsage)
+        : existing.lastUsage;
+      const completedPromptPreflightIds = existing.completedPromptPreflightIds.filter(
+        (id) => id !== preflightId,
+      );
+      // Once the compact boundary is proven, keep a one-use receipt on the
+      // target user message. This survives a daemon restart and prevents the
+      // now-unknown occupancy from scheduling the same compact indefinitely.
+      // Reuse the existing string array so rollback builds can still parse the
+      // record even though they do not understand the target-id receipt.
+      if (
+        options?.clearContextUsage &&
+        target &&
+        !isStoredPendingPromptPreflight(target) &&
+        !completedPromptPreflightIds.includes(target.id)
+      ) {
+        completedPromptPreflightIds.push(target.id);
+      }
+      return {
+        ...existing,
+        pendingPrompts: existing.pendingPrompts.filter((item) => item.id !== preflightId),
+        completedPromptPreflightIds,
+        ...(lastUsage ? { lastUsage } : { lastUsage: undefined }),
+      };
+    });
+  }
+
+  async recordPendingPromptPreflightBoundary(agentId: string, preflightId: string): Promise<void> {
+    await this.load();
+    await this.queueRecordMutation(agentId, (existing) => {
+      if (!existing) throw new Error(`Agent ${agentId} not found`);
+      const preflight = existing.pendingPrompts.find((item) => item.id === preflightId);
+      if (!preflight || !isStoredPendingPromptPreflight(preflight)) return existing;
+      if (existing.completedPromptPreflightIds.includes(preflightId)) return existing;
+      return {
+        ...existing,
+        completedPromptPreflightIds: [...existing.completedPromptPreflightIds, preflightId],
+      };
+    });
+  }
+
+  async completePendingPrompt(agentId: string, promptId: string): Promise<void> {
+    await this.load();
+    await this.queueRecordMutation(agentId, (existing) => {
+      if (!existing) {
+        throw new Error(`Agent ${agentId} not found`);
+      }
+      return {
+        ...existing,
+        pendingPrompts: existing.pendingPrompts.filter((item) => item.id !== promptId),
+        completedPromptPreflightIds: existing.completedPromptPreflightIds.filter(
+          (id) => id !== promptId,
+        ),
+      };
+    });
+  }
+
+  async releasePendingPrompt(agentId: string, promptId: string): Promise<void> {
+    await this.load();
+    await this.queueRecordMutation(agentId, (existing) => {
+      if (!existing) {
+        throw new Error(`Agent ${agentId} not found`);
+      }
+      return {
+        ...existing,
+        pendingPrompts: existing.pendingPrompts.map((item) =>
+          item.id === promptId ? { ...item, state: "queued" as const } : item,
+        ),
+      };
+    });
+  }
+
+  async transferPendingPrompts(sourceAgentId: string, targetAgentId: string): Promise<void> {
+    if (sourceAgentId === targetAgentId) return;
+    await this.load();
+    await this.waitForPendingWrite(sourceAgentId);
+    const source = await this.get(sourceAgentId);
+    if (!source || source.pendingPrompts.length === 0) return;
+
+    const prompts = source.pendingPrompts
+      .filter((item) => !isStoredPendingPromptPreflight(item))
+      .map((item) => ({
+        id: item.id,
+        prompt: item.prompt,
+        createdAt: item.createdAt,
+        // A provider iterator cannot survive a family rollover. The successor
+        // owns replay admission and will claim the prompt again once its bounded
+        // handoff turn settles.
+        state: "queued" as const,
+        attemptCount: item.attemptCount,
+      }));
+    await this.queueRecordMutation(targetAgentId, (target) => {
+      if (!target) {
+        throw new Error(`Agent ${targetAgentId} not found`);
+      }
+      const existingIds = new Set(target.pendingPrompts.map((item) => item.id));
+      const pendingPrompts = [
+        ...prompts.filter((item) => !existingIds.has(item.id)),
+        // The family pointer is redirected before transfer, so anything
+        // already queued on the successor arrived after these predecessor
+        // prompts and must remain behind them.
+        ...target.pendingPrompts,
+      ];
+      const pendingUserPrompts = pendingPrompts.filter(
+        (item) => !isStoredPendingPromptPreflight(item),
+      ).length;
+      if (pendingUserPrompts > MAX_PENDING_USER_PROMPTS) {
+        throw new Error(
+          `Agent ${targetAgentId} prompt queue is full (${MAX_PENDING_USER_PROMPTS} messages)`,
+        );
+      }
+      if (pendingPrompts.length > MAX_STORED_PENDING_ITEMS) {
+        throw new Error(`Agent ${targetAgentId} prompt preflight queue is full`);
+      }
+      return { ...target, pendingPrompts };
+    });
+    await this.queueRecordMutation(sourceAgentId, (latestSource) => {
+      if (!latestSource) {
+        throw new Error(`Agent ${sourceAgentId} not found`);
+      }
+      const movedIds = new Set(prompts.map((item) => item.id));
+      return {
+        ...latestSource,
+        pendingPrompts: latestSource.pendingPrompts.filter(
+          (item) => !isStoredPendingPromptPreflight(item) && !movedIds.has(item.id),
+        ),
+      };
+    });
+  }
+
   private queueRecordWrite(record: StoredAgentRecord): Promise<void> {
     return this.queueRecordMutation(record.id, () => record);
   }
@@ -204,6 +614,7 @@ export class AgentStorage {
     this.cache.set(agentId, record);
     this.indexOwner(record);
     this.pathById.set(agentId, nextPath);
+    for (const listener of this.recordChangeListeners.get(agentId) ?? []) listener();
   }
 
   beginDelete(agentId: string): void {
@@ -235,6 +646,7 @@ export class AgentStorage {
     this.removeOwnerIndex(agentId);
     this.pathById.delete(agentId);
     this.pathsById.delete(agentId);
+    for (const listener of this.recordChangeListeners.get(agentId) ?? []) listener();
   }
 
   async applySnapshot(
@@ -258,6 +670,11 @@ export class AgentStorage {
       // stale pre-archive record after the archive mutation.
       if (existing && existing.archivedAt !== undefined) {
         record.archivedAt = existing.archivedAt;
+      }
+      if (existing) {
+        record.continuationRequest = existing.continuationRequest;
+        record.pendingPrompts = existing.pendingPrompts;
+        record.completedPromptPreflightIds = existing.completedPromptPreflightIds;
       }
       return record;
     });

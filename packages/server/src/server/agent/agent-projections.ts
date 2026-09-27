@@ -91,6 +91,7 @@ export function toStoredAgentRecord(
     features: normalizeFeatures(agent.features),
     persistence,
     lastError: agent.lastError ?? undefined,
+    lastFailureKind: agent.lastFailureKind ?? undefined,
     requiresAttention: agent.attention.requiresAttention,
     attentionReason: agent.attention.requiresAttention ? agent.attention.attentionReason : null,
     attentionTimestamp: agent.attention.requiresAttention
@@ -98,6 +99,9 @@ export function toStoredAgentRecord(
       : null,
     internal: options?.internal,
     owner: agent.owner,
+    pendingPrompts: [],
+    completedPromptPreflightIds: [],
+    lastUsage: sanitizeUsage(agent.lastUsage),
   } satisfies StoredAgentRecord;
 }
 
@@ -206,6 +210,7 @@ export function buildStoredAgentPayload(
     supportsMcpServers: false,
     supportsReasoningStream: false,
     supportsToolInvocations: true,
+    supportsInFlightSteering: false,
     supportsRewindConversation: false,
     supportsRewindFiles: false,
     supportsRewindBoth: false,
@@ -449,7 +454,11 @@ function assignFiniteNumber(
   field: UsageNumericField,
 ): boolean {
   const raw = source[field];
-  if (typeof raw === "number" && Number.isFinite(raw)) {
+  if (
+    typeof raw === "number" &&
+    Number.isFinite(raw) &&
+    (field !== "contextWindowUsedTokens" || raw >= 0)
+  ) {
     target[field] = raw;
     return true;
   }

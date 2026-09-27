@@ -1,4 +1,4 @@
-import { test, expect, beforeEach, afterEach } from "vitest";
+import { test, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import path from "path";
@@ -80,6 +80,85 @@ test("rapid fire messages then single wait", async () => {
       m.payload.event.item.type === "user_message",
   );
   expect(userMessages.length).toBe(3);
+
+  await ctx.client.deleteAgent(agent.id);
+  rmSync(cwd, { recursive: true, force: true });
+}, 45000);
+
+test("Claude steer sent while running is serialized as a second daemon turn", async () => {
+  const cwd = tmpCwd();
+
+  const agent = await ctx.client.createAgent({
+    provider: "claude",
+    model: "haiku",
+    cwd,
+    title: "Claude Safe Steer Fallback",
+    modeId: "bypassPermissions",
+  });
+
+  collector.clear();
+  await ctx.client.sendAgentMessage(
+    agent.id,
+    "Use Bash to run sleep 1, then reply with exactly: FIRST_DONE",
+    { messageId: "safe-steer-first" },
+  );
+  await ctx.client.waitForAgentUpsert(
+    agent.id,
+    (snapshot) => snapshot.status === "running",
+    10_000,
+  );
+
+  await ctx.client.sendAgentMessage(agent.id, "Reply with exactly: SECOND_DONE", {
+    messageId: "safe-steer-second",
+    activeTurnBehavior: "steer",
+  });
+
+  await vi.waitFor(
+    () => {
+      const starts = collector.messages.filter(
+        (message) =>
+          message.type === "agent_stream" &&
+          message.payload.agentId === agent.id &&
+          message.payload.event.type === "turn_started",
+      );
+      expect(starts).toHaveLength(2);
+    },
+    { timeout: 10_000 },
+  );
+  const state = await ctx.client.waitForFinish(agent.id, 30_000);
+  expect(state.status).toBe("idle");
+
+  const turnEvents = collector.messages.flatMap((message) => {
+    if (message.type !== "agent_stream" || message.payload.agentId !== agent.id) return [];
+    const event = message.payload.event;
+    return event.type === "turn_started" ||
+      event.type === "turn_completed" ||
+      event.type === "turn_canceled"
+      ? [event]
+      : [];
+  });
+  expect(turnEvents.map((event) => event.type)).toEqual([
+    "turn_started",
+    "turn_completed",
+    "turn_started",
+    "turn_completed",
+  ]);
+  const turnIds = turnEvents
+    .filter((event) => event.type === "turn_started")
+    .map((event) => event.turnId);
+  expect(new Set(turnIds).size).toBe(2);
+
+  const timeline = await ctx.client.fetchAgentTimeline(agent.id, { limit: 100 });
+  const userMessages = timeline.entries
+    .filter((entry) => entry.item.type === "user_message")
+    .map((entry) => ({ text: entry.item.text, messageId: entry.item.messageId }));
+  expect(userMessages).toEqual([
+    {
+      text: "Use Bash to run sleep 1, then reply with exactly: FIRST_DONE",
+      messageId: "safe-steer-first",
+    },
+    { text: "Reply with exactly: SECOND_DONE", messageId: "safe-steer-second" },
+  ]);
 
   await ctx.client.deleteAgent(agent.id);
   rmSync(cwd, { recursive: true, force: true });

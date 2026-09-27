@@ -78,6 +78,13 @@ export class InMemoryAgentTimelineStore {
     return row ? cloneRow(row) : null;
   }
 
+  markUserMessageProviderSubmitted(
+    agentId: string,
+    clientMessageId: string,
+  ): AgentTimelineRow | null {
+    return this.requireState(agentId).projection.markUserMessageProviderSubmitted(clientMessageId);
+  }
+
   enrichSubmittedUserMessage(
     agentId: string,
     clientMessageId: string,

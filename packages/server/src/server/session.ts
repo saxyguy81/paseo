@@ -32,6 +32,7 @@ import {
   type ProjectPlacementPayload,
   type WorkspaceSetupSnapshot,
   type WorkspaceDescriptorPayload,
+  type WebPushSubscription,
 } from "./messages.js";
 import type {
   TerminalManager,
@@ -127,6 +128,7 @@ import type { StructuredGenerationDaemonConfig } from "./agent/structured-genera
 import {
   getAgentStreamEventTurnId,
   type AgentPersistenceHandle,
+  type AgentPermissionRequest,
   type AgentPermissionResponse,
   type AgentRunOptions,
   type AgentSessionConfig,
@@ -282,6 +284,7 @@ type ProviderSubagentManagerEvent = Extract<
 const LEGACY_PROVIDER_IDS = new Set(["claude", "codex", "opencode"]);
 const MIN_VERSION_ALL_PROVIDERS = "0.1.45";
 const MIN_VERSION_EXPLICIT_WORKSPACE_RECOVERY = "0.1.105";
+const MAX_LEGACY_TIMELINE_REPLACEMENT_ROWS = 200;
 function errorToFriendlyMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === "string") return error;
@@ -759,6 +762,10 @@ export class Session {
     { owner: OwnedSubscription; events: Set<SessionEventSubscription>; notifications: boolean }
   >();
   private readonly workspaceUpdateTails = new Map<string, Promise<void>>();
+  private registeredWebPushSubscription: {
+    subscription: WebPushSubscription;
+    revocationToken: string;
+  } | null = null;
   private readonly terminalManager: TerminalManager | null;
   private readonly providerSnapshotManager: ProviderSnapshotManager;
   private readonly serviceProxy: ServiceProxySubsystem | null;
@@ -2773,6 +2780,15 @@ export class Session {
         return this.daemonSession.handleHubRelationshipRequest(msg);
       case "diagnostics.request":
         return this.daemonSession.handleDiagnosticsRequest(msg);
+      case "diagnostics.incident.report.request": {
+        return this.agentManager.reportDiagnosticIncident(msg).then((accepted) => {
+          this.emit({
+            type: "diagnostics.incident.report.response",
+            payload: { requestId: msg.requestId, accepted },
+          });
+          return undefined;
+        });
+      }
       case "daemon.update.request":
         return this.daemonSession.handleUpdateRequest(msg);
       case "set_daemon_config_request":
@@ -3057,6 +3073,31 @@ export class Session {
         }
         this.emit({
           type: "push.unregister.response",
+          payload: { requestId: msg.requestId },
+        });
+        return;
+      case "push.web.subscribe.request": {
+        const revocationToken = this.pushNotifications.renewWeb(
+          msg.subscription,
+          msg.revocationToken,
+        );
+        this.registeredWebPushSubscription = {
+          subscription: msg.subscription,
+          revocationToken,
+        };
+        this.emit({
+          type: "push.web.subscribe.response",
+          payload: { requestId: msg.requestId, revocationToken },
+        });
+        return;
+      }
+      case "push.web.unsubscribe.request":
+        this.pushNotifications.revokeWeb(msg.endpoint, msg.revocationToken);
+        if (this.registeredWebPushSubscription?.subscription.endpoint === msg.endpoint) {
+          this.registeredWebPushSubscription = null;
+        }
+        this.emit({
+          type: "push.web.unsubscribe.response",
           payload: { requestId: msg.requestId },
         });
         return;
@@ -4536,6 +4577,7 @@ export class Session {
         await this.interruptAgentIfRunning(agentId);
         snapshot = await this.agentManager.reloadAgentSession(agentId, undefined, {
           rehydrateFromDisk: true,
+          broadcastProviderSubagentReset: false,
         });
       } else {
         const record = await this.agentStorage.get(agentId);
@@ -4555,11 +4597,15 @@ export class Session {
         snapshot = await ensureAgentLoaded(agentId, {
           agentManager: this.agentManager,
           agentStorage: this.agentStorage,
-          broadcastTimeline: true,
+          broadcastTimeline: false,
           logger: this.sessionLogger,
         });
       }
-      await this.agentManager.hydrateTimelineFromProvider(agentId, { broadcast: true });
+      // Refresh reconstructs authoritative server state. Historical rows are fetched in bounded
+      // pages by current clients after the replacement invalidation; replaying them as live events
+      // can enqueue tens of thousands of WebSocket frames and exhaust the daemon.
+      await this.agentManager.hydrateTimelineFromProvider(agentId, { broadcast: false });
+      this.agentManager.announceTimelineReplacement(agentId);
       await this.agentUpdates.forwardLiveAgent(snapshot);
       const timelineSize = this.agentManager.getTimeline(agentId).length;
       if (requestId) {
@@ -4687,7 +4733,12 @@ export class Session {
     const epoch = timeline.epoch;
 
     if (this.clientSources.size === 0 || !this.onMessageToSource) {
-      if (!this.supports(CLIENT_CAPS.timelineReplacementInvalidation)) {
+      if (this.supports(CLIENT_CAPS.timelineReplacementInvalidation)) {
+        this.emit({
+          type: "agent.timeline.replacement",
+          payload: { agentId, epoch },
+        });
+      } else {
         this.emitReconstructedTimelineRows(agentId, agent.provider, timeline.rows, epoch);
       }
       return;
@@ -4726,7 +4777,9 @@ export class Session {
     epoch: string,
     source?: object,
   ): void {
-    for (const row of rows) {
+    // Legacy clients cannot process replacement invalidations. Keep their compatibility replay
+    // bounded so a large persisted conversation cannot overwhelm the physical WebSocket.
+    for (const row of rows.slice(-MAX_LEGACY_TIMELINE_REPLACEMENT_ROWS)) {
       if (!this.supportsTimelineItem(row.item, source)) {
         continue;
       }
@@ -4878,6 +4931,12 @@ export class Session {
     }
     if (metadata.pushToken) {
       this.pushNotifications.renew(metadata.pushToken);
+    }
+    if (this.registeredWebPushSubscription) {
+      this.pushNotifications.renewWeb(
+        this.registeredWebPushSubscription.subscription,
+        this.registeredWebPushSubscription.revocationToken,
+      );
     }
   }
 
@@ -8061,6 +8120,8 @@ export class Session {
         },
         "agent.session.send_agent_message",
       );
+      // A conversation family can roll the prompt forward into a successor agent.
+      let effectiveAgentId = agentId;
       const send = async () => {
         const result = await sendPromptToAgent({
           agentManager: this.agentManager,
@@ -8068,14 +8129,15 @@ export class Session {
           agentId,
           prompt,
           messageId: msg.messageId,
-          activeTurnBehavior: msg.activeTurnBehavior ?? "interrupt",
+          activeTurnBehavior: msg.activeTurnBehavior ?? "queue",
           clearPendingPermissions: true,
           logger: this.sessionLogger,
         });
+        effectiveAgentId = result.effectiveAgentId;
         if (result.disposition === "turn_started") {
           await waitForAgentRunStartWithTimeout(
             this.agentManager,
-            agentId,
+            result.effectiveAgentId,
             this.delivery.requestSignal,
           );
         }
@@ -8084,7 +8146,7 @@ export class Session {
         await this.messageReceipts.send({
           agentId,
           messageId: msg.messageId,
-          request: { prompt, activeTurnBehavior: msg.activeTurnBehavior ?? "interrupt" },
+          request: { prompt, activeTurnBehavior: msg.activeTurnBehavior ?? "queue" },
           prepare: async () => {
             await this.prepareAgentMessage(agentId, msg.text);
           },
@@ -8098,7 +8160,7 @@ export class Session {
         type: "send_agent_message_response",
         payload: {
           requestId: msg.requestId,
-          agentId,
+          agentId: effectiveAgentId,
           accepted: true,
           error: null,
         },
@@ -8116,6 +8178,113 @@ export class Session {
         },
       });
     }
+  }
+
+  private emitStoredWaitForFinishResponse(record: StoredAgentRecord, requestId: string): void {
+    const final = this.buildStoredAgentPayload(record);
+    let status: "permission" | "error" | "idle" = "idle";
+    if (record.attentionReason === "permission") {
+      status = "permission";
+    } else if (record.lastStatus === "error") {
+      status = "error";
+    }
+    const error = resolveWaitForFinishError({ status, final });
+    this.emit({
+      type: "wait_for_finish_response",
+      payload: { requestId, status, final, error, lastMessage: null },
+    });
+  }
+
+  private async ensureWaitForFinishTarget(
+    agentId: string,
+    pendingPromptIds: readonly string[],
+    requestId: string,
+  ): Promise<boolean> {
+    if (this.agentManager.getAgent(agentId)) return true;
+
+    const record = await this.agentStorage.get(agentId);
+    if (!record || record.internal) {
+      this.emit({
+        type: "wait_for_finish_response",
+        payload: {
+          requestId,
+          status: "error",
+          final: null,
+          error: `Agent not found: ${agentId}`,
+          lastMessage: null,
+        },
+      });
+      return false;
+    }
+    if (record.archivedAt || pendingPromptIds.length === 0) {
+      this.emitStoredWaitForFinishResponse(record, requestId);
+      return false;
+    }
+
+    await ensureAgentLoaded(agentId, {
+      agentManager: this.agentManager,
+      agentStorage: this.agentStorage,
+      logger: this.sessionLogger,
+    });
+    void this.agentManager.drainStoredPendingPrompts(agentId).catch((error) => {
+      this.sessionLogger.error(
+        { err: error, agentId },
+        "Failed to resume durable prompts while waiting for agent completion",
+      );
+    });
+    if (this.agentManager.getAgent(agentId)) return true;
+
+    this.emitStoredWaitForFinishResponse(record, requestId);
+    return false;
+  }
+
+  private async waitForDurablePromptBoundary(
+    agentId: string,
+    pendingPromptIds: readonly string[],
+    signal: AbortSignal,
+  ): Promise<AgentPermissionRequest | null> {
+    return await new Promise<AgentPermissionRequest | null>((resolveOutcome, rejectOutcome) => {
+      let finished = false;
+      let unsubscribe: () => void = () => undefined;
+      const cleanup = () => unsubscribe();
+      const finish = (permission: AgentPermissionRequest | null) => {
+        if (finished) return;
+        finished = true;
+        cleanup();
+        resolveOutcome(permission);
+      };
+      const fail = (error: unknown) => {
+        if (finished) return;
+        finished = true;
+        cleanup();
+        rejectOutcome(error);
+      };
+
+      unsubscribe = this.agentManager.subscribe(
+        (event) => {
+          if (event.type === "agent_stream" && event.event.type === "permission_requested") {
+            finish(event.event.request);
+            return;
+          }
+          if (event.type !== "agent_state") return;
+          const permission = event.agent.pendingPermissions.values().next().value;
+          if (permission) finish(permission);
+        },
+        { agentId, replayState: false },
+      );
+
+      const currentPermission = this.agentManager
+        .getAgent(agentId)
+        ?.pendingPermissions.values()
+        .next().value;
+      if (currentPermission) {
+        finish(currentPermission);
+        return;
+      }
+      void this.agentStorage
+        .waitForPendingPromptIds(agentId, pendingPromptIds, { signal })
+        .then(() => finish(null), fail);
+    });
   }
 
   private async handleWaitForFinish(
@@ -8141,38 +8310,10 @@ export class Session {
     }
 
     const agentId = resolved.agentId;
-    const live = this.agentManager.getAgent(agentId);
-    if (!live) {
-      const record = await this.agentStorage.get(agentId);
-      if (!record || record.internal) {
-        this.emit({
-          type: "wait_for_finish_response",
-          payload: {
-            requestId,
-            status: "error",
-            final: null,
-            error: `Agent not found: ${agentId}`,
-            lastMessage: null,
-          },
-        });
-        return;
-      }
-      const final = this.buildStoredAgentPayload(record);
-      let status: "permission" | "error" | "idle";
-      if (record.attentionReason === "permission") {
-        status = "permission";
-      } else if (record.lastStatus === "error") {
-        status = "error";
-      } else {
-        status = "idle";
-      }
-      const error = resolveWaitForFinishError({ status, final });
-      this.emit({
-        type: "wait_for_finish_response",
-        payload: { requestId, status, final, error, lastMessage: null },
-      });
-      return;
-    }
+    const pendingPromptIds = (await this.agentStorage.listPendingPrompts(agentId)).map(
+      (prompt) => prompt.id,
+    );
+    if (!(await this.ensureWaitForFinishTarget(agentId, pendingPromptIds, requestId))) return;
 
     const abortController = new AbortController();
     const hasTimeout = typeof timeoutMs === "number" && timeoutMs > 0;
@@ -8187,6 +8328,22 @@ export class Session {
         signal: AbortSignal.any([abortController.signal, sourceSignal]),
         waitForActive: true,
       });
+      if (!result.permission && pendingPromptIds.length > 0) {
+        const permission = await this.waitForDurablePromptBoundary(
+          agentId,
+          pendingPromptIds,
+          abortController.signal,
+        );
+        if (permission) {
+          result = { ...result, permission };
+        } else {
+          result = {
+            status: this.agentManager.getAgent(agentId)?.lifecycle ?? result.status,
+            permission: null,
+            lastMessage: await this.agentManager.getLastAssistantMessage(agentId),
+          };
+        }
+      }
       let final = await this.getAgentPayloadById(agentId);
       if (!final) {
         throw new Error(`Agent ${agentId} disappeared while waiting`);

@@ -445,6 +445,18 @@ describe("toAgentPayload", () => {
     expect(payload).not.toHaveProperty("lastUsage");
   });
 
+  it("omits lastUsage when context window usage is negative", () => {
+    const agent = createManagedAgent({
+      lastUsage: {
+        contextWindowMaxTokens: 200_000,
+        contextWindowUsedTokens: -1,
+      },
+    });
+
+    expect(toAgentPayload(agent)).not.toHaveProperty("lastUsage");
+    expect(toStoredAgentRecord(agent).lastUsage).toBeUndefined();
+  });
+
   it("keeps existing lastUsage behavior when context window fields are absent", () => {
     const agent = createManagedAgent({
       lastUsage: {

@@ -1330,7 +1330,7 @@ export class OmpAgentSession implements AgentSession {
       return;
     }
     this.emitBufferedNoTurnOutputs(turnId);
-    this.completeTurn(turnId, []);
+    this.completeTurn(turnId, [], "local");
   }
 
   private clearNoTurnBuffers(): void {
@@ -2127,7 +2127,11 @@ export class OmpAgentSession implements AgentSession {
     });
   }
 
-  private completeTurn(turnId: string | undefined, messages: OmpAgentMessage[]): void {
+  private completeTurn(
+    turnId: string | undefined,
+    messages: OmpAgentMessage[],
+    outputProvenance: "provider" | "local" = "provider",
+  ): void {
     this.activeTurnId = null;
     this.activeClientMessageId = null;
     this.activeAssistantMessageId = null;
@@ -2163,6 +2167,7 @@ export class OmpAgentSession implements AgentSession {
     this.emit({
       type: "turn_completed",
       provider: this.provider,
+      outputProvenance,
       turnId,
     });
     void this.refreshAfterTurn(finalUsage);
