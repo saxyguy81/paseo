@@ -1,10 +1,12 @@
 import { describe, it, expect } from "vitest";
 import {
   describeCompactTimeAgo,
+  describeTurnCompletionTime,
   formatCompactTimeAgo,
   formatDuration,
   formatMessageTimestamp,
   formatTimeAgo,
+  formatTurnCompletionTime,
 } from "./time";
 
 describe("formatTimeAgo", () => {
@@ -114,5 +116,33 @@ describe("formatMessageTimestamp", () => {
     const formatted = formatMessageTimestamp(date, now);
     expect(formatted).toMatch(/Apr|April/);
     expect(formatted).toMatch(/2026/);
+  });
+});
+
+describe("formatTurnCompletionTime", () => {
+  const now = new Date(2026, 7, 12, 12, 0);
+
+  it.each([
+    [new Date(2026, 7, 12, 11, 59, 40), /just now/],
+    [new Date(2026, 7, 12, 11, 42), /18 minutes ago/],
+    [new Date(2026, 7, 12, 9, 0), /3 hours ago/],
+    [new Date(2026, 7, 11, 17, 45), /yesterday.*5:45 PM|yesterday.*17:45/],
+    [new Date(2026, 7, 10, 8, 0), /last Monday/],
+    [new Date(2026, 7, 6, 11, 30), /8\/6\/26.*11:30 AM|8\/6\/26.*11:30/],
+  ])("formats %s for persistent footer prose", (date, expected) => {
+    expect(formatTurnCompletionTime(date, now)).toMatch(expected);
+  });
+
+  it("reports a clock-skewed future completion as just now", () => {
+    expect(formatTurnCompletionTime(new Date(now.getTime() + 30_000), now)).toBe("just now");
+  });
+
+  it("returns the update resolution needed by the shared clock", () => {
+    expect(describeTurnCompletionTime(new Date(2026, 7, 12, 11, 42), now).resolution).toBe(
+      "minute",
+    );
+    expect(describeTurnCompletionTime(new Date(2026, 7, 12, 9, 0), now).resolution).toBe("hour");
+    expect(describeTurnCompletionTime(new Date(2026, 7, 11, 17, 45), now).resolution).toBe("day");
+    expect(describeTurnCompletionTime(new Date(2026, 7, 6, 11, 30), now).resolution).toBe("static");
   });
 });

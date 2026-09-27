@@ -8,6 +8,9 @@ import { useHostProjects } from "@/projects/host-projects";
 import { getHostRuntimeStore, useHostRegistryLoaded, useHosts } from "@/runtime/host-runtime";
 import { useSidebarOrderStore } from "@/stores/sidebar-order-store";
 import { useSidebarViewStore } from "@/stores/sidebar-view-store";
+import { findSupersededConversationFamilyWorkspaceKeys } from "@/conversation-family";
+import { useAgentHistory } from "./use-agent-history";
+import { useAppVisible } from "./use-app-visible";
 import {
   buildSidebarWorkspacePlacementModel,
   computeSidebarOrderUpdates,
@@ -107,6 +110,7 @@ export function useSidebarWorkspacesList(options?: {
   const hostFilters = options?.hostFilters ?? storeHostFilters;
   const reconcileHostFilters = useSidebarViewStore((state) => state.reconcileHostFilters);
   const isActive = options?.enabled !== false;
+  const isAppVisible = useAppVisible();
 
   const serverIds = useMemo(() => {
     if (hostFilters.length === 0) {
@@ -139,13 +143,25 @@ export function useSidebarWorkspacesList(options?: {
   const directoryServerIds = useWorkspaceDirectoryServerIds(serverIds);
 
   const hostProjects = useHostProjects(directoryServerIds);
+  // Family predecessors are intentionally archived, while their workspaces stay
+  // available so stitched history remains readable. The live directory omits
+  // archived agents, so use the complete history index for this projection.
+  const { agents, refreshAll: refreshAgentHistory } = useAgentHistory({
+    enabled: isActive,
+    autoLoadAll: true,
+  });
+  const supersededFamilyWorkspaceKeys = useMemo(
+    () => findSupersededConversationFamilyWorkspaceKeys(agents),
+    [agents],
+  );
 
   const sidebarModel = useMemo(
     () =>
       buildSidebarWorkspacePlacementModel({
         projects: hostProjects,
+        excludedWorkspaceKeys: supersededFamilyWorkspaceKeys,
       }),
-    [hostProjects],
+    [hostProjects, supersededFamilyWorkspaceKeys],
   );
 
   const projects = sidebarModel.projects.length > 0 ? sidebarModel.projects : EMPTY_PROJECTS;
@@ -175,6 +191,7 @@ export function useSidebarWorkspacesList(options?: {
 
   const refreshAll = useCallback(() => {
     if (!isActive) return;
+    void refreshAgentHistory();
     for (const serverId of serverIds) {
       void runtime.refreshDirectories(serverId).catch((error) => {
         console.error("[WorkspaceFetch][sidebar-refresh] failed", {
@@ -183,7 +200,15 @@ export function useSidebarWorkspacesList(options?: {
         });
       });
     }
-  }, [isActive, runtime, serverIds]);
+  }, [isActive, refreshAgentHistory, runtime, serverIds]);
+
+  // Directory demand keeps a live subscription, but an already-satisfied demand can retain
+  // a cached snapshot while the app is backgrounded. Force an authoritative refresh whenever
+  // the sidebar mounts or returns to the foreground so externally archived workspaces disappear.
+  useEffect(() => {
+    if (!isAppVisible) return;
+    refreshAll();
+  }, [isAppVisible, refreshAll]);
 
   const loadingState = deriveSidebarLoadingState({
     isActive,

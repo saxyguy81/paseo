@@ -231,6 +231,25 @@ export const fr: TranslationResources = {
     },
   },
   agentStream: {
+    activityGroup: {
+      show: "Afficher le travail · {{count}}",
+      hide: "Masquer le travail · {{count}}",
+    },
+    family: {
+      fullHistory: "Historique complet · {{count}} sessions",
+      loadFailed: "Une partie de l’historique n’a pas pu être chargée",
+      searchPlaceholder: "Rechercher dans cette conversation",
+      clearSearch: "Effacer la recherche dans la conversation",
+      matchCount: "{{current}} sur {{total}}",
+      noMatches: "Aucun résultat",
+      previousMatch: "Résultat précédent",
+      nextMatch: "Résultat suivant",
+      includeTools: "Inclure les outils",
+      conversationStarted: "Conversation démarrée dans « {{title}} »",
+      continuedInNewSession: "Suite dans une nouvelle session : « {{title}} »",
+      readOnlySegment:
+        "Ceci est un ancien segment en lecture seule. Continuez depuis la session la plus récente dans l’historique.",
+    },
     empty: "Commencez à discuter avec cet agent...",
     scrollToBottom: "Faire défiler vers le bas",
     historyLoadFailed: "Impossible de charger l’historique de l’agent",
@@ -311,6 +330,7 @@ export const fr: TranslationResources = {
       archived: "Archivé",
       pending: "{{count}}en attente",
       attention: "Attention",
+      sessionCount: "{{count}} sessions",
     },
     archiveSheet: {
       hostOffline: "Hosthors ligne",
@@ -2032,6 +2052,7 @@ export const fr: TranslationResources = {
       sentTitle: "Notification de test envoyée",
       sentDescription: "Paseo a transmis la notification au système d’exploitation.",
       sendFailedTitle: "Impossible d’envoyer la notification de test",
+      background: en.settings.notifications.background,
     },
     hostSections: {
       projects: "Projets",

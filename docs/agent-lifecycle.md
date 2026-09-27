@@ -50,6 +50,97 @@ older cancellation from settling a newer turn. If interruption is rejected or ti
 keeps its active foreground turn and replacement, reload, rewind, and Stop report the failure.
 Accepting new work after an ambiguous interruption would create a split-brain session.
 
+### Single-writer turns and fresh-session rollover
+
+Normal prompts enter one durable FIFO per Paseo agent. A provider may bypass that queue only when it
+explicitly supports steering an in-flight turn; Claude does not. This keeps one local writer attached
+to each native Claude session even when another browser, CLI, or recovered daemon submits a follow-up
+while the current turn is running.
+
+Not every upstream `409` means the same thing. A response saying the conversation currently has an
+active request is a live ownership conflict and may receive one bounded retry on the same native
+session. CCProxy's distinct `Conversation has an unresolved prior request` response means delivery of
+an earlier request is ambiguous. Replaying that session could duplicate side effects, so Paseo never
+retries it in place. Likewise, `Conversation continuation was not found` means CCProxy cannot safely
+bind the submitted history to the saved native conversation; Paseo rolls forward instead of letting
+Claude misreport the conflict as model unavailability. CCProxy returns that deterministic rejection
+with `x-should-retry: false`; the status, message, and retry header form the cross-service rollover
+contract. A `Continuation matching is temporarily unavailable` response gets one bounded same-session
+retry when the turn has no work yet, or when
+post-work recovery can be claimed safely and durably. If that retry is unsafe or the exact failure
+repeats, Paseo treats the native session as
+unresolved and rolls forward. Authentication, model-access, quota, and rate-limit failures remain
+visible instead of being treated as ownership conflicts.
+
+One narrowly bounded exception covers a Claude SDK failure observed after a saved native session has
+been resumed: a structured synthetic `model_not_found` before that resumed runtime has completed any
+successful turn. A fresh canary can still prove that the configured model is available while the
+saved native session remains poisoned and repeatedly emits the misleading model error. Paseo may
+roll that family forward once per native resume boundary. The classified failure kind is persisted
+with the predecessor, and the successor carries a durable attempt marker, so a daemon restart cannot
+infer recovery from transcript prose or turn a genuine entitlement failure into an unbounded chain
+of fresh sessions. The marker is not inherited after a later rollover for another reason. A fresh
+session rejection, a rejection after a successful resumed turn, and every other
+authentication/model/quota/rate-limit error remain visible. Live classification uses the SDK's
+structured `model_not_found` tag; provider text is preserved only for display and is never the
+authority for this rollover after restart.
+
+An unresolved prior request and a context overflow both use the same durable rollover transition:
+
+1. Mark the old native session as the read-only predecessor.
+2. Create exactly one fresh native session in the same Paseo conversation family.
+3. Seed it with a bounded handoff containing the latest user request and recent decision state, not a
+   pasted transcript or a request to repeat completed work.
+4. Transfer the durable prompt FIFO to the successor and continue draining it there.
+
+The handoff source is the ordered conversation family, not only the failed native session. A fresh
+successor starts with an internal handoff that is intentionally hidden from the user timeline. If
+that successor later needs another rollover, Paseo follows its predecessor chain backward only until
+it finds the latest substantive user request, then includes the bounded state recorded after that
+request. Following the lineage avoids adopting work from a divergent sibling if crash recovery ever
+left one behind. It also keeps repeated rollovers recoverable without loading unrelated early history
+or promoting an internal handoff into a new user instruction.
+
+Each fresh family member also stores the bounded outstanding user request separately from provider
+history. Provider history and Paseo's committed timeline can have different retention boundaries, so
+the request is the durable recovery anchor while the current member's timeline supplies newer working
+state. This avoids reopening a poisoned predecessor or depending on stitched history being locally
+materialized at the instant another rollover is required.
+
+The predecessor label is the transition's idempotency key. Repeated terminal events or a daemon crash
+adopt the already-created successor instead of creating another one. The UI stitches the read-only
+predecessor and writable successor into one searchable conversation history while keeping future
+prompts on the canonical successor.
+
+Automatic rollover has a family-wide budget of two fresh sessions per rolling hour. Exhaustion parks
+the family and leaves its prompt FIFO on disk. Daemon startup must not resume that native session or
+drain the FIFO. A new user message is an explicit retry: Paseo creates a fresh canonical member,
+transfers the FIFO, and starts the message there. System notifications remain queued while the family
+is parked. The durable park latch does not expire into an unsafe startup resume; only an explicit user
+retry re-arms the family on a fresh native session.
+
+System-notification admission resolves the writable canonical member and enqueues under the same
+family operation boundary as explicit retry and FIFO transfer. If the notification wins the race, the
+retry transfers it; if the retry wins, the notification targets the successor directly. It cannot be
+stranded on the archived predecessor or duplicated across both members.
+
+Prompt entrypoints receive that fresh member's effective agent ID. WebSocket acknowledgements, MCP
+blocking waits, background finish notifications, and status reads must follow that ID instead of the
+archived predecessor supplied by the caller.
+
+The budget expires after one hour or resets after the current writable member ends a provider turn
+with a non-empty assistant reply. The terminal event must explicitly identify its output as
+provider-backed; matching the agent's provider name is not proof because Claude local commands such
+as unknown slash commands and rewind use the same provider identity. Empty completions, local
+synthetic completions, history from an old member, and stale completion events do not reset it.
+Family updates carry a monotonic epoch and run through one serialized operation so a late completion
+cannot clear a newer failure reservation.
+
+Daemon shutdown also preserves any durable rollover failure already recorded for a family member.
+The supervisor can terminate a provider subprocess just before the worker enters its shutdown state;
+the resulting synthetic SIGTERM failure is teardown noise and must not replace the failure that tells
+startup reconciliation to create a fresh successor.
+
 ## Relationships
 
 Agents can launch other agents via the agent-scoped `create_agent` MCP tool. Agent-scoped creation is always asynchronous and always stamps `paseo.parent-agent-id`, pointing back at the caller. Omit `workspaceId` to use the caller's workspace, or pass an existing workspace ID returned by `create_workspace`. Placement never changes parentage.

@@ -229,6 +229,25 @@ export const ja: TranslationResources = {
     },
   },
   agentStream: {
+    activityGroup: {
+      show: "作業を表示 · {{count}}",
+      hide: "作業を非表示 · {{count}}",
+    },
+    family: {
+      fullHistory: "全履歴 · {{count}} セッション",
+      loadFailed: "一部の履歴を読み込めませんでした",
+      searchPlaceholder: "この会話を検索",
+      clearSearch: "会話の検索をクリア",
+      matchCount: "{{total}} 件中 {{current}} 件目",
+      noMatches: "一致する項目はありません",
+      previousMatch: "前の一致項目",
+      nextMatch: "次の一致項目",
+      includeTools: "ツールを含める",
+      conversationStarted: "「{{title}}」で会話を開始",
+      continuedInNewSession: "新しいセッション「{{title}}」で続行",
+      readOnlySegment:
+        "これは読み取り専用の過去のセグメントです。履歴にある最新のセッションから続行してください。",
+    },
     empty: "このエージェントとチャットを始めましょう...",
     scrollToBottom: "下にスクロール",
     historyLoadFailed: "エージェントの履歴を読み込めませんでした",
@@ -310,6 +329,7 @@ export const ja: TranslationResources = {
       archived: "アーカイブ済み",
       pending: "{{count}}件保留中",
       attention: "注意",
+      sessionCount: "{{count}}件のセッション",
     },
     archiveSheet: {
       hostOffline: "ホストオフライン",
@@ -1999,6 +2019,7 @@ export const ja: TranslationResources = {
       sentTitle: "テスト通知を送信しました",
       sentDescription: "Paseo が通知をオペレーティングシステムに渡しました。",
       sendFailedTitle: "テスト通知を送信できません",
+      background: en.settings.notifications.background,
     },
     hostSections: {
       projects: "プロジェクト",

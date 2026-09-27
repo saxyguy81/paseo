@@ -287,8 +287,18 @@ export function deriveProjectStatusBucket(input: {
 
 export function buildSidebarWorkspacePlacementModel(input: {
   projects: readonly HostProjectListItem[];
+  excludedWorkspaceKeys?: ReadonlySet<string>;
 }): SidebarWorkspacePlacementModel {
-  const projects = buildSidebarProjectsFromHostProjects({ projects: input.projects });
+  const excludedWorkspaceKeys = input.excludedWorkspaceKeys;
+  const projects = buildSidebarProjectsFromHostProjects({ projects: input.projects }).flatMap(
+    (project) => {
+      if (!excludedWorkspaceKeys || excludedWorkspaceKeys.size === 0) return [project];
+      const workspaces = project.workspaces.filter(
+        (workspace) => !excludedWorkspaceKeys.has(workspace.workspaceKey),
+      );
+      return workspaces.length > 0 ? [{ ...project, workspaces }] : [];
+    },
+  );
   return {
     projects,
     workspaces: projects.flatMap((project) => project.workspaces),

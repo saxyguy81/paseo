@@ -46,6 +46,11 @@ vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key }),
 }));
 
+const reportRenderFailure = vi.fn();
+vi.mock("@/runtime/host-runtime", () => ({
+  getHostRuntimeStore: () => ({ reportRenderFailure }),
+}));
+
 let root: Root | null = null;
 
 beforeEach(() => {

@@ -227,6 +227,24 @@ export const zhCN: TranslationResources = {
     },
   },
   agentStream: {
+    activityGroup: {
+      show: "显示工作 · {{count}}",
+      hide: "隐藏工作 · {{count}}",
+    },
+    family: {
+      fullHistory: "完整历史记录 · {{count}} 个会话",
+      loadFailed: "部分历史记录无法加载",
+      searchPlaceholder: "搜索此对话",
+      clearSearch: "清除对话搜索",
+      matchCount: "第 {{current}} 个，共 {{total}} 个",
+      noMatches: "无匹配项",
+      previousMatch: "上一个匹配项",
+      nextMatch: "下一个匹配项",
+      includeTools: "包括工具",
+      conversationStarted: "对话开始于“{{title}}”",
+      continuedInNewSession: "在新会话“{{title}}”中继续",
+      readOnlySegment: "这是较早的只读片段。请从历史记录中的最新会话继续。",
+    },
     empty: "开始和这个 Agent 对话...",
     scrollToBottom: "滚动到底部",
     historyLoadFailed: "无法加载智能体历史记录",
@@ -305,6 +323,7 @@ export const zhCN: TranslationResources = {
       archived: "已归档",
       pending: "{{count}} 个待处理",
       attention: "需要注意",
+      sessionCount: "{{count}} 个会话",
     },
     archiveSheet: {
       hostOffline: "Host 离线",
@@ -1958,6 +1977,7 @@ export const zhCN: TranslationResources = {
       sentTitle: "测试通知已发送",
       sentDescription: "Paseo 已将通知交给操作系统。",
       sendFailedTitle: "无法发送测试通知",
+      background: en.settings.notifications.background,
     },
     hostSections: {
       projects: "项目",

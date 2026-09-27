@@ -24,10 +24,12 @@ export function refreshAgentInitializationTimeout(input: {
   key: string;
   agentId: string;
   setAgentInitializing: SetAgentInitializing;
+  onTimeout?: () => void;
 }): void {
   refreshInitTimeout({
     key: input.key,
     onTimeout: () => {
+      input.onTimeout?.();
       input.setAgentInitializing(input.agentId, false);
       rejectInitDeferred(input.key, createHistorySyncTimeoutError());
     },
@@ -38,7 +40,8 @@ export interface EnsureAgentIsInitializedInput {
   serverId: string;
   agentId: string;
   client: Pick<DaemonClient, "fetchAgentTimeline"> | null;
-  runtime: Pick<HostRuntimeStore, "fetchAgentTimeline">;
+  runtime: Pick<HostRuntimeStore, "fetchAgentTimeline"> &
+    Partial<Pick<HostRuntimeStore, "reportClientIssue">>;
   setAgentInitializing: SetAgentInitializing;
   hostDisconnectedMessage?: string;
 }
@@ -57,7 +60,12 @@ export function ensureAgentIsInitialized(input: EnsureAgentIsInitializedInput): 
   );
 
   const deferred = createInitDeferred(key, timelineRequest.direction);
-  refreshAgentInitializationTimeout({ key, agentId, setAgentInitializing });
+  refreshAgentInitializationTimeout({
+    key,
+    agentId,
+    setAgentInitializing,
+    onTimeout: () => input.runtime.reportClientIssue?.(serverId, "client_history_failed", agentId),
+  });
 
   setAgentInitializing(agentId, true);
 

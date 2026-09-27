@@ -229,6 +229,25 @@ export const ru: TranslationResources = {
     },
   },
   agentStream: {
+    activityGroup: {
+      show: "Показать работу · {{count}}",
+      hide: "Скрыть работу · {{count}}",
+    },
+    family: {
+      fullHistory: "Полная история · сеансов: {{count}}",
+      loadFailed: "Не удалось загрузить часть истории",
+      searchPlaceholder: "Поиск в этой беседе",
+      clearSearch: "Очистить поиск по беседе",
+      matchCount: "{{current}} из {{total}}",
+      noMatches: "Совпадений нет",
+      previousMatch: "Предыдущее совпадение",
+      nextMatch: "Следующее совпадение",
+      includeTools: "Включить инструменты",
+      conversationStarted: "Беседа начата в «{{title}}»",
+      continuedInNewSession: "Продолжение в новом сеансе: «{{title}}»",
+      readOnlySegment:
+        "Это предыдущий сегмент только для чтения. Продолжайте в последнем сеансе в истории.",
+    },
     empty: "Начните общаться с этим агентом...",
     scrollToBottom: "Прокрутить вниз",
     historyLoadFailed: "Не удалось загрузить историю агента",
@@ -309,6 +328,7 @@ export const ru: TranslationResources = {
       archived: "В архиве",
       pending: "На рассмотрении: {{count}}",
       attention: "Внимание",
+      sessionCount: "Сессий: {{count}}",
     },
     archiveSheet: {
       hostOffline: "Хост не в сети",
@@ -2012,6 +2032,7 @@ export const ru: TranslationResources = {
       sentTitle: "Тестовое уведомление отправлено",
       sentDescription: "Paseo передал уведомление операционной системе.",
       sendFailedTitle: "Не удалось отправить тестовое уведомление",
+      background: en.settings.notifications.background,
     },
     hostSections: {
       projects: "Проекты",

@@ -108,9 +108,8 @@ export function useKeyboardShortcuts({
   }, [isDesktopApp, publishBrowserShortcutPolicy]);
 
   // Only the modifier that actually performs the workspace-index jump on this
-  // runtime should reveal the sidebar number badges (Alt on web, Cmd on
-  // desktop Mac, Ctrl on desktop non-Mac). The store ORs altDown/cmdOrCtrlDown
-  // to drive badge visibility, so we set the flag matching this runtime.
+  // runtime should reveal the sidebar number badges. The store ORs
+  // altDown/cmdOrCtrlDown to drive badge visibility, so we set the flag matching this runtime.
   // Derived from the effective bindings: `null` when the user unassigned or
   // rebound the jump shortcut, and no `event.key` ever equals null, so the
   // badges simply never appear.
@@ -128,10 +127,10 @@ export function useKeyboardShortcuts({
 
   const setBadgeModifierDown = (down: boolean) => {
     const state = useKeyboardShortcutsStore.getState();
-    if (isDesktopApp) {
-      state.setCmdOrCtrlDown(down);
-    } else {
+    if (badgeModifierKey === "Alt") {
       state.setAltDown(down);
+    } else {
+      state.setCmdOrCtrlDown(down);
     }
   };
 

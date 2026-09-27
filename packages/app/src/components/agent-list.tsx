@@ -36,6 +36,8 @@ interface AgentListProps {
   showAttentionIndicator?: boolean;
   showHostColumn?: boolean;
   search?: string;
+  /** Related immutable sessions folded into each canonical conversation row. */
+  familyMemberCountByAgentKey?: Record<string, number>;
 }
 
 type DateSectionKey = "today" | "yesterday" | "thisWeek" | "thisMonth" | "older";
@@ -115,11 +117,13 @@ function SessionRowBadges({
   archivedIcon,
   pendingPermissionCount,
   showDesktopAttention,
+  familyMemberCount,
 }: {
   agent: AggregatedAgent;
   archivedIcon: ReactElement;
   pendingPermissionCount: number;
   showDesktopAttention: boolean;
+  familyMemberCount?: number;
 }) {
   const { t } = useTranslation();
   return (
@@ -135,6 +139,9 @@ function SessionRowBadges({
       ) : null}
       {showDesktopAttention ? (
         <SessionBadge label={t("agentList.badges.attention")} tone="danger" />
+      ) : null}
+      {familyMemberCount && familyMemberCount > 1 ? (
+        <SessionBadge label={t("agentList.badges.sessionCount", { count: familyMemberCount })} />
       ) : null}
     </>
   );
@@ -167,6 +174,7 @@ function SessionRow({
   selectedAgentId,
   showAttentionIndicator,
   showHostColumn,
+  familyMemberCount,
   onPress,
   onLongPress,
 }: {
@@ -176,6 +184,7 @@ function SessionRow({
   selectedAgentId?: string;
   showAttentionIndicator: boolean;
   showHostColumn: boolean;
+  familyMemberCount?: number;
   onPress: (agent: AggregatedAgent) => void;
   onLongPress: (agent: AggregatedAgent) => void;
 }) {
@@ -262,6 +271,7 @@ function SessionRow({
             archivedIcon={archivedIcon}
             pendingPermissionCount={pendingPermissionCount}
             showDesktopAttention={showDesktopAttention}
+            familyMemberCount={familyMemberCount}
           />
         </View>
         {isMobile ? agentTitle : null}
@@ -340,6 +350,7 @@ export function AgentList({
   showAttentionIndicator = true,
   showHostColumn = false,
   search,
+  familyMemberCountByAgentKey,
 }: AgentListProps) {
   const { theme } = useUnistyles();
   const { t } = useTranslation();
@@ -442,6 +453,7 @@ export function AgentList({
         <SessionRow
           agent={item.agent}
           search={search}
+          familyMemberCount={familyMemberCountByAgentKey?.[item.key]}
           isMobile={isMobile}
           selectedAgentId={selectedAgentId}
           showAttentionIndicator={showAttentionIndicator}
@@ -455,6 +467,7 @@ export function AgentList({
       handleAgentLongPress,
       handleAgentPress,
       isMobile,
+      familyMemberCountByAgentKey,
       search,
       selectedAgentId,
       showAttentionIndicator,

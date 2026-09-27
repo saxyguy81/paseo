@@ -23,6 +23,7 @@ export interface AgentScreenAgent {
     thinkingOptionId?: string | null;
   } | null;
   features?: readonly AgentFeature[];
+  labels?: Record<string, string>;
   lastError?: string | null;
   projectPlacement?: {
     projectKey?: string;

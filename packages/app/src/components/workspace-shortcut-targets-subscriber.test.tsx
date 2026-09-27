@@ -3,6 +3,7 @@
  */
 import React from "react";
 import { act } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -21,6 +22,14 @@ import { defaultHostAppearance } from "@/hosts/appearance";
 vi.hoisted(() => {
   (globalThis as unknown as { __DEV__: boolean }).__DEV__ = false;
 });
+
+vi.mock("@react-native-async-storage/async-storage", () => ({
+  default: {
+    getItem: vi.fn().mockResolvedValue(null),
+    setItem: vi.fn().mockResolvedValue(undefined),
+    removeItem: vi.fn().mockResolvedValue(undefined),
+  },
+}));
 
 function workspaceDescriptor(input: {
   id: string;
@@ -72,8 +81,10 @@ function setHostProfiles(hosts: HostProfile[]): void {
 describe("WorkspaceShortcutTargetsSubscriber", () => {
   let root: Root | null = null;
   let container: HTMLElement | null = null;
+  let queryClient: QueryClient;
 
   beforeEach(() => {
+    queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container);
@@ -114,6 +125,7 @@ describe("WorkspaceShortcutTargetsSubscriber", () => {
       });
     }
     root = null;
+    queryClient.clear();
     container?.remove();
     container = null;
     act(() => {
@@ -127,9 +139,11 @@ describe("WorkspaceShortcutTargetsSubscriber", () => {
   it("publishes workspace shortcut targets without rendering the sidebar", async () => {
     await act(async () => {
       root?.render(
-        <SidebarModelProvider>
-          <WorkspaceShortcutTargetsSubscriber enabled={true} />
-        </SidebarModelProvider>,
+        <QueryClientProvider client={queryClient}>
+          <SidebarModelProvider>
+            <WorkspaceShortcutTargetsSubscriber enabled={true} />
+          </SidebarModelProvider>
+        </QueryClientProvider>,
       );
     });
 
@@ -195,9 +209,11 @@ describe("WorkspaceShortcutTargetsSubscriber", () => {
 
     await act(async () => {
       root?.render(
-        <SidebarModelProvider>
-          <WorkspaceShortcutTargetsSubscriber enabled={true} />
-        </SidebarModelProvider>,
+        <QueryClientProvider client={queryClient}>
+          <SidebarModelProvider>
+            <WorkspaceShortcutTargetsSubscriber enabled={true} />
+          </SidebarModelProvider>
+        </QueryClientProvider>,
       );
     });
 
@@ -229,9 +245,11 @@ describe("WorkspaceShortcutTargetsSubscriber", () => {
 
     await act(async () => {
       root?.render(
-        <SidebarModelProvider>
-          <WorkspaceShortcutTargetsSubscriber enabled={true} />
-        </SidebarModelProvider>,
+        <QueryClientProvider client={queryClient}>
+          <SidebarModelProvider>
+            <WorkspaceShortcutTargetsSubscriber enabled={true} />
+          </SidebarModelProvider>
+        </QueryClientProvider>,
       );
     });
 
@@ -251,17 +269,21 @@ describe("WorkspaceShortcutTargetsSubscriber", () => {
   it("clears targets when disabled", async () => {
     await act(async () => {
       root?.render(
-        <SidebarModelProvider>
-          <WorkspaceShortcutTargetsSubscriber enabled={true} />
-        </SidebarModelProvider>,
+        <QueryClientProvider client={queryClient}>
+          <SidebarModelProvider>
+            <WorkspaceShortcutTargetsSubscriber enabled={true} />
+          </SidebarModelProvider>
+        </QueryClientProvider>,
       );
     });
 
     await act(async () => {
       root?.render(
-        <SidebarModelProvider>
-          <WorkspaceShortcutTargetsSubscriber enabled={false} />
-        </SidebarModelProvider>,
+        <QueryClientProvider client={queryClient}>
+          <SidebarModelProvider>
+            <WorkspaceShortcutTargetsSubscriber enabled={false} />
+          </SidebarModelProvider>
+        </QueryClientProvider>,
       );
     });
 

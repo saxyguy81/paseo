@@ -1481,7 +1481,7 @@ function ComposerContentImpl({
         agentId: string,
         text: string,
         attachments: ComposerAttachment[],
-        activeTurnBehavior: "interrupt" | "steer",
+        activeTurnBehavior: "interrupt" | "steer" | "queue",
       ) => Promise<void>)
     | null
   >(null);
@@ -1535,7 +1535,11 @@ function ComposerContentImpl({
   }, [focusInput, onFocusInput]);
 
   const submitMessage = useCallback(
-    async (text: string, submitAttachments: ComposerAttachment[]) => {
+    async (
+      text: string,
+      submitAttachments: ComposerAttachment[],
+      activeTurnBehaviorOverride?: "interrupt" | "steer" | "queue",
+    ) => {
       onMessageSent?.();
       if (onSubmitMessageRef.current) {
         await onSubmitMessageRef.current({ text, attachments: submitAttachments, cwd });
@@ -1548,7 +1552,7 @@ function ComposerContentImpl({
         agentIdRef.current,
         text,
         submitAttachments,
-        appSettings.sendBehavior === "steer" ? "steer" : "interrupt",
+        activeTurnBehaviorOverride ?? appSettings.sendBehavior,
       );
     },
     [appSettings.sendBehavior, cwd, onMessageSent, t],
@@ -1563,7 +1567,7 @@ function ComposerContentImpl({
       targetAgentId: string,
       text: string,
       sendAttachments: ComposerAttachment[],
-      activeTurnBehavior: "interrupt" | "steer",
+      activeTurnBehavior: "interrupt" | "steer" | "queue",
     ) => {
       if (!client) {
         throw new Error(t("workspace.terminal.hostDisconnected"));
@@ -1656,6 +1660,7 @@ function ComposerContentImpl({
       outgoingMessage: string,
       outgoingAttachments: ComposerAttachment[],
       forceSend?: boolean,
+      activeTurnBehaviorOverride?: "interrupt" | "steer" | "queue",
     ) => {
       const result = await submitAgentInput({
         message: outgoingMessage,
@@ -1675,7 +1680,11 @@ function ComposerContentImpl({
           if (submitBehavior !== "preserve-and-lock") {
             beginSubmit(submitAttachments);
           }
-          await submitMessage(submitText, submitAttachments);
+          await submitMessage(
+            submitText,
+            submitAttachments,
+            activeTurnBehaviorOverride ?? activeSendBehavior,
+          );
         },
         clearDraft,
         setUserInput: replaceUserInput,
@@ -1696,6 +1705,7 @@ function ComposerContentImpl({
     },
     [
       allowEmptySubmit,
+      activeSendBehavior,
       beginSubmit,
       clearDraft,
       completeSubmit,
@@ -1947,7 +1957,7 @@ function ComposerContentImpl({
   const handleSendQueuedNow = useCallback(
     async (id: string) => {
       if (!sendAgentMessageRef.current && !onSubmitMessageRef.current) return;
-      // Reuse the regular send path; server-side send atomically interrupts any active run.
+      // Reuse the regular send path; the server queues behind any active run.
       const result = await sendQueuedComposerMessageNow({
         agentId,
         messageId: id,
@@ -1979,15 +1989,19 @@ function ComposerContentImpl({
         commands: pluginClientSlashCommands,
       });
       if (pluginSlashCommand && runPluginClientSlashCommand(pluginSlashCommand)) return;
-      queueMessage(payload.text, outgoingAttachments);
+      // The daemon owns active-turn admission. Submit the follow-up now so it is
+      // durably queued even if this browser disconnects or another device opens
+      // the conversation. The legacy client queue remains only to drain drafts
+      // created by older Paseo versions.
+      void sendMessageWithContent(payload.text, outgoingAttachments, true, "queue");
     },
     [
       attachments,
       buildOutgoingAttachments,
       pluginClientSlashCommands,
-      queueMessage,
       runClientSlashCommand,
       runPluginClientSlashCommand,
+      sendMessageWithContent,
     ],
   );
 
@@ -2300,8 +2314,12 @@ function ComposerContentImpl({
   );
 
   const inputAreaContainerStyle = useMemo(
-    () => [styles.inputAreaContainer, isComposerLocked && styles.inputAreaLocked],
-    [isComposerLocked],
+    () => [
+      styles.inputAreaContainer,
+      isCompactLayout && styles.inputAreaContainerCompact,
+      isComposerLocked && styles.inputAreaLocked,
+    ],
+    [isCompactLayout, isComposerLocked],
   );
 
   const attachmentTray = useMemo(
@@ -2541,6 +2559,9 @@ const styles = StyleSheet.create((theme: Theme) => ({
   },
   inputAreaLocked: {
     opacity: 0.6,
+  },
+  inputAreaContainerCompact: {
+    paddingBottom: theme.spacing[1],
   },
   inputAreaContent: {
     flexShrink: 1,

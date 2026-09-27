@@ -227,6 +227,25 @@ export const en = {
     scrollToBottom: "Scroll to bottom",
     historyLoadFailed: "Couldn't load agent history",
     messageCapped: "This message was capped ({{bytes}} bytes).",
+    activityGroup: {
+      show: "Show work · {{count}}",
+      hide: "Hide work · {{count}}",
+    },
+    family: {
+      fullHistory: "Full history · {{count}} sessions",
+      loadFailed: "Some history could not be loaded",
+      searchPlaceholder: "Search this conversation",
+      clearSearch: "Clear conversation search",
+      matchCount: "{{current}} of {{total}}",
+      noMatches: "No matches",
+      previousMatch: "Previous match",
+      nextMatch: "Next match",
+      includeTools: "Include tools",
+      conversationStarted: "Conversation started in “{{title}}”",
+      continuedInNewSession: "Continued in a new session: “{{title}}”",
+      readOnlySegment:
+        "This is an earlier read-only segment. Continue from the latest session in History.",
+    },
     permission: {
       rejectedPlan: "Rejected plan",
       approvedPlan: "Approved plan",
@@ -302,6 +321,7 @@ export const en = {
       archived: "Archived",
       pending: "{{count}} pending",
       attention: "Attention",
+      sessionCount: "{{count}} sessions",
     },
     archiveSheet: {
       hostOffline: "Host offline",
@@ -2039,6 +2059,23 @@ export const en = {
       sentTitle: "Test notification sent",
       sentDescription: "Paseo handed the notification to the operating system.",
       sendFailedTitle: "Unable to send test notification",
+      background: {
+        title: "Background notifications",
+        noHost: "Connect to an updated Paseo host to enable notifications.",
+        unsupported:
+          "This browser does not support background notifications. On iPhone, install Paseo to your Home Screen first.",
+        unavailable: "This host has not enabled Web Push yet.",
+        selectedElsewhere:
+          "Background notifications are assigned to another host. Open that host's settings and turn them off before switching.",
+        denied:
+          "Notifications are blocked in this browser. Allow them in browser settings, then return here.",
+        enabled: "Paseo will alert you when an agent needs attention, finishes, or fails.",
+        disabled: "Turn this on to receive background alerts when Paseo is not open.",
+        enable: "Turn on",
+        disable: "Turn off",
+        working: "Working...",
+        updateFailed: "Notifications could not be updated",
+      },
     },
     hostSections: {
       projects: "Projects",

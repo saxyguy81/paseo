@@ -229,6 +229,25 @@ export const es: TranslationResources = {
     },
   },
   agentStream: {
+    activityGroup: {
+      show: "Mostrar trabajo · {{count}}",
+      hide: "Ocultar trabajo · {{count}}",
+    },
+    family: {
+      fullHistory: "Historial completo · {{count}} sesiones",
+      loadFailed: "No se pudo cargar parte del historial",
+      searchPlaceholder: "Buscar en esta conversación",
+      clearSearch: "Borrar búsqueda de conversación",
+      matchCount: "{{current}} de {{total}}",
+      noMatches: "Sin coincidencias",
+      previousMatch: "Coincidencia anterior",
+      nextMatch: "Coincidencia siguiente",
+      includeTools: "Incluir herramientas",
+      conversationStarted: "Conversación iniciada en «{{title}}»",
+      continuedInNewSession: "Continuación en una sesión nueva: «{{title}}»",
+      readOnlySegment:
+        "Este es un segmento anterior de solo lectura. Continúe desde la sesión más reciente en Historial.",
+    },
     empty: "Comience a chatear con este agente...",
     scrollToBottom: "Desplazarse hacia abajo",
     historyLoadFailed: "No se pudo cargar el historial del agente",
@@ -310,6 +329,7 @@ export const es: TranslationResources = {
       archived: "Archivado",
       pending: "{{count}}pendiente",
       attention: "Atención",
+      sessionCount: "{{count}} sesiones",
     },
     archiveSheet: {
       hostOffline: "Hostfuera de línea",
@@ -2027,6 +2047,7 @@ export const es: TranslationResources = {
       sentTitle: "Notificación de prueba enviada",
       sentDescription: "Paseo entregó la notificación al sistema operativo.",
       sendFailedTitle: "No se pudo enviar la notificación de prueba",
+      background: en.settings.notifications.background,
     },
     hostSections: {
       projects: "Proyectos",

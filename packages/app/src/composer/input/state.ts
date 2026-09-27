@@ -78,12 +78,6 @@ export function applyDictationTranscript(text: string, ctx: DictationTranscriptC
 
   ctx.replaceText(nextValue);
 
-  if (ctx.defaultSendBehavior === "queue" && ctx.isAgentRunning && ctx.onQueue) {
-    ctx.onQueue({ text: nextValue, attachments: ctx.attachments, cwd: ctx.cwd });
-    ctx.replaceText("");
-    return;
-  }
-
   ctx.onSubmit({
     text: nextValue,
     attachments: ctx.attachments,
@@ -118,10 +112,6 @@ export function computeCanStartDictation(input: {
 }
 
 export function runDefaultSendAction(ctx: SendActionContext): void {
-  if (ctx.defaultSendBehavior === "queue" && ctx.isAgentRunning && ctx.onQueue) {
-    ctx.handleQueueMessage();
-    return;
-  }
   ctx.handleSendMessage();
 }
 

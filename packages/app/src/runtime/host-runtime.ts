@@ -1,5 +1,8 @@
 import { useSyncExternalStore, useMemo } from "react";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { randomUUID } from "expo-crypto";
+import { AppState } from "react-native";
+import { ClientIncidentQueue, type ClientIncident } from "./client-incidents";
 import equal from "fast-deep-equal/es6";
 import {
   DaemonClient,
@@ -1396,6 +1399,8 @@ export class HostRuntimeStore {
   private storage: HostRuntimeStorage;
   private replicaCache: ReplicaCache;
   private readonly revokePushNotifications: typeof revokePushNotifications;
+  private readonly incidentQueue: ClientIncidentQueue;
+  private readonly incidentConnectionTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   constructor(input?: {
     deps?: HostRuntimeControllerDeps;
@@ -1405,6 +1410,7 @@ export class HostRuntimeStore {
   }) {
     this.deps = input?.deps ?? createDefaultDeps();
     this.storage = input?.storage ?? AsyncStorage;
+    this.incidentQueue = new ClientIncidentQueue(this.storage, randomUUID);
     this.replicaCache = new ReplicaCache(input?.replicaRowStore ?? createReplicaRowStore());
     this.revokePushNotifications = input?.revokePushNotifications ?? revokePushNotifications;
   }
@@ -2039,6 +2045,8 @@ export class HostRuntimeStore {
         continue;
       }
       this.controllers.delete(serverId);
+      clearTimeout(this.incidentConnectionTimers.get(serverId));
+      this.incidentConnectionTimers.delete(serverId);
       this.lastConnectionStatusByServer.delete(serverId);
       this.connectionStatusStartedAtByServer.delete(serverId);
       this.directorySyncByServer.get(serverId)?.dispose();
@@ -2155,6 +2163,24 @@ export class HostRuntimeStore {
     this.lastConnectionStatusByServer.set(serverId, snapshot.connectionStatus);
     const didTransitionOnline =
       snapshot.connectionStatus === "online" && previousStatus !== "online";
+    if (didTransitionOnline && snapshot.client) {
+      clearTimeout(this.incidentConnectionTimers.get(serverId));
+      this.incidentConnectionTimers.delete(serverId);
+      void this.incidentQueue.flush(serverId, snapshot.client).catch(() => undefined);
+    } else if (previousStatus === "online" && isUnavailable) {
+      clearTimeout(this.incidentConnectionTimers.get(serverId));
+      this.incidentConnectionTimers.set(
+        serverId,
+        setTimeout(() => {
+          this.incidentConnectionTimers.delete(serverId);
+          const foreground = isWeb
+            ? document.visibilityState === "visible"
+            : AppState.currentState === "active";
+          if (foreground && this.getSnapshot(serverId)?.connectionStatus !== "online")
+            this.reportClientIssue(serverId, "client_connection_lost");
+        }, 120_000),
+      );
+    }
     if (didTransitionOnline) {
       useSessionStore.getState().bumpHistorySyncGeneration(serverId);
       // Checkout git data is push-driven; pushes emitted while disconnected are gone for
@@ -2204,6 +2230,7 @@ export class HostRuntimeStore {
     })
       .then((result) => {
         if (result.status === "failed") {
+          this.reportClientIssue(serverId, "client_queue_failed", agentId);
           console.error("[HostRuntime] failed to drain queued agent message", {
             serverId,
             agentId,
@@ -2281,6 +2308,23 @@ export class HostRuntimeStore {
 
   getClient(serverId: string): DaemonClient | null {
     return this.controllers.get(serverId)?.getClient() ?? null;
+  }
+
+  reportClientIssue(serverId: string, code: ClientIncident["code"], agentId?: string): void {
+    void this.incidentQueue
+      .capture(serverId, code, agentId)
+      .then(async () => {
+        const snapshot = this.getSnapshot(serverId);
+        if (snapshot?.connectionStatus === "online" && snapshot.client)
+          await this.incidentQueue.flush(serverId, snapshot.client);
+        return undefined;
+      })
+      .catch(() => undefined);
+  }
+
+  reportRenderFailure(): void {
+    for (const serverId of this.controllers.keys())
+      this.reportClientIssue(serverId, "client_render_failed");
   }
 
   subscribe(serverId: string, listener: () => void): () => void {
@@ -2400,7 +2444,22 @@ export class HostRuntimeStore {
     const directory = this.directorySyncByServer.get(serverId);
     if (!directory) throw new Error(`Unknown host runtime for serverId ${serverId}`);
     const owner = useSessionStore.getState().sessions[serverId]?.viewedTimelineSync;
-    const page = await directory.fetchTimeline(agentId, request);
+    let page: Awaited<ReturnType<typeof directory.fetchTimeline>>;
+    try {
+      page = await directory.fetchTimeline(agentId, request);
+    } catch (error) {
+      if (!(error instanceof Error && error.name === "AbortError"))
+        this.reportClientIssue(serverId, "client_history_failed", agentId);
+      throw error;
+    }
+    if (
+      page.direction === "tail" &&
+      page.entries.length === 0 &&
+      page.window.maxSeq > 0 &&
+      page.agent?.lastUserMessageAt
+    ) {
+      this.reportClientIssue(serverId, "client_history_empty", agentId);
+    }
     if (owner && useSessionStore.getState().sessions[serverId]?.viewedTimelineSync === owner) {
       owner.flushStreamAgent(agentId);
       owner.applyTimelineResponse(page);

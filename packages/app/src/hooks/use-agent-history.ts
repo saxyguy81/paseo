@@ -4,10 +4,10 @@ import type {
   FetchAgentHistoryPageInfo,
 } from "@getpaseo/client/internal/daemon-client";
 import { useInfiniteQuery } from "@tanstack/react-query";
-import { useCallback, useMemo, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
 import type { AggregatedAgent } from "@/hooks/use-aggregated-agents";
-import { getHostRuntimeStore, isHostRuntimeConnected, useHosts } from "@/runtime/host-runtime";
+import { getHostRuntimeStore, useHosts } from "@/runtime/host-runtime";
 import { useSessionStore } from "@/stores/session-store";
 import { buildAgentDirectoryState } from "@/utils/agent-directory-sync";
 import { agentHistoryQueryKey, allAgentHistoryQueryKey } from "./agent-history-query-key";
@@ -218,44 +218,76 @@ export function useAgentHistory(options: {
   serverId?: string | null;
   enabled?: boolean;
   search?: string;
+  /** Keep fetching until every unfiltered history page has been loaded. */
+  autoLoadAll?: boolean;
 }): AgentHistoryResult {
   const { t } = useTranslation();
   const daemons = useHosts();
   const runtime = getHostRuntimeStore();
-  const runtimeVersion = useSyncExternalStore(
-    (onStoreChange) => runtime.subscribeAll(onStoreChange),
-    () => runtime.getVersion(),
-    () => runtime.getVersion(),
-  );
   const serverId = useMemo(() => {
     const value = options.serverId;
     return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
   }, [options.serverId]);
   const enabled = options.enabled ?? true;
+  const targetServerIdsForRuntime = useMemo(
+    () => (serverId ? [serverId] : daemons.map((daemon) => daemon.serverId)),
+    [daemons, serverId],
+  );
+  const subscribeToTargetRuntime = useCallback(
+    (onStoreChange: () => void) => runtime.subscribeAll(onStoreChange),
+    [runtime],
+  );
+  const getTargetRuntimeSnapshot = useCallback(
+    () =>
+      JSON.stringify(
+        targetServerIdsForRuntime.map((targetServerId) => {
+          const snapshot = runtime.getSnapshot(targetServerId);
+          return [
+            targetServerId,
+            snapshot?.connectionStatus ?? null,
+            snapshot?.clientGeneration ?? -1,
+            Boolean(runtime.getClient(targetServerId)),
+          ];
+        }),
+      ),
+    [runtime, targetServerIdsForRuntime],
+  );
+  const targetRuntimeSnapshot = useSyncExternalStore(
+    subscribeToTargetRuntime,
+    getTargetRuntimeSnapshot,
+    getTargetRuntimeSnapshot,
+  );
   // A host the user asked about splits two ways: one this fetch can reach, and
   // one whose sessions will be missing from the answer. Both come out of here,
   // because dropping the unreachable ones silently is what lets the list — and
   // worse, "No sessions match" — overstate what was actually searched.
+  // The runtime object is stable while its connection state mutates. Subscribe
+  // to a primitive snapshot that contains the fields this query needs; using a
+  // generic version only as a memo dependency can be optimized away by the
+  // React compiler and leave a newly connected host classified as unreachable.
   const { targetHosts, unreachableHosts } = useMemo(() => {
-    void runtimeVersion;
+    const rows = JSON.parse(targetRuntimeSnapshot) as Array<
+      [
+        serverId: string,
+        connectionStatus: string | null,
+        clientGeneration: number,
+        hasClient: boolean,
+      ]
+    >;
     const serverLabelById = new Map(daemons.map((daemon) => [daemon.serverId, daemon.label]));
-    const serverIds = serverId ? [serverId] : daemons.map((daemon) => daemon.serverId);
     const hosts: AgentHistoryHost[] = [];
     const unreachable: AgentHistoryHostError[] = [];
-
-    for (const targetServerId of serverIds) {
-      const snapshot = runtime.getSnapshot(targetServerId);
-      const client = runtime.getClient(targetServerId);
+    for (const [targetServerId, connectionStatus, , hasClient] of rows) {
       const serverName = serverLabelById.get(targetServerId) ?? targetServerId;
-      if (!client || !isHostRuntimeConnected(snapshot)) {
+      const client = hasClient ? runtime.getClient(targetServerId) : null;
+      if (!client || connectionStatus !== "online") {
         unreachable.push({ serverId: targetServerId, serverName });
         continue;
       }
       hosts.push({ serverId: targetServerId, serverLabel: serverName, client });
     }
-
     return { targetHosts: hosts, unreachableHosts: unreachable };
-  }, [daemons, runtime, runtimeVersion, serverId]);
+  }, [daemons, runtime, targetRuntimeSnapshot]);
   const targetServerIds = useMemo(() => targetHosts.map((host) => host.serverId), [targetHosts]);
   // One gate, checked before the field is offered: a fleet where any host
   // predates search has no search, rather than a list that silently omits that
@@ -333,6 +365,28 @@ export function useAgentHistory(options: {
     }
     void fetchNextPage();
   }, [enabled, fetchNextPage, hasNextPage, isFetchingNextPage, targetHosts.length]);
+
+  useEffect(() => {
+    if (
+      !options.autoLoadAll ||
+      search ||
+      !enabled ||
+      targetHosts.length === 0 ||
+      !hasNextPage ||
+      isFetchingNextPage
+    ) {
+      return;
+    }
+    void fetchNextPage();
+  }, [
+    enabled,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+    options.autoLoadAll,
+    search,
+    targetHosts.length,
+  ]);
 
   const agents = useMemo(() => {
     const pages = data?.pages ?? [];

@@ -22,6 +22,7 @@ import { shallow, useShallow } from "zustand/shallow";
 import { useStoreWithEqualityFn } from "zustand/traditional";
 import { AgentStreamView, type AgentStreamViewHandle } from "@/agent-stream/view";
 import { ArchivedAgentCallout } from "@/components/archived-agent-callout";
+import { ConversationFamilyToolbar } from "@/components/conversation-family-toolbar";
 import { ComposerDock } from "@/composer/dock";
 import { FileDropZone } from "@/components/file-drop/file-drop-zone";
 import { useRetainedPanelActive } from "@/components/retained-panel";
@@ -100,6 +101,8 @@ import { applyLegacyDaemonWorkspaceOwnership } from "@/workspace/legacy-daemon-w
 import type { WorkspaceFileOpenRequest } from "@/workspace/file-open";
 import { deriveSidebarStateBucket } from "@/utils/sidebar-agent-state";
 import { buildDraftAgentSetup, type ClientSlashCommand } from "@/client-slash-commands";
+import { parseConversationFamilyLabels } from "@/conversation-family";
+import { useConversationFamily } from "@/hooks/use-conversation-family";
 
 interface ChatAgentStateShape {
   serverId: string | null;
@@ -114,6 +117,7 @@ interface ChatAgentStateShape {
   thinkingOptionId?: Agent["thinkingOptionId"];
   runtimeInfo?: Agent["runtimeInfo"];
   features?: Agent["features"];
+  labels?: Agent["labels"];
   lastError?: Agent["lastError"] | null;
 }
 
@@ -173,6 +177,7 @@ function selectChatAgentState(
     thinkingOptionId: agent.thinkingOptionId,
     runtimeInfo: agent.runtimeInfo,
     features: agent.features,
+    labels: agent.labels,
     lastError: agent.lastError ?? null,
     archivedAt: agent.archivedAt ?? null,
     requiresAttention: agent.requiresAttention ?? false,
@@ -200,6 +205,7 @@ function buildChatAgentFromState(
     thinkingOptionId: state.thinkingOptionId,
     runtimeInfo: state.runtimeInfo,
     features: state.features,
+    labels: state.labels,
     lastError: state.lastError ?? null,
     projectPlacement,
   };
@@ -610,7 +616,9 @@ function AgentPanelBody({
   const agentState = useSessionStore(
     useShallow((state) => selectChatAgentState(state, serverId, agentId)),
   );
-  const [lookupState, setLookupState] = useState<AgentLookupState>({ tag: "idle" });
+  const [lookupState, setLookupState] = useState<AgentLookupState>({
+    tag: "idle",
+  });
   const lookupAttemptTokenRef = useRef(0);
   const retryAgentLookup = useCallback(() => setLookupState({ tag: "idle" }), []);
 
@@ -815,7 +823,11 @@ function ChatAgentContent({
     sync: viewedTimelineSync,
   });
   const hasActiveCreateHandoff = useCreateFlowStore((state) =>
-    findActiveCreateHandoff({ pendingByDraftId: state.pendingByDraftId, serverId, agentId }),
+    findActiveCreateHandoff({
+      pendingByDraftId: state.pendingByDraftId,
+      serverId,
+      agentId,
+    }),
   );
   const hasSession = useSessionStore((state) => Boolean(state.sessions[serverId]));
   const [missingAgentState, setMissingAgentState] = useState<AgentScreenMissingState>({
@@ -1157,7 +1169,10 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   onOpenWorkspaceFile?: (request: WorkspaceFileOpenRequest) => void;
 }) {
   const { t } = useTranslation();
-  const subagentRows = useSubagentsForParent({ serverId, parentAgentId: agentId });
+  const subagentRows = useSubagentsForParent({
+    serverId,
+    parentAgentId: agentId,
+  });
   const tasks = useSessionStore((state): TodoEntry[] | undefined =>
     state.sessions[serverId]?.agentTasks.get(agentId),
   );
@@ -1166,8 +1181,14 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
     parentAgentId: agentId,
     rows: subagentRows,
   });
+  const familyMetadata = useMemo(
+    () => parseConversationFamilyLabels(effectiveAgent.labels),
+    [effectiveAgent.labels],
+  );
+  const isReadOnlyHistory = Boolean(familyMetadata && familyMetadata.currentAgentId !== agentId);
   const hasPluginComposerPills = useHasPluginComposerPills(serverId, workspaceId, agentId);
-  const hasActiveComposer = !agentState.archivedAt && !isArchivingCurrentAgent;
+  const hasActiveComposer =
+    !agentState.archivedAt && !isArchivingCurrentAgent && !isReadOnlyHistory;
   const hasVisibleAgentTracks = hasAgentTracks({
     subagentRows,
     tasks,
@@ -1235,6 +1256,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
         onAttentionPromptSend={onAttentionPromptSend}
         onComposerHeightChange={handleComposerHeightChange}
         onMessageSent={handleMessageSent}
+        isReadOnlyHistory={isReadOnlyHistory}
       />
     </RenderProfile>
   );
@@ -1253,6 +1275,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
           hasVisibleAgentTracks={hasVisibleAgentTracks}
           toast={toastApi}
           onOpenWorkspaceFile={onOpenWorkspaceFile}
+          readOnly={isReadOnlyHistory}
         />
       </RenderProfile>
       {hasActiveComposer ? (
@@ -1294,7 +1317,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   );
 
   const dock = (
-    <ChatSurface disabled={isArchivingCurrentAgent}>
+    <ChatSurface disabled={isArchivingCurrentAgent || isReadOnlyHistory}>
       {dockContent}
       {composerSection}
       {dockOverlay}
@@ -1378,6 +1401,7 @@ const AgentStreamSection = memo(function AgentStreamSection({
   hasVisibleAgentTracks,
   toast,
   onOpenWorkspaceFile,
+  readOnly,
 }: {
   streamViewRef: React.RefObject<AgentStreamViewHandle | null>;
   serverId: string;
@@ -1390,8 +1414,13 @@ const AgentStreamSection = memo(function AgentStreamSection({
   hasVisibleAgentTracks: boolean;
   toast: ReturnType<typeof useToastHost>["api"];
   onOpenWorkspaceFile?: (request: WorkspaceFileOpenRequest) => void;
+  readOnly: boolean;
 }) {
   const isCompactFormFactor = useIsCompactFormFactor();
+  const [isCompactFamilyHistoryExpanded, setIsCompactFamilyHistoryExpanded] = useState(false);
+  const isFamilyHistoryExpanded = !isCompactFormFactor || isCompactFamilyHistoryExpanded;
+  const [isFamilySearchActive, setIsFamilySearchActive] = useState(false);
+  useEffect(() => setIsCompactFamilyHistoryExpanded(false), [agent.id]);
   const hasWorkspaceDiffStat = useWorkspaceHasDiffStat(serverId, workspaceId);
   const hasVisibleComposerTracks =
     hasActiveComposer && (hasVisibleAgentTracks || hasWorkspaceDiffStat);
@@ -1415,10 +1444,39 @@ const AgentStreamSection = memo(function AgentStreamSection({
     useShallow((state) =>
       agentId
         ? selectAgentTurnPresentation(state.sessions[serverId], agentId)
-        : { isActive: false, isCancelling: false, startedAt: null, turnId: null },
+        : {
+            isActive: false,
+            isCancelling: false,
+            startedAt: null,
+            turnId: null,
+          },
     ),
   );
   const streamItems = streamItemsRaw ?? EMPTY_STREAM_ITEMS;
+  const family = useConversationFamily({
+    serverId,
+    agentId: agent.id,
+    labels: agent.labels,
+    loadHistory: isFamilySearchActive,
+  });
+  const displayedStreamItems =
+    family && family.streamItems.length > 0 ? family.streamItems : streamItems;
+  const familyHistoryPagination = useMemo(
+    () =>
+      family
+        ? {
+            hasOlder: family.hasOlder,
+            isLoadingOlder: family.isLoading,
+            progressKey: family.progressKey,
+            onLoadOlder: family.loadOlder,
+          }
+        : undefined,
+    [family],
+  );
+  const handleJumpToFamilyMatch = useCallback(
+    (itemId: string) => streamViewRef.current?.scrollToMessage(itemId),
+    [streamViewRef],
+  );
   const pendingPermissionList = useStoreWithEqualityFn(
     useSessionStore,
     (state) => {
@@ -1447,22 +1505,36 @@ const AgentStreamSection = memo(function AgentStreamSection({
   }, [pendingPermissionList]);
 
   return (
-    <AgentStreamView
-      ref={streamViewRef}
-      agentId={agent.id}
-      serverId={serverId}
-      context={agent}
-      streamItems={streamItems}
-      pendingPermissions={pendingPermissions}
-      routeBottomAnchorRequest={routeBottomAnchorRequest}
-      isAuthoritativeHistoryReady={hasAppliedAuthoritativeHistory}
-      bottomOverlayTailClearance={bottomOverlayTailClearance}
-      bottomOverlayControlClearance={bottomOverlayControlClearance}
-      toast={toast}
-      pendingMessageSubmissions={pendingMessageSubmissions}
-      turnPresentation={turnPresentation}
-      onOpenWorkspaceFile={onOpenWorkspaceFile}
-    />
+    <View style={styles.familyStreamContainer}>
+      {family ? (
+        <ConversationFamilyToolbar
+          family={family}
+          isExpanded={isFamilyHistoryExpanded}
+          onSearchActiveChange={setIsFamilySearchActive}
+          onExpandedChange={setIsCompactFamilyHistoryExpanded}
+          onJumpToMatch={handleJumpToFamilyMatch}
+        />
+      ) : null}
+      <AgentStreamView
+        ref={streamViewRef}
+        agentId={agent.id}
+        serverId={serverId}
+        context={agent}
+        streamItems={displayedStreamItems}
+        pendingPermissions={readOnly ? EMPTY_PENDING_PERMISSIONS : pendingPermissions}
+        routeBottomAnchorRequest={routeBottomAnchorRequest}
+        isAuthoritativeHistoryReady={hasAppliedAuthoritativeHistory}
+        bottomOverlayTailClearance={bottomOverlayTailClearance}
+        bottomOverlayControlClearance={bottomOverlayControlClearance}
+        toast={toast}
+        pendingMessageSubmissions={pendingMessageSubmissions}
+        turnPresentation={turnPresentation}
+        onOpenWorkspaceFile={onOpenWorkspaceFile}
+        readOnly={readOnly}
+        readOnlyItemIds={family?.readOnlyItemIds}
+        historyPagination={familyHistoryPagination}
+      />
+    </View>
   );
 });
 
@@ -1479,6 +1551,7 @@ const AgentComposerSection = memo(function AgentComposerSection({
   onAttentionPromptSend,
   onComposerHeightChange,
   onMessageSent,
+  isReadOnlyHistory,
 }: {
   agentId?: string;
   serverId: string;
@@ -1492,9 +1565,20 @@ const AgentComposerSection = memo(function AgentComposerSection({
   onAttentionPromptSend: () => void;
   onComposerHeightChange: (height: number) => void;
   onMessageSent: () => void;
+  isReadOnlyHistory: boolean;
 }) {
+  const { t } = useTranslation();
   if (!agentId) {
     return null;
+  }
+  if (isReadOnlyHistory) {
+    return (
+      <View style={styles.familyReadOnlyCalloutRail} testID="conversation-family-read-only">
+        <Text style={styles.familyReadOnlyCalloutText}>
+          {t("agentStream.family.readOnlySegment")}
+        </Text>
+      </View>
+    );
   }
   if (archivedAt) {
     return <ArchivedAgentCallout serverId={serverId} agentId={agentId} />;
@@ -1545,7 +1629,9 @@ function ActiveAgentComposer({
   const isCompactFormFactor = useIsCompactFormFactor();
   const { onLayout: onInputAreaLayout, isBelow: isCompactComposerLayout } = useContainerWidthBelow(
     COMPACT_FORM_FACTOR_WIDTH,
-    { initialIsBelow: isCompactFormFactor },
+    {
+      initialIsBelow: isCompactFormFactor,
+    },
   );
   const paneContext = usePaneContext();
   const openInSidePane = useSettings((settings) => settings.openInSidePane);
@@ -1570,7 +1656,10 @@ function ActiveAgentComposer({
       }
       openWorkspaceChanges({
         isCompact: isCompactFormFactor,
-        workspaceKey: buildWorkspaceTabPersistenceKey({ serverId, workspaceId }),
+        workspaceKey: buildWorkspaceTabPersistenceKey({
+          serverId,
+          workspaceId,
+        }),
         checkout: { serverId, cwd, isGit: true },
         preferences: openInSidePane,
       });
@@ -1585,7 +1674,10 @@ function ActiveAgentComposer({
         throw new Error("Agent not found");
       }
 
-      const workspaceKey = buildWorkspaceTabPersistenceKey({ serverId, workspaceId });
+      const workspaceKey = buildWorkspaceTabPersistenceKey({
+        serverId,
+        workspaceId,
+      });
       if (workspaceKey) {
         unpinWorkspaceAgent(workspaceKey, agentId);
         hideWorkspaceAgent(workspaceKey, agentId);
@@ -1741,6 +1833,26 @@ const styles = StyleSheet.create((theme) => ({
     flex: 1,
     overflow: "hidden",
     ...(isWeb ? { userSelect: "none" as const } : {}),
+  },
+  familyStreamContainer: {
+    flex: 1,
+    minHeight: 0,
+  },
+  familyReadOnlyCalloutRail: {
+    width: "100%",
+    alignItems: "center",
+    borderTopWidth: theme.borderWidth[1],
+    borderTopColor: theme.colors.border,
+    backgroundColor: theme.colors.surface0,
+    paddingHorizontal: theme.spacing[4],
+    paddingVertical: theme.spacing[3],
+  },
+  familyReadOnlyCalloutText: {
+    width: "100%",
+    maxWidth: MAX_CONTENT_WIDTH,
+    color: theme.colors.foregroundMuted,
+    fontSize: theme.fontSize.sm,
+    textAlign: "center",
   },
   timelineSyncCalloutRail: {
     width: "100%",
