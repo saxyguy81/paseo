@@ -26,6 +26,7 @@ import {
   SessionInboundMessageSchema,
   type ActiveTurnBehavior,
   type ServerInfoStatusPayload,
+  type WebPushSubscription,
 } from "@getpaseo/protocol/messages";
 import { validateWSOutboundMessage } from "@getpaseo/protocol/validation/ws-outbound";
 import type {
@@ -975,6 +976,7 @@ const DEFAULT_RECONNECT_BASE_DELAY_MS = 1500;
 const DEFAULT_RECONNECT_MAX_DELAY_MS = 30000;
 const DEFAULT_SESSION_RPC_TIMEOUT_MS = 60_000;
 const PUSH_TOKEN_REVOCATION_TIMEOUT_MS = 2_000;
+const PUSH_SUBSCRIPTION_RPC_TIMEOUT_MS = 10_000;
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
 const DEFAULT_LIVENESS_TIMEOUT_MS = 5000;
 const LIVENESS_HEARTBEAT_INTERVAL_MS = 10_000;
@@ -2020,6 +2022,35 @@ export class DaemonClient {
       message: { type: "push.unregister.request", token, requestId },
       responseType: "push.unregister.response",
       timeout: PUSH_TOKEN_REVOCATION_TIMEOUT_MS,
+    });
+  }
+
+  async subscribeWebPush(
+    subscription: WebPushSubscription,
+    revocationToken?: string,
+  ): Promise<string> {
+    const requestId = this.createRequestId();
+    const payload = await this.sendCorrelatedSessionRequest({
+      requestId,
+      message: {
+        type: "push.web.subscribe.request",
+        subscription,
+        requestId,
+        ...(revocationToken ? { revocationToken } : {}),
+      },
+      responseType: "push.web.subscribe.response",
+      timeout: PUSH_SUBSCRIPTION_RPC_TIMEOUT_MS,
+    });
+    return payload.revocationToken;
+  }
+
+  async unsubscribeWebPush(endpoint: string, revocationToken: string): Promise<void> {
+    const requestId = this.createRequestId();
+    await this.sendCorrelatedSessionRequest({
+      requestId,
+      message: { type: "push.web.unsubscribe.request", endpoint, revocationToken, requestId },
+      responseType: "push.web.unsubscribe.response",
+      timeout: PUSH_SUBSCRIPTION_RPC_TIMEOUT_MS,
     });
   }
 
@@ -5075,6 +5106,26 @@ export class DaemonClient {
         type: "diagnostics.request",
       },
     });
+  }
+
+  async reportDiagnosticIncident(input: {
+    incidentId: string;
+    agentId?: string;
+    code:
+      | "client_history_failed"
+      | "client_history_empty"
+      | "client_render_failed"
+      | "client_connection_lost"
+      | "client_queue_failed";
+  }): Promise<boolean> {
+    // COMPAT(diagnosticIncidents): added in v0.7.2, remove gate after 2027-03-02.
+    if (!this.lastServerInfoMessage?.features?.diagnosticIncidents) return false;
+    const response =
+      await this.sendNamespacedCorrelatedSessionRequest<"diagnostics.incident.report.response">({
+        message: { type: "diagnostics.incident.report.request", ...input },
+        timeout: 8000,
+      });
+    return response.accepted;
   }
 
   async patchDaemonConfig(

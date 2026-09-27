@@ -371,6 +371,8 @@ const AgentCapabilityFlagsSchema: z.ZodType<AgentCapabilityFlags> = z
     supportsMcpServers: z.boolean(),
     supportsReasoningStream: z.boolean(),
     supportsToolInvocations: z.boolean(),
+    // COMPAT(in-flight-steering): older daemons do not advertise this.
+    supportsInFlightSteering: z.boolean().optional().default(false),
     // COMPAT(rewind): added in v0.1.X, drop when floor >= v0.1.X.
     supportsRewindConversation: z.boolean().optional().default(false),
     // COMPAT(rewind): added in v0.1.X, drop when floor >= v0.1.X.
@@ -666,6 +668,7 @@ export const AgentTimelineItemPayloadSchema: z.ZodType<AgentTimelineItem, unknow
     text: z.string(),
     messageId: z.string().optional(),
     clientMessageId: z.string().optional(),
+    deliveryStatus: z.literal("rejected").optional(),
   }),
   z.object({
     type: z.literal("assistant_message"),
@@ -736,6 +739,14 @@ export const AgentStreamEventPayloadSchema = z.discriminatedUnion("type", [
     provider: AgentProviderSchema,
     turnId: z.string().optional(),
     error: z.string(),
+    failureKind: z
+      .enum([
+        "context_overflow",
+        "conversation_unresolved",
+        "resume_model_unavailable",
+        "retryable_api",
+      ])
+      .optional(),
     code: z.string().optional(),
     diagnostic: z.string().optional(),
   }),
@@ -1192,7 +1203,7 @@ const ImageAttachmentSchema = z.object({
   mimeType: z.string(), // e.g., "image/jpeg", "image/png"
 });
 
-export const ActiveTurnBehaviorSchema = z.enum(["interrupt", "steer"]);
+export const ActiveTurnBehaviorSchema = z.enum(["interrupt", "steer", "queue"]);
 export type ActiveTurnBehavior = z.infer<typeof ActiveTurnBehaviorSchema>;
 
 export const SendAgentMessageSchema = z.object({
@@ -1407,6 +1418,20 @@ export const HubManagementDaemonPermissionsUpdateRequestSchema = z.object({
 export const DiagnosticsRequestSchema = z.object({
   type: z.literal("diagnostics.request"),
   requestId: z.string(),
+});
+
+export const DiagnosticIncidentRequestSchema = z.object({
+  type: z.literal("diagnostics.incident.report.request"),
+  requestId: z.string(),
+  incidentId: z.string().uuid(),
+  agentId: z.string().uuid().optional(),
+  code: z.enum([
+    "client_history_failed",
+    "client_history_empty",
+    "client_render_failed",
+    "client_connection_lost",
+    "client_queue_failed",
+  ]),
 });
 
 export const PluginCatalogGetRequestSchema = z.object({
@@ -2884,6 +2909,48 @@ export const PushUnregisterResponseSchema = z.object({
   }),
 });
 
+export const WebPushSubscriptionSchema = z.object({
+  endpoint: z.string().trim().min(1).max(4096),
+  expirationTime: z.number().nullable(),
+  keys: z.object({
+    p256dh: z.string().trim().min(1).max(4096),
+    auth: z.string().trim().min(1).max(4096),
+  }),
+});
+
+const WebPushRevocationTokenSchema = z
+  .string()
+  .min(43)
+  .max(128)
+  .regex(/^[A-Za-z0-9_-]+$/);
+
+export const WebPushSubscribeRequestSchema = z.object({
+  type: z.literal("push.web.subscribe.request"),
+  subscription: WebPushSubscriptionSchema,
+  revocationToken: WebPushRevocationTokenSchema.optional(),
+  requestId: z.string(),
+});
+
+export const WebPushSubscribeResponseSchema = z.object({
+  type: z.literal("push.web.subscribe.response"),
+  payload: z.object({
+    requestId: z.string(),
+    revocationToken: WebPushRevocationTokenSchema,
+  }),
+});
+
+export const WebPushUnsubscribeRequestSchema = z.object({
+  type: z.literal("push.web.unsubscribe.request"),
+  endpoint: z.string().trim().min(1).max(4096),
+  revocationToken: WebPushRevocationTokenSchema,
+  requestId: z.string(),
+});
+
+export const WebPushUnsubscribeResponseSchema = z.object({
+  type: z.literal("push.web.unsubscribe.response"),
+  payload: z.object({ requestId: z.string() }),
+});
+
 // ============================================================================
 // Terminal Messages
 // ============================================================================
@@ -3194,6 +3261,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   HubManagementDaemonDisconnectRequestSchema,
   HubManagementDaemonPermissionsUpdateRequestSchema,
   DiagnosticsRequestSchema,
+  DiagnosticIncidentRequestSchema,
   PluginCatalogGetRequestSchema,
   PluginListRequestSchema,
   PluginLogsGetRequestSchema,
@@ -3321,6 +3389,8 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   ListCommandsRequestSchema,
   RegisterPushTokenMessageSchema,
   PushUnregisterRequestSchema,
+  WebPushSubscribeRequestSchema,
+  WebPushUnsubscribeRequestSchema,
   ListTerminalsRequestSchema,
   SubscribeTerminalsRequestSchema,
   UnsubscribeTerminalsRequestSchema,
@@ -3533,6 +3603,7 @@ export const ServerInfoStatusPayloadSchema = z
         // COMPAT(hubAgentRpc): added in v0.8.0; remove gate after 2027-03-05.
         hubAgentRpc: z.boolean().optional(),
         providersSnapshot: z.boolean().optional(),
+        diagnosticIncidents: z.boolean().optional(),
         // COMPAT(providersSnapshotCwd): added in v0.3.2, remove gate after 2027-02-10.
         providersSnapshotCwd: z.boolean().optional(),
         // COMPAT(directorySync): added in v0.3.x, remove gate after 2027-02-12.
@@ -3571,6 +3642,12 @@ export const ServerInfoStatusPayloadSchema = z
         relayConfig: z.boolean().optional(),
         // COMPAT(pushTokenRevocation): added in v0.3.2, remove gate after 2027-02-10.
         pushTokenRevocation: z.boolean().optional(),
+        // COMPAT(webPushNotifications): added in v0.7.2, remove gate after 2027-09-05.
+        webPushNotifications: z
+          .object({
+            vapidPublicKey: z.string().trim().min(1),
+          })
+          .optional(),
         // COMPAT(plugins): added in v0.3.0, remove gate after 2027-08-07.
         plugins: z.boolean().optional(),
         // COMPAT(pluginManagement): added in v0.4.0, remove gate after 2027-08-14.
@@ -4654,6 +4731,11 @@ export const ProviderSubagentDescriptorPayloadSchema = z.object({
   // Compact provider-owned context for the shared track. Providers choose what belongs here and
   // format it for display; clients must not parse provider-specific facts out of this string.
   subtitle: z.string().nullable().optional(),
+  /**
+   * Provider-owned lifecycle category. Background tasks share Claude's task protocol with
+   * subagents, but are not themselves agents. Optional keeps older daemons wire-compatible.
+   */
+  activityKind: z.enum(["subagent", "foreground_task", "background_task"]).optional(),
 });
 
 export type ProviderSubagentDescriptorPayload = z.infer<
@@ -5032,6 +5114,11 @@ export const DiagnosticsResponseSchema = z.object({
       diagnostic: z.string(),
     })
     .passthrough(),
+});
+
+export const DiagnosticIncidentResponseSchema = z.object({
+  type: z.literal("diagnostics.incident.report.response"),
+  payload: z.object({ requestId: z.string(), accepted: z.boolean() }),
 });
 
 export const SetDaemonConfigResponseMessageSchema = z.object({
@@ -6766,6 +6853,8 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   StatusMessageSchema,
   PongMessageSchema,
   PushUnregisterResponseSchema,
+  WebPushSubscribeResponseSchema,
+  WebPushUnsubscribeResponseSchema,
   RpcErrorMessageSchema,
   ArtifactMessageSchema,
   AgentUpdateMessageSchema,
@@ -6830,6 +6919,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   HubManagementDaemonDisconnectResponseSchema,
   HubManagementDaemonPermissionsUpdateResponseSchema,
   DiagnosticsResponseSchema,
+  DiagnosticIncidentResponseSchema,
   GetDaemonConfigResponseMessageSchema,
   SetDaemonConfigResponseMessageSchema,
   ReadProjectConfigResponseMessageSchema,
@@ -7362,6 +7452,11 @@ export type ListCommandsResponse = z.infer<typeof ListCommandsResponseSchema>;
 export type RegisterPushTokenMessage = z.infer<typeof RegisterPushTokenMessageSchema>;
 export type PushUnregisterRequest = z.infer<typeof PushUnregisterRequestSchema>;
 export type PushUnregisterResponse = z.infer<typeof PushUnregisterResponseSchema>;
+export type WebPushSubscription = z.infer<typeof WebPushSubscriptionSchema>;
+export type WebPushSubscribeRequest = z.infer<typeof WebPushSubscribeRequestSchema>;
+export type WebPushSubscribeResponse = z.infer<typeof WebPushSubscribeResponseSchema>;
+export type WebPushUnsubscribeRequest = z.infer<typeof WebPushUnsubscribeRequestSchema>;
+export type WebPushUnsubscribeResponse = z.infer<typeof WebPushUnsubscribeResponseSchema>;
 
 // Terminal message types
 export type ListTerminalsRequest = z.infer<typeof ListTerminalsRequestSchema>;

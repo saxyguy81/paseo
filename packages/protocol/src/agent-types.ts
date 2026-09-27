@@ -2,6 +2,12 @@ import type { AgentAttachment } from "./messages.js";
 
 export type AgentProvider = string;
 
+export type AgentFailureKind =
+  | "context_overflow"
+  | "conversation_unresolved"
+  | "resume_model_unavailable"
+  | "retryable_api";
+
 export interface AgentMetadata {
   [key: string]: unknown;
 }
@@ -160,6 +166,11 @@ export interface AgentCapabilityFlags {
   supportsMcpServers: boolean;
   supportsReasoningStream: boolean;
   supportsToolInvocations: boolean;
+  /**
+   * The provider can add input to an already-running turn without starting a
+   * second provider request. Providers that omit this capability are queued.
+   */
+  supportsInFlightSteering?: boolean;
   supportsRewindConversation?: boolean;
   supportsRewindFiles?: boolean;
   supportsRewindBoth?: boolean;
@@ -369,7 +380,14 @@ export interface AgentTaskItem {
 }
 
 export type AgentTimelineItem =
-  | { type: "user_message"; text: string; messageId?: string; clientMessageId?: string }
+  | {
+      type: "user_message";
+      text: string;
+      messageId?: string;
+      clientMessageId?: string;
+      /** Present only when Paseo rejected the message before provider submission. */
+      deliveryStatus?: "rejected";
+    }
   | { type: "assistant_message"; text: string; messageId?: string }
   | { type: "reasoning"; text: string }
   | ToolCallTimelineItem
@@ -404,6 +422,7 @@ export type AgentStreamEvent =
       type: "turn_failed";
       provider: AgentProvider;
       error: string;
+      failureKind?: AgentFailureKind;
       code?: string;
       diagnostic?: string;
       turnId?: string;

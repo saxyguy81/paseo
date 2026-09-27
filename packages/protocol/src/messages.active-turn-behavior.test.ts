@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 import { z } from "zod";
 
 describe("send_agent_message_request active-turn behavior", () => {
-  it("accepts an optional steer intent while retaining interrupt compatibility", () => {
+  it("accepts steer and durable queue intents while retaining interrupt compatibility", () => {
     expect(
       SendAgentMessageRequestSchema.parse({
         type: "send_agent_message_request",
@@ -17,6 +17,16 @@ describe("send_agent_message_request active-turn behavior", () => {
         activeTurnBehavior: "steer",
       }).activeTurnBehavior,
     ).toBe("steer");
+
+    expect(
+      SendAgentMessageRequestSchema.parse({
+        type: "send_agent_message_request",
+        requestId: "request-queue",
+        agentId: "agent-1",
+        text: "Run this after the current turn",
+        activeTurnBehavior: "queue",
+      }).activeTurnBehavior,
+    ).toBe("queue");
 
     expect(
       SendAgentMessageRequestSchema.parse({
@@ -54,6 +64,53 @@ describe("canonical timeline turn ID compatibility", () => {
     expect(AgentStreamEventPayloadSchema.parse({ ...timeline, turnId: "turn-1" }).turnId).toBe(
       "turn-1",
     );
+  });
+
+  it("preserves the classified Claude context-overflow failure kind", () => {
+    const failure = AgentStreamEventPayloadSchema.parse({
+      type: "turn_failed",
+      provider: "claude",
+      error: "Prompt is too long",
+      failureKind: "context_overflow",
+    });
+
+    expect(failure).toMatchObject({
+      type: "turn_failed",
+      provider: "claude",
+      error: "Prompt is too long",
+      failureKind: "context_overflow",
+    });
+  });
+
+  it("preserves the classified unresolved-conversation failure kind", () => {
+    const failure = AgentStreamEventPayloadSchema.parse({
+      type: "turn_failed",
+      provider: "claude",
+      error: "API Error: 409 Conversation has an unresolved prior request",
+      failureKind: "conversation_unresolved",
+    });
+
+    expect(failure.failureKind).toBe("conversation_unresolved");
+  });
+
+  it("accepts resumed-session model rollover failures", () => {
+    const failure = AgentStreamEventPayloadSchema.parse({
+      type: "turn_failed",
+      provider: "claude",
+      error: "selected model unavailable on resumed session",
+      failureKind: "resume_model_unavailable",
+    });
+    expect(failure.failureKind).toBe("resume_model_unavailable");
+  });
+
+  it("accepts a retryable pre-work API failure", () => {
+    const failure = AgentStreamEventPayloadSchema.parse({
+      type: "turn_failed",
+      provider: "claude",
+      error: "API Error: 502 status code (no body)",
+      failureKind: "retryable_api",
+    });
+    expect(failure.failureKind).toBe("retryable_api");
   });
 });
 

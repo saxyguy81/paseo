@@ -24,6 +24,7 @@ const agent = {
     supportsMcpServers: false,
     supportsReasoningStream: true,
     supportsToolInvocations: true,
+    supportsInFlightSteering: false,
     supportsRewindConversation: false,
     supportsRewindFiles: false,
     supportsRewindBoth: false,
