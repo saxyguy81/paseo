@@ -547,6 +547,8 @@ export interface CreateAgentOptions {
 
 export interface AgentManagerOptions {
   onTurnFailure?: (notice: import("./turn-failure-outbox.js").TurnFailureNotice) => Promise<void>;
+  /** The provider session is about to close; background tasks it launched end with it. */
+  onProviderSessionEnding?: (agentId: string) => void;
   pluginLifecycle?: PluginLifecycle;
   clients?: ProviderClientMap;
   providerDefinitions?: ProviderEnabledMap;
@@ -1005,6 +1007,7 @@ export class AgentManager {
   private appendSystemPrompt: string;
   private onAgentAttention?: AgentAttentionCallback;
   private onTurnFailure?: AgentManagerOptions["onTurnFailure"];
+  private onProviderSessionEnding?: AgentManagerOptions["onProviderSessionEnding"];
   private readonly diagnosticLastAt = new Map<string, number>();
   /** Agents whose runtime Paseo is closing on purpose; their teardown is not a failure. */
   private readonly controlledCloseAgentIds = new Set<string>();
@@ -1024,6 +1027,7 @@ export class AgentManager {
     this.durableTimelineStore = options?.durableTimelineStore;
     this.onAgentAttention = options?.onAgentAttention;
     this.onTurnFailure = options.onTurnFailure;
+    this.onProviderSessionEnding = options.onProviderSessionEnding;
     this.onWorkspaceStateMayHaveChanged = options?.onWorkspaceStateMayHaveChanged;
     this.mcpBaseUrl = options?.mcpBaseUrl ?? null;
     this.mcpAuthToken = options?.mcpAuthToken ?? null;
@@ -2738,6 +2742,7 @@ export class AgentManager {
   private async closeReloadedSession(session: AgentSession, agentId: string): Promise<void> {
     let operation = this.reloadedSessionCloses.get(session);
     if (!operation) {
+      this.onProviderSessionEnding?.(agentId);
       operation = session.close();
       this.reloadedSessionCloses.set(session, operation);
       // Keep pending closes across request timeouts; a retry must await the same release.
@@ -2828,6 +2833,7 @@ export class AgentManager {
     // The session stays subscribed meanwhile, so mark the close as controlled:
     // the provider exit it causes must not notify as a turn failure.
     this.controlledCloseAgentIds.add(agentId);
+    this.onProviderSessionEnding?.(agentId);
     try {
       await agent.session.close();
       await this.drainSessionEvents(agentId);

@@ -12967,3 +12967,40 @@ test("concurrent native restores run once before resuming the same agent", async
     rmSync(workdir, { recursive: true, force: true });
   }
 });
+
+test("closing an agent announces the ending provider session before closing it", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-session-ending-"));
+  const order: string[] = [];
+  class RecordingSession extends TestAgentSession {
+    override async close(): Promise<void> {
+      order.push("close");
+      await super.close();
+    }
+  }
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({
+    clients: {
+      codex: new (class extends TestAgentClient {
+        override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+          return new RecordingSession(config);
+        }
+      })(),
+    },
+    registry: storage,
+    logger,
+    onProviderSessionEnding: (agentId) => {
+      order.push(`ending:${agentId}`);
+    },
+  });
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.closeAgent(agent.id);
+    await manager.flush();
+    expect(order).toEqual([`ending:${agent.id}`, "close"]);
+  } finally {
+    await storage.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});

@@ -11,6 +11,7 @@ import type { Logger } from "pino";
 import { z } from "zod";
 import { createBranchChangeRouteHandler } from "./script-route-branch-handler.js";
 import { startConfiguredFailureOutbox } from "./agent/turn-failure-outbox.js";
+import { BackgroundMonitorLedger } from "./agent/background-monitor-ledger.js";
 
 export type ListenTarget =
   | { type: "tcp"; host: string; port: number }
@@ -930,12 +931,20 @@ export async function createPaseoDaemon(
     command: process.env.PASEO_TURN_FAILURE_COMMAND,
     warn: (error) => logger.warn({ err: error }, "Failed-turn notification remains pending"),
   });
+  const backgroundMonitors = new BackgroundMonitorLedger({
+    path: path.join(config.paseoHome, "background-monitors.json"),
+    bootId: randomUUID(),
+    report: failureOutbox.onTurnFailure,
+    warn: (error, message) => logger.warn({ err: error }, message),
+  });
+  await backgroundMonitors.start();
   const agentManager = new AgentManager({
     pluginLifecycle: pluginRuntime,
     clients: initialAgentManagerState.clients,
     providerDefinitions: initialAgentManagerState.providerDefinitions,
     registry: agentStorage,
     onTurnFailure: failureOutbox.onTurnFailure,
+    onProviderSessionEnding: (agentId) => backgroundMonitors.sessionEnded(agentId),
     appendSystemPrompt: config.appendSystemPrompt,
     onWorkspaceStateMayHaveChanged: ({ cwd }) => {
       workspaceGitService.onWorkspaceStateMayHaveChanged(cwd);
@@ -952,6 +961,13 @@ export async function createPaseoDaemon(
   };
   const unsubscribePluginProviders =
     pluginRuntime.subscribeProviderRegistrations(syncPluginProviders);
+
+  const unsubscribeBackgroundMonitors = agentManager.subscribe(
+    (event) => {
+      if (event.type === "provider_subagent") backgroundMonitors.observe(event.event);
+    },
+    { replayState: false },
+  );
 
   const detachAgentStoragePersistence = attachAgentStoragePersistence(
     logger,
@@ -1811,6 +1827,9 @@ export async function createPaseoDaemon(
     // Freeze both ingress and registration before taking the agent closure snapshot.
     wsServer?.prepareForShutdown();
     agentManager.prepareForShutdown();
+    backgroundMonitors.prepareForShutdown();
+    unsubscribeBackgroundMonitors();
+    await backgroundMonitors.flush();
     await failureOutbox.stop();
     await closeAllAgents(logger, agentManager);
     await agentManager.flushForShutdown().catch(() => undefined);
